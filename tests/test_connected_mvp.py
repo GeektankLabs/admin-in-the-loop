@@ -438,6 +438,135 @@ class ConnectedRoundTripTests(unittest.TestCase):
         with self.assertRaises(a.ProbeError):
             self.core.approve(output.id)
 
+    def test_approved_output_event_continuation_uses_exact_canonical_read(self):
+        store = a.BridgeStore(Path(self.temp.name, "event-bridge"), uuid.uuid4().hex)
+        controller, controller_id = store.issue("CONTROLLER")
+        ai, ai_id = store.issue("AI")
+        harness = ServiceHarness(store, controller, controller_id, ai, ai_id)
+        self.addCleanup(harness.close)
+        self.core.connect_profile(harness.profile)
+        self.addCleanup(self.core.disconnect_bridge)
+        self.fixture.wait(lambda: self.core.bridge_state == "CONNECTED", timeout=6)
+        process = SimpleNamespace(profile=harness.profile, ai_token=ai, mcp_url=harness.mcp_url)
+
+        def event_rpc(method, params):
+            value = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": method,
+                     "params": dict(params, _meta={
+                         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                         "io.modelcontextprotocol/clientCapabilities": {}})}
+            status, raw = request(harness.mcp_url, "POST", body=value, headers={
+                "X-AITL-AI-Key": ai, "MCP-Protocol-Version": "2026-07-28"})
+            self.assertEqual(status, 200)
+            return json.loads(raw)["result"]
+
+        secret = "whsec_" + base64.b64encode(b"e" * 24).decode()
+        subscribed = event_rpc("events/subscribe", {
+            "name": a.BRIDGE_EVENT_NAME,
+            "arguments": {"conversation": harness.profile.conversation},
+            "delivery": {"mode": "webhook", "url": "https://callback.example/continuation",
+                         "secret": secret}})
+        subscription_id = subscribed["id"]
+
+        command_runs = Path(self.temp.name, "event-command-runs")
+        proposal = mcp(process, "submit_proposal", {
+            "request_id": uuid.uuid4().hex,
+            "text": "printf 'APPROVED_EVENT_OUTPUT\\n'; printf x >> event-command-runs"})
+        submission_id = proposal["submission_id"]
+        self.fixture.wait(lambda: bool(self.core.inbox), timeout=6)
+        self.assertIsNone(self.core.review)
+        self.assertFalse(command_runs.exists())
+        self.assertEqual(mcp(process, "get_approved_output", {"submission_id": submission_id})["outputs"], [])
+        self.assertEqual(harness.deliveries, {})
+
+        command_review = self.core.review_pending_proposal()
+        self.assertEqual(command_review.proposal_id, submission_id)
+        self.assertFalse(command_runs.exists())
+        self.core.approve(command_review.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(command_review.id, override=True)
+            self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+        self.fixture.wait(lambda: command_runs.exists()
+                          and b"APPROVED_EVENT_OUTPUT\r\n" in self.core.output.data)
+        self.assertEqual(command_runs.read_text(), "x")
+        self.assertEqual(mcp(process, "get_submission_status", {"submission_id": submission_id})[
+            "approved_output_available"], False)
+        self.assertEqual(harness.deliveries, {})
+
+        output_review = self.core.select_current_output()
+        self.assertIn("APPROVED_EVENT_OUTPUT", output_review.text)
+        output_review = self.core.edit_review(output_review.id, "HUMAN_APPROVED_EVENT_OUTPUT\n", False)
+        posted_outputs = []
+        original_request = a.BridgeHTTP.request
+
+        def capture_approved_output(client, method, path, value=None, **kwargs):
+            result = original_request(client, method, path, value, **kwargs)
+            if path == "/v1/approved-output":
+                posted_outputs.append(value)
+            return result
+
+        with mock.patch.object(a.BridgeHTTP, "request", capture_approved_output):
+            self.core.approve(output_review.id, submission_id=submission_id)
+            self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
+        self.assertEqual(len(posted_outputs), 1)
+        harness.wait(lambda: len(harness.deliveries.get(subscription_id, [])) == 1)
+
+        event = harness.deliveries[subscription_id][0][1]
+        self.assertEqual(event["name"], a.BRIDGE_EVENT_NAME)
+        self.assertEqual(event["eventId"], event["data"]["output_id"])
+        self.assertEqual(event["data"]["submission_id"], submission_id)
+        self.assertNotIn("conversation", event["data"])
+        self.assertNotIn(harness.profile.conversation, json.dumps(event))
+        self.assertNotIn("HUMAN_APPROVED_EVENT_OUTPUT", json.dumps(event))
+        row = store.execute("SELECT delivered,delivered_at FROM outputs WHERE id=?",
+                            (event["eventId"],)).fetchone()
+        self.assertEqual(row["delivered"], 1)
+        self.assertIsNotNone(row["delivered_at"])
+
+        processed = {}
+
+        def continue_from_notification(notification):
+            event_id = notification["eventId"]
+            if event_id in processed:
+                return False
+            data = notification["data"]
+            self.assertEqual(data["output_id"], event_id)
+            readback = mcp(process, "get_approved_output", {"submission_id": data["submission_id"]})
+            outputs = readback["outputs"]
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(outputs[0]["output_id"], event_id)
+            self.assertEqual(outputs[0]["submission_id"], submission_id)
+            self.assertEqual(outputs[0]["text"], "HUMAN_APPROVED_EVENT_OUTPUT\n")
+            processed[event_id] = outputs[0]
+            return True
+
+        self.assertTrue(continue_from_notification(event))
+        self.assertEqual(mcp(process, "get_submission_status", {"submission_id": submission_id})[
+            "approved_output_available"], False)
+        self.assertEqual(mcp(process, "get_approved_output")["outputs"], [])
+        wrong_binding = event_rpc("tools/call", {"name": "get_approved_output", "arguments": {
+            "conversation": "wrong-conversation-binding", "submission_id": submission_id}})
+        self.assertTrue(wrong_binding["isError"])
+
+        replayed_upload = a.BridgeHTTP(harness.profile).request(
+            "POST", "/v1/approved-output", posted_outputs[0])
+        self.assertEqual(replayed_upload["output_id"], event["eventId"])
+        self.assertEqual(len(harness.deliveries[subscription_id]), 1)
+
+        subscription = store.active_subscription(subscription_id, store.clock())
+        harness.service.deliver({"subscription": subscription, "event": event, "attempts": 0})
+        self.assertEqual(len(harness.deliveries[subscription_id]), 2)
+        replay_event = harness.deliveries[subscription_id][1][1]
+        self.assertEqual(replay_event["eventId"], event["eventId"])
+        self.assertFalse(continue_from_notification(replay_event))
+        final_row = store.execute("SELECT delivered,delivered_at FROM outputs WHERE id=?",
+                                  (event["eventId"],)).fetchone()
+        self.assertEqual(tuple(final_row), tuple(row))
+        self.assertEqual(tuple(processed), (event["eventId"],))
+        self.assertEqual(command_runs.read_text(), "x")
+        self.assertFalse(self.core.inbox)
+        self.assertEqual(store.execute("SELECT count(*) FROM proposals").fetchone()[0], 1)
+
     def test_output_binding_is_exact_per_submission_not_last_heuristic(self):
         first = self.submit("printf 'MULTI_FLIGHT_ONE\\n'")
         second = self.submit("printf 'MULTI_FLIGHT_TWO\\n'")
@@ -572,6 +701,16 @@ class ConnectedRoundTripTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertFalse(self.core.inbox)
         self.assertEqual(self.core.review_state, "REJECTED")
+
+    @unittest.skip("PENDING_EXTERNAL: real ChatGPT-Work host/workspace is unavailable here")
+    def test_chatgpt_work_event_continuation_without_another_user_turn(self):
+        """External checkpoint in this connected run: exercise the approved-output event in
+        the actual configured ChatGPT-Work workspace, continue on that same event without a
+        new user turn, read the exact event submission via get_approved_output, and verify
+        that neither approval nor a follow-up command is bypassed. Record external evidence
+        before removing this pending marker; local fixtures cannot satisfy this checkpoint.
+        """
+        self.fail("External host E2E must be evidenced in the real ChatGPT-Work workspace")
 
 
 class RemoteFixture:
