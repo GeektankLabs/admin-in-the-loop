@@ -1,0 +1,6 @@
+test_native_tk_xterm_review_and_connection_dialog (__main__.GUISmokeTests.test_native_tk_xterm_review_and_connection_dialog) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.904s
+
+OK

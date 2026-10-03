@@ -1,0 +1,75 @@
+unittest.case.FunctionTestCase (wrapped)
+controlling_tty_and_job_control ... ok
+unittest.case.FunctionTestCase (wrapped)
+pending_reject_approve ... ok
+unittest.case.FunctionTestCase (wrapped)
+single_use_approval ... ok
+unittest.case.FunctionTestCase (wrapped)
+immutable_review ... ok
+unittest.case.FunctionTestCase (wrapped)
+stale_session_blocked ... ok
+unittest.case.FunctionTestCase (wrapped)
+return_unicode_and_limits ... ok
+unittest.case.FunctionTestCase (wrapped)
+no_hidden_final_enter ... ok
+unittest.case.FunctionTestCase (wrapped)
+internal_newlines_execute ... ok
+unittest.case.FunctionTestCase (wrapped)
+password_echo_off ... ok
+unittest.case.FunctionTestCase (wrapped)
+echo_on_positive_control ... ok
+unittest.case.FunctionTestCase (wrapped)
+prompt_override_and_false_positive ... ok
+unittest.case.FunctionTestCase (wrapped)
+resize_and_sigwinch ... ok
+unittest.case.FunctionTestCase (wrapped)
+ctrl_c_foreground_interrupt ... ok
+unittest.case.FunctionTestCase (wrapped)
+output_offset_background_and_frozen_selection ... ok
+unittest.case.FunctionTestCase (wrapped)
+bounded_output_overflow ... ok
+unittest.case.FunctionTestCase (wrapped)
+short_write_success ... ok
+unittest.case.FunctionTestCase (wrapped)
+short_write_failure_no_retry ... ok
+unittest.case.FunctionTestCase (wrapped)
+credential_environment_not_inherited ... ok
+unittest.case.FunctionTestCase (wrapped)
+fragmented_utf8_capture ... ok
+unittest.case.FunctionTestCase (wrapped)
+eof_fd_close_and_reaping ... ok
+unittest.case.FunctionTestCase (wrapped)
+bounded_shutdown_with_foreground_job ... ok
+test_disconnect_invalidates_review_manual_terminal_survives (__main__.LocalIntegrationTests.test_disconnect_invalidates_review_manual_terminal_survives) ... ok
+test_draft_guard_snapshot_immutable_and_return_visible (__main__.LocalIntegrationTests.test_draft_guard_snapshot_immutable_and_return_visible) ... ok
+test_duplicate_ipc_request_does_not_repeat_execution (__main__.LocalIntegrationTests.test_duplicate_ipc_request_does_not_repeat_execution) ... ok
+test_edit_inbox_pause_preferences_and_stale_review (__main__.LocalIntegrationTests.test_edit_inbox_pause_preferences_and_stale_review) ... ok
+test_full_round_trip_and_single_approval (__main__.LocalIntegrationTests.test_full_round_trip_and_single_approval) ... ok
+test_gap_in_output_fails_closed (__main__.LocalIntegrationTests.test_gap_in_output_fails_closed) ... ok
+test_invalid_proposal_is_not_consumed (__main__.LocalIntegrationTests.test_invalid_proposal_is_not_consumed) ... ok
+test_invalid_session_cannot_be_overridden (__main__.LocalIntegrationTests.test_invalid_session_cannot_be_overridden) ... ok
+test_large_relay_output_is_framed_and_utf8_preserved (__main__.LocalIntegrationTests.test_large_relay_output_is_framed_and_utf8_preserved) ... ok
+test_manual_relay_password_and_output_disclosure (__main__.LocalIntegrationTests.test_manual_relay_password_and_output_disclosure) ... ok
+test_multiline_and_no_final_enter (__main__.LocalIntegrationTests.test_multiline_and_no_final_enter) ... ok
+test_one_proposal_slot_consumed_without_automatic_review (__main__.LocalIntegrationTests.test_one_proposal_slot_consumed_without_automatic_review) ... ok
+test_output_default_last_line_then_since_confirmed_transfer (__main__.LocalIntegrationTests.test_output_default_last_line_then_since_confirmed_transfer) ... ok
+test_output_selection_frozen_sanitized_and_editable (__main__.LocalIntegrationTests.test_output_selection_frozen_sanitized_and_editable) ... ok
+test_resize_ctrl_c_and_exit_restore_outer_terminal (__main__.LocalIntegrationTests.test_resize_ctrl_c_and_exit_restore_outer_terminal) ... ok
+test_return_preference_sticky_and_output_does_not_change_it (__main__.LocalIntegrationTests.test_return_preference_sticky_and_output_does_not_change_it) ... ok
+test_since_transfer_is_not_silently_limited_to_500_lines (__main__.LocalIntegrationTests.test_since_transfer_is_not_silently_limited_to_500_lines) ... ok
+test_unknown_prompt_override_and_cancel (__main__.LocalIntegrationTests.test_unknown_prompt_override_and_cancel) ... ok
+test_bad_auth_cannot_attach_and_capability_permissions (__main__.ProtocolTests.test_bad_auth_cannot_attach_and_capability_permissions) ... ok
+test_fragmentation_schema_size_and_backpressure (__main__.ProtocolTests.test_fragmentation_schema_size_and_backpressure) ... ok
+test_frame_timeout_and_eof_after_complete_message (__main__.ProtocolTests.test_frame_timeout_and_eof_after_complete_message) ... ok
+test_import_does_not_load_tk_or_start_processes (__main__.ProtocolTests.test_import_does_not_load_tk_or_start_processes) ... ok
+test_sanitizer_bounds_and_json_review_roundtrip (__main__.ProtocolTests.test_sanitizer_bounds_and_json_review_roundtrip) ... ok
+test_corrupt_or_unsafe_preferences_do_not_reset_return_to_on (__main__.PreferenceAndPresentationTests.test_corrupt_or_unsafe_preferences_do_not_reset_return_to_on) ... ok
+test_first_start_and_persisted_single_return_off (__main__.PreferenceAndPresentationTests.test_first_start_and_persisted_single_return_off) ... ok
+test_symlink_preferences_rejected_without_touching_target (__main__.PreferenceAndPresentationTests.test_symlink_preferences_rejected_without_touching_target) ... ok
+test_tagged_projection_does_not_change_payload_or_soft_wrap_lines (__main__.PreferenceAndPresentationTests.test_tagged_projection_does_not_change_payload_or_soft_wrap_lines) ... ok
+test_write_failure_keeps_previous_preference_and_removes_temp_file (__main__.PreferenceAndPresentationTests.test_write_failure_keeps_previous_preference_and_removes_temp_file) ... ok
+
+----------------------------------------------------------------------
+Ran 49 tests in 7.326s
+
+OK

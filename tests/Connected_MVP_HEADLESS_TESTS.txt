@@ -1,0 +1,41 @@
+test_ack_loss_retry_identical_snapshot_no_duplicate_upload (__main__.ConnectedRoundTripTests.test_ack_loss_retry_identical_snapshot_no_duplicate_upload) ... ok
+test_bridge_disconnect_stales_review_manual_shell_survives (__main__.ConnectedRoundTripTests.test_bridge_disconnect_stales_review_manual_shell_survives) ... ok
+test_complete_mcp_review_pty_output_review_mcp_round_trip (__main__.ConnectedRoundTripTests.test_complete_mcp_review_pty_output_review_mcp_round_trip) ... ok
+test_disclosed_preference_single_and_no_approval_restore (__main__.ConnectedRoundTripTests.test_disclosed_preference_single_and_no_approval_restore) ... ok
+test_pending_second_proposal_never_changes_review (__main__.ConnectedRoundTripTests.test_pending_second_proposal_never_changes_review) ... ok
+test_reconnect_does_not_represent_consumed_proposal (__main__.ConnectedRoundTripTests.test_reconnect_does_not_represent_consumed_proposal) ... ok
+test_reconnect_generation_and_expired_proposal_block_approval (__main__.ConnectedRoundTripTests.test_reconnect_generation_and_expired_proposal_block_approval) ... ok
+test_stopped_network_worker_blocks_existing_approval (__main__.ConnectedRoundTripTests.test_stopped_network_worker_blocks_existing_approval) ... ok
+test_four_tools_legacy_and_modern_discovery (__main__.HTTPTests.test_four_tools_legacy_and_modern_discovery) ... ok
+test_full_size_approved_output_is_retrievable_over_mcp (__main__.HTTPTests.test_full_size_approved_output_is_retrievable_over_mcp) ... ok
+test_host_origin_limits_and_error_bodies_do_not_echo (__main__.HTTPTests.test_host_origin_limits_and_error_bodies_do_not_echo) ... ok
+test_long_poll_empty_timeout_and_new_proposal (__main__.HTTPTests.test_long_poll_empty_timeout_and_new_proposal) ... ok
+test_other_chat_cannot_guess_or_discover_binding (__main__.HTTPTests.test_other_chat_cannot_guess_or_discover_binding) ... ok
+test_remote_plaintext_rejected_and_process_no_terminal_fds (__main__.HTTPTests.test_remote_plaintext_rejected_and_process_no_terminal_fds) ... ok
+test_roles_auth_and_missing_terminal_endpoints (__main__.HTTPTests.test_roles_auth_and_missing_terminal_endpoints) ... ok
+test_bound_cursors_and_passive_schema (__main__.StoreTests.test_bound_cursors_and_passive_schema) ... ok
+test_json_limits_duplicates_nonfinite_and_no_reflection (__main__.StoreTests.test_json_limits_duplicates_nonfinite_and_no_reflection) ... ok
+test_output_envelope_extreme_escaping_is_not_silently_truncated (__main__.StoreTests.test_output_envelope_extreme_escaping_is_not_silently_truncated) ... ok
+test_output_idempotency_exact_body_and_retention (__main__.StoreTests.test_output_idempotency_exact_body_and_retention) ... ok
+test_pair_code_single_use_attempt_limit_and_expiry (__main__.StoreTests.test_pair_code_single_use_attempt_limit_and_expiry) ... ok
+test_proposal_limits_and_idempotency (__main__.StoreTests.test_proposal_limits_and_idempotency) ... ok
+test_restart_respects_expiry_and_token_hashes (__main__.StoreTests.test_restart_respects_expiry_and_token_hashes) ... ok
+test_role_separation_pending_confirm_revoke (__main__.StoreTests.test_role_separation_pending_confirm_revoke) ... ok
+test_symlink_state_is_rejected (__main__.StoreTests.test_symlink_state_is_rejected) ... ok
+test_fragmented_utf8_and_escapes_match_whole_stream (__main__.StreamingProjectionTests.test_fragmented_utf8_and_escapes_match_whole_stream) ... ok
+test_last_lines_never_enter_middle_of_osc_payload (__main__.StreamingProjectionTests.test_last_lines_never_enter_middle_of_osc_payload) ... ok
+test_loss_and_arbitrary_partial_chunk_offset_are_explicit (__main__.StreamingProjectionTests.test_loss_and_arbitrary_partial_chunk_offset_are_explicit) ... ok
+test_unterminated_sequence_remains_bounded_and_visible (__main__.StreamingProjectionTests.test_unterminated_sequence_remains_bounded_and_visible) ... ok
+test_certificate_renewal_keeps_spki_identity (__main__.TLSPairingTests.test_certificate_renewal_keeps_spki_identity) ... ok
+test_pinning_and_name_checked_before_any_http_bytes (__main__.TLSPairingTests.test_pinning_and_name_checked_before_any_http_bytes) ... ok
+test_real_remote_pair_persist_confirm_revoke (__main__.TLSPairingTests.test_real_remote_pair_persist_confirm_revoke) ... ok
+test_unsafe_saved_config_and_plaintext_remote_rejected (__main__.TLSPairingTests.test_unsafe_saved_config_and_plaintext_remote_rejected) ... ok
+test_bad_cli_arguments_never_echo_credentials (__main__.TunnelTests.test_bad_cli_arguments_never_echo_credentials) ... ok
+test_official_runtime_cli_start_health_and_stop_without_cloud (__main__.TunnelTests.test_official_runtime_cli_start_health_and_stop_without_cloud) ... ok
+test_official_tunnel_forwards_full_human_controlled_round_trip (__main__.TunnelTests.test_official_tunnel_forwards_full_human_controlled_round_trip) ... ok
+test_private_key_files_and_no_credential_argv_environment (__main__.TunnelTests.test_private_key_files_and_no_credential_argv_environment) ... ok
+
+----------------------------------------------------------------------
+Ran 36 tests in 18.828s
+
+OK
