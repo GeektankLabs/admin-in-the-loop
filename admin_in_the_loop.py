@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import gzip
 import hashlib
 import io
 import json
@@ -1427,7 +1428,7 @@ import queue
 import ssl
 import threading
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlencode
+from urllib.parse import urlsplit, urlencode, urljoin
 from dataclasses import field, replace
 
 
@@ -1612,12 +1613,15 @@ class CommandRiskTool:
     size: int
     version: str
     generation: int
+    lease_path: str | None = None
 
     def __post_init__(self):
         require(type(self.binary) is str and Path(self.binary).is_absolute(), "risk_binary_path")
         require(type(self.sha256) is str and re.fullmatch("[0-9a-f]{64}", self.sha256), "risk_binary_hash")
         _risk_number(self.size, 1, 16 * 1024 * 1024)
         _risk_number(self.generation, 0, 2**63 - 1)
+        require(self.lease_path is None or type(self.lease_path) is str
+                and Path(self.lease_path).is_absolute(), "risk_install_lock")
         require(type(self.version) is str and len(self.version) <= 64
                 and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", self.version),
                 "risk_version")
@@ -1756,7 +1760,49 @@ def _risk_process(argv, directory, environment, rules_fd, cancel):
             process.stderr.close()
 
 
+RISK_LEASE_TIMEOUT = 2.0
+
+
+def _risk_acquire_lease(path, cancel, exclusive=False, create=False, timeout=RISK_LEASE_TIMEOUT):
+    if path is None:
+        return None  # Private caller-created test tools do not share an install.
+    _risk_directory(str(Path(path).parent))
+    require(Path(path).resolve() == Path(path), "risk_install_lock")
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o600, "risk_install_lock")
+        deadline = time.monotonic() + timeout
+        while True:
+            require(not cancel.is_set(), "risk_cancelled")
+            try:
+                fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                require(time.monotonic() < deadline, "risk_lease_busy")
+                cancel.wait(min(0.02, max(0, deadline - time.monotonic())))
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def run_command_risk(job, cancel):
+    lease = None
+    try:
+        lease = _risk_acquire_lease(job.key.tool.lease_path, cancel)
+        return _run_command_risk_leased(job, cancel)
+    except ProbeError as exc:
+        return CommandRiskResult(job.key, "UNAVAILABLE", str(exc))
+    except Exception:
+        return CommandRiskResult(job.key, "UNAVAILABLE", "risk_process_failure")
+    finally:
+        if lease is not None:
+            os.close(lease)  # Only after every subprocess has exited and been reaped.
+
+
+def _run_command_risk_leased(job, cancel):
     """Only text analysis. Errors are bounded metadata, never argv/stderr contents."""
     try:
         require(_risk_review_valid(job.review)
@@ -1935,6 +1981,131 @@ def command_risk_release():
     return RISK_RELEASES[arch + "-" + suffix]
 
 
+RISK_DOWNLOAD_TIMEOUT = 120.0
+RISK_ARCHIVE_EXPANDED_LIMIT = 32 * 1024 * 1024
+
+
+class _RiskDownloadBudget:
+    """Request-local deadline/watchdog; never changes global socket defaults."""
+    def __init__(self, cancel):
+        self.cancel = cancel
+        self.deadline = time.monotonic() + RISK_DOWNLOAD_TIMEOUT
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.sockets = []
+        self.resolvers = []
+        self.error = None
+        self.thread = threading.Thread(target=self._watch, name="aitl-risk-download-budget", daemon=True)
+        self.thread.start()
+
+    def check(self):
+        if self.cancel.is_set():
+            raise ProbeError("risk_cancelled")
+        require(time.monotonic() < self.deadline and self.error is None, "risk_download_timeout")
+
+    def timeout(self):
+        self.check()
+        return max(0.001, min(15.0, self.deadline - time.monotonic()))
+
+    def register(self, sock):
+        with self.lock:
+            self.sockets.append(sock)
+            self.check()
+
+    def _abort_sockets(self):
+        with self.lock:
+            for sock in self.sockets:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+
+    def _watch(self):
+        while not self.done.wait(0.02):
+            if self.cancel.is_set() or time.monotonic() >= self.deadline:
+                self.error = "risk_cancelled" if self.cancel.is_set() else "risk_download_timeout"
+                self._abort_sockets()  # Interrupt headers, TLS and chunk framing too.
+                return
+
+    def resolve(self, host, port):
+        # libc DNS cannot be force-cancelled in Python. Its helper returns only data:
+        # after cancellation no late result is permitted to connect a socket.
+        result = queue.Queue(maxsize=1)
+
+        def resolve():
+            try:
+                value = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            except Exception as exc:
+                value = exc
+            result.put_nowait(value)
+
+        thread = threading.Thread(target=resolve, name="aitl-risk-download-dns", daemon=True)
+        self.resolvers.append(thread)
+        thread.start()
+        while True:
+            self.check()
+            try:
+                value = result.get(timeout=min(0.02, self.timeout()))
+                self.check()
+                if isinstance(value, Exception):
+                    raise ProbeError("risk_download_dns") from None
+                return value
+            except queue.Empty:
+                pass
+
+    def close(self):
+        self.done.set()
+        self.thread.join()
+        self._abort_sockets()
+        for thread in self.resolvers:
+            thread.join(timeout=0.02)
+
+
+def _risk_download_handler(budget):
+    from urllib.request import HTTPSHandler
+
+    class Connection(http.client.HTTPSConnection):
+        def connect(self):
+            require(self._tunnel_host is None, "risk_download_proxy")
+            last_error = None
+            for family, kind, proto, _name, address in budget.resolve(self.host, self.port):
+                budget.check()
+                raw = socket.socket(family, kind, proto)
+                budget.register(raw)
+                try:
+                    raw.setblocking(False)
+                    code = raw.connect_ex(address)
+                    require(code in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY), "risk_download_connect")
+                    while code:
+                        budget.check()
+                        _, writable, failed = select.select([], [raw], [raw], min(0.02, budget.timeout()))
+                        if writable or failed:
+                            code = raw.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                            require(code == 0, "risk_download_connect")
+                    raw.settimeout(budget.timeout())
+                    secured = self._context.wrap_socket(raw, server_hostname=self.host, do_handshake_on_connect=False)
+                    budget.register(secured)
+                    secured.do_handshake()
+                    budget.check()
+                    self.sock = secured
+                    return
+                except (OSError, ProbeError) as exc:
+                    raw.close()
+                    budget.check()
+                    last_error = exc
+            raise ProbeError("risk_download_connect") from last_error
+
+    class Handler(HTTPSHandler):
+        def https_open(self, req):
+            budget.check()
+            value = self.do_open(Connection, req, context=self._context)
+            budget.check()
+            return value
+
+    return Handler(context=ssl.create_default_context())
+
+
 def download_command_risk(release, cancel):
     """Explicit installer path ONLY; all production entries are currently gated."""
     from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
@@ -1945,6 +2116,7 @@ def download_command_risk(release, cancel):
         count = 0
 
         def redirect_request(self, req, fp, code, msg, headers, newurl):
+            budget.check()
             self.count += 1
             parsed = urlsplit(newurl)
             require(self.count <= 5 and parsed.scheme == "https" and parsed.hostname in hosts
@@ -1952,18 +2124,79 @@ def download_command_risk(release, cancel):
                     "risk_download_redirect")
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    deadline, raw = time.monotonic() + 120, bytearray()
-    require(not cancel.is_set(), "risk_cancelled")
-    with build_opener(ProxyHandler({}), Redirects()).open(release.url, timeout=15) as response:
+        def http_error_302(self, req, fp, code, msg, headers):
+            location = headers.get("Location")
+            require(type(location) is str and len(location) <= 8192, "risk_download_redirect")
+            redirected = self.redirect_request(req, fp, code, msg, headers, urljoin(req.full_url, location))
+            fp.close()  # Never consume an unbounded redirect body via fp.read().
+            budget.check()
+            return self.parent.open(redirected, timeout=budget.timeout())
+
+        http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+    budget, raw = _RiskDownloadBudget(cancel), bytearray()
+    try:
+        handler = _risk_download_handler(budget)
+        budget.check()
+        with build_opener(ProxyHandler({}), Redirects(), handler).open(release.url, timeout=budget.timeout()) as response:
+            budget.check()
+            while True:
+                budget.check()
+                chunk = response.read1(65536)  # At most one underlying receive.
+                budget.check()  # Includes EOF, never accept a late success.
+                if not chunk:
+                    break
+                require(len(raw) + len(chunk) <= release.archive_size, "risk_archive_size")
+                raw.extend(chunk)
+        budget.check()
+        return bytes(raw)
+    except Exception:
+        budget.check()  # Deadline/cancel wins over the induced socket error.
+        raise
+    finally:
+        budget.close()
+
+
+def _risk_archive_binary(raw, release, cancel):
+    """Bound ALL physical bytes before interpreting any tar header/metadata."""
+    expanded = bytearray()
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
         while True:
             require(not cancel.is_set(), "risk_cancelled")
-            require(time.monotonic() < deadline, "risk_download_timeout")
-            chunk = response.read(65536)
+            chunk = compressed.read(min(65536, RISK_ARCHIVE_EXPANDED_LIMIT + 1 - len(expanded)))
             if not chunk:
                 break
-            require(len(raw) + len(chunk) <= release.archive_size, "risk_archive_size")
-            raw.extend(chunk)
-    return bytes(raw)
+            expanded.extend(chunk)
+            require(len(expanded) <= RISK_ARCHIVE_EXPANDED_LIMIT, "risk_archive_size")
+    require(len(expanded) % 512 == 0, "risk_archive_members")
+    offset, seen, binary = 0, set(), None
+    while offset + 512 <= len(expanded):
+        require(not cancel.is_set(), "risk_cancelled")
+        block = bytes(expanded[offset:offset + 512])
+        if block == b"\0" * 512:
+            require(len(expanded) - offset >= 1024 and not any(expanded[offset:]), "risk_archive_members")
+            break
+        # Reject GNU longname/longlink, PAX, sparse, devices and extensions BEFORE
+        # tarfile gets a chance to consume or expand those headers.
+        require(block[156:157] in (tarfile.REGTYPE, tarfile.AREGTYPE), "risk_archive_members")
+        try:
+            member = tarfile.TarInfo.frombuf(block, "utf-8", "strict")
+        except (tarfile.TarError, UnicodeError, ValueError):
+            raise ProbeError("risk_archive_members") from None
+        require(member.name in ("sh-guard", "sh-guard-mcp") and member.name not in seen, "risk_archive_members")
+        _risk_number(member.size, 1, 16 * 1024 * 1024)
+        seen.add(member.name)
+        begin = offset + 512
+        offset = begin + ((member.size + 511) // 512) * 512
+        require(offset <= len(expanded), "risk_archive_size")
+        if member.name == "sh-guard":
+            require(member.size == release.binary_size, "risk_binary_integrity")
+            binary = bytes(expanded[begin:begin + member.size])
+    else:
+        raise ProbeError("risk_archive_members")
+    require(seen == {"sh-guard", "sh-guard-mcp"}, "risk_archive_members")
+    require(hashlib.sha256(binary).hexdigest() == release.binary_sha256, "risk_binary_integrity")
+    return binary
 
 
 def _risk_private_tree(base, parts):
@@ -2019,7 +2252,8 @@ class CommandRiskInstallation:
     def tool(self, path=None):
         release = self.release
         return CommandRiskTool(str(path or self.destination), release.binary_sha256,
-                               release.binary_size, release.version, 1)
+                               release.binary_size, release.version, 1,
+                               None if path is not None else str(self.base / "tools" / "sh-guard" / ".lock"))
 
     def check(self, cancel):
         self.release.validate()
@@ -2030,22 +2264,22 @@ class CommandRiskInstallation:
             if path == self.base or path.is_relative_to(self.base):
                 _risk_directory(str(path))
         tool = self.tool()
-        _risk_verify_tool(tool, cancel)
-        work = _risk_private_tree(self.base, ("tools", "sh-guard", ".work"))
-        _risk_probe(tool, work, cancel)
-        return tool
+        lock = _risk_acquire_lease(tool.lease_path, cancel)
+        try:
+            _risk_verify_tool(tool, cancel)
+            work = _risk_private_tree(self.base, ("tools", "sh-guard", ".work"))
+            _risk_probe(tool, work, cancel)
+            return tool
+        finally:
+            os.close(lock)
 
     def install(self, cancel, progress, transport=download_command_risk):
         self.release.validate()
         release = self.release
         root = _risk_private_tree(self.base, ("tools", "sh-guard"))
         work = _risk_private_tree(self.base, ("tools", "sh-guard", ".work"))
-        lock = os.open(root / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        lock = _risk_acquire_lease(str(root / ".lock"), cancel, exclusive=True, create=True)
         try:
-            info = os.fstat(lock)
-            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
-                    and stat.S_IMODE(info.st_mode) == 0o600, "risk_install_lock")
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             progress("DOWNLOADING")
             require(not cancel.is_set(), "risk_cancelled")
             raw = transport(release, cancel)
@@ -2053,32 +2287,15 @@ class CommandRiskInstallation:
             require(hashlib.sha256(raw).hexdigest() == release.archive_sha256, "risk_archive_hash")
             progress("VERIFYING")
             with tempfile.TemporaryDirectory(prefix="install-", dir=work) as staging:
-                binary, seen, total = Path(staging, "sh-guard"), set(), 0
-                with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
-                    for member in archive:
-                        require(not cancel.is_set(), "risk_cancelled")
-                        require(member.name in ("sh-guard", "sh-guard-mcp") and member.name not in seen
-                                and member.isfile() and not member.issparse() and not member.pax_headers,
-                                "risk_archive_members")
-                        _risk_number(member.size, 1, 16 * 1024 * 1024)
-                        seen.add(member.name)
-                        total += member.size
-                        require(total <= 32 * 1024 * 1024, "risk_archive_size")
-                        if member.name == "sh-guard":
-                            require(member.size == release.binary_size, "risk_binary_integrity")
-                            with archive.extractfile(member) as source:
-                                payload = source.read(release.binary_size + 1)
-                            require(len(payload) == release.binary_size
-                                    and hashlib.sha256(payload).hexdigest() == release.binary_sha256,
-                                    "risk_binary_integrity")
-                            fd = os.open(binary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-                            with os.fdopen(fd, "wb") as target:
-                                target.write(payload)
-                                target.flush()
-                                os.fsync(target.fileno())
-                            _risk_quarantine(binary)
-                            binary.chmod(0o500)
-                require(seen == {"sh-guard", "sh-guard-mcp"}, "risk_archive_members")
+                binary = Path(staging, "sh-guard")
+                payload = _risk_archive_binary(raw, release, cancel)
+                fd = os.open(binary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as target:
+                    target.write(payload)
+                    target.flush()
+                    os.fsync(target.fileno())
+                _risk_quarantine(binary)
+                binary.chmod(0o500)
                 require(not cancel.is_set(), "risk_cancelled")
                 progress("PROBING")
                 _risk_probe(self.tool(binary), work, cancel)
@@ -2104,12 +2321,9 @@ class CommandRiskInstallation:
         self.release.validate()
         root = self.base / "tools" / "sh-guard"
         _risk_directory(str(root))
-        lock = os.open(root / ".lock", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # Remove is a foreground action: fail busy immediately rather than block Tk.
+        lock = _risk_acquire_lease(str(root / ".lock"), threading.Event(), exclusive=True, timeout=0)
         try:
-            info = os.fstat(lock)
-            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
-                    and stat.S_IMODE(info.st_mode) == 0o600, "risk_install_lock")
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             tool = self.tool()
             _risk_verify_tool(tool, threading.Event())
             target = self.destination.parent
@@ -2174,6 +2388,11 @@ class CommandRiskReviewer:
 
     def _owner(self):
         require(threading.get_ident() == self.owner, "risk_wrong_thread")
+
+    def quiescent(self):
+        self._owner()
+        with self.condition:
+            return self.pending is None and self.cancel is None
 
     def invalidate(self):
         self._owner()
@@ -3318,6 +3537,7 @@ class AppCore:
         self.risk_setup_state = "DISABLED"
         self.risk_setup_error = None
         self.risk_setup_epoch = 0
+        self.risk_setup_pending = None
 
     def request_command_risk(self, enabled):
         self._command_risk._owner()
@@ -3327,21 +3547,17 @@ class AppCore:
         self._command_risk.configure()
         if self.risk_setup:
             self.risk_setup.close()
+        self.risk_setup_pending = None
         self.risk_setup_state, self.risk_setup_error = "DISABLED", None
         if not enabled:
             return
         self.risk_installation = None
-        if self.risk_setup and self.risk_setup.thread.is_alive():
-            self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", "risk_setup_busy"
-            return
-        self.risk_setup = None
         try:
             release = command_risk_release()
             release.validate()  # BEFORE any filesystem, dialog, transport or execution.
             base = self.preference_store.directory if self.preference_store else preference_directory()
             self.risk_installation = CommandRiskInstallation(base, release)
-            self.risk_setup = CommandRiskSetup(self.risk_installation)
-            self.risk_setup_state = "CHECKING_TOOL"
+            self._queue_command_risk_setup(False)
         except ProbeError as exc:
             self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", str(exc)
 
@@ -3352,34 +3568,47 @@ class AppCore:
             self.request_command_risk(False)
             return
         self.risk_installation.release.validate()
-        self.risk_setup = CommandRiskSetup(self.risk_installation, install=True)
-        self.risk_setup_state = "INSTALLING"
+        self._queue_command_risk_setup(True)
+
+    def _queue_command_risk_setup(self, install):
+        self.risk_setup_pending = (self.risk_installation, install)
+        self.risk_setup_state = "WAITING_FOR_REAP"
+        self._pump_command_risk_setup()
 
     def remove_command_risk(self):
         self._command_risk._owner()
         require(self.risk_installation is not None and not self.risk_requested
                 and (self.risk_setup is None or not self.risk_setup.thread.is_alive())
-                and (self._command_risk.cancel is None), "risk_cleanup_busy")
+                and self._command_risk.quiescent(), "risk_cleanup_busy")
         self.risk_installation.remove()
 
     def _pump_command_risk_setup(self):
         setup = self.risk_setup
-        if setup is None:
-            return
-        try:
-            kind, value = setup.events.get_nowait()
-        except queue.Empty:
-            return
-        self.risk_setup = None
-        if not self.risk_requested or setup.cancel.is_set():
-            return
-        if kind == "ready":
-            self._command_risk.configure(*value)
-            self.risk_setup_state, self.risk_setup_error = "READY", None
-        elif kind == "missing":
-            self.risk_setup_state = "INSTALL_CONFIRM"
-        else:
-            self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", value
+        if setup is not None:
+            try:
+                kind, value = setup.events.get_nowait()
+            except queue.Empty:
+                kind, value = None, None
+            if kind is not None:
+                self.risk_setup = None
+                if self.risk_requested and not setup.cancel.is_set():
+                    if kind == "ready":
+                        self._command_risk.configure(*value)
+                        self.risk_setup_state, self.risk_setup_error = "READY", None
+                    elif kind == "missing":
+                        self.risk_setup_state = "INSTALL_CONFIRM"
+                    else:
+                        self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", value
+            # Even a completion event is not permission to overlap the old worker.
+            if setup.thread.is_alive():
+                self.risk_setup = setup
+        if (self.risk_requested and self.risk_setup_pending is not None
+                and (self.risk_setup is None or not self.risk_setup.thread.is_alive())
+                and self._command_risk.quiescent()):
+            installation, install = self.risk_setup_pending
+            self.risk_setup_pending = None
+            self.risk_setup = CommandRiskSetup(installation, install=install)
+            self.risk_setup_state = "INSTALLING" if install else "CHECKING_TOOL"
 
     def set_command_risk(self, tool=None, directory=None):
         """Local headless setup only; callers own artifact admission. Default OFF."""
@@ -4084,6 +4313,7 @@ class AppCore:
         if self.risk_setup:
             self.risk_setup.close()
         self.risk_requested = False
+        self.risk_setup_pending = None
         self._command_risk.close()
         self.disconnect_bridge()
         self.pending_output = None
@@ -4139,6 +4369,9 @@ class ScrollableText:
 
     def show_review(self, source, spans=()):
         """Project source characters to actual Tcl indices; never reconstruct payload."""
+        if not spans:
+            self.show(review_fragments(source))
+            return
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         positions = []
@@ -5251,6 +5484,7 @@ class ReviewUI:
         labels = {"DISABLED": "", "IDLE": "Bereit · kein Command-Review" if not snapshot.review else "Nur AI→Terminal",
                   "CHECKING_TOOL": "sh-guard wird geprüft…", "INSTALL_CONFIRM": "Installation bestätigen…",
                   "INSTALLING": "sh-guard wird installiert…", "SCANNING": "Prüfung läuft…",
+                  "WAITING_FOR_REAP": "Vorherige Prüfung wird beendet…",
                   "STALE": "Analyse nicht mehr aktuell", "UNKNOWN": "Analyse unvollständig",
                   "UNAVAILABLE": "Prüfung nicht verfügbar"}
         error = risk.error

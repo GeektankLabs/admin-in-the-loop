@@ -1,5 +1,6 @@
 """Pinned SELF-CREATED archive/transport/Tk fixtures. No upstream binary/network."""
 import hashlib
+import gc
 import io
 import json
 import os
@@ -251,7 +252,7 @@ class InstallationTests(unittest.TestCase):
         extra.unlink()
         with open(self.base / "tools/sh-guard/.lock", "rb") as lock:
             a.fcntl.flock(lock, a.fcntl.LOCK_EX | a.fcntl.LOCK_NB)
-            with self.assertRaises(BlockingIOError):
+            with self.assertRaisesRegex(a.ProbeError, "risk_lease_busy"):
                 self.installation.remove()
             self.assertTrue(Path(tool.binary).exists())
 
@@ -384,6 +385,8 @@ class RiskGUITests(unittest.TestCase):
         for callback in self.root.tk.call("after", "info"):
             self.root.after_cancel(callback)
         self.root.destroy()
+        self.ui = self.root = self.core = None
+        gc.collect()  # Dispose Tcl-owned cycles on the creating thread, before another worker starts.
 
     def until(self, predicate, timeout=4):
         deadline = time.monotonic() + timeout
