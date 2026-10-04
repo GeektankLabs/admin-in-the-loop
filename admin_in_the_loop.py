@@ -5378,7 +5378,7 @@ class ReviewUI:
         self.risk_render_key = None
         self.risk_confirm_pending = False
         self.status_labels = []
-        root.title("Admin in the Loop")
+        root.title("Admin in the Loop · v" + BRIDGE_SERVER_INFO["version"])
         width = min(1360, root.winfo_screenwidth())
         height = min(850, max(600, root.winfo_screenheight() - 80))
         root.geometry("%dx%d+0+0" % (width, height))

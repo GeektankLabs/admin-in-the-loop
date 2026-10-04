@@ -13,6 +13,8 @@ Integrationsstand `6108390d927c9247fdf4627ef0bc2a1b345d901c`.
 - Konsolidierte stdlib-Bridge mit approved-output Events und kanonischem Pull-Fallback.
 - Optionales lokales sh-guard-Plumbing einschließlich Review-UI integriert;
   standardmäßig OFF, alle realen Pins weiterhin `approved=False`.
+- Die Hauptfenstertitelleiste zeigt die App-Version dynamisch aus der kanonischen
+  MCP-Versionsmetadatenquelle.
 
 Operatorentscheidung vom 4. Oktober 2026, 23:06 Europe/Berlin: Der alleinige Tester
 nimmt diesen Stand für persönliche Tests an; externe Vorab-Abnahmen sind kein
