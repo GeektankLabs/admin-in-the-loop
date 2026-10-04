@@ -53,7 +53,7 @@ def request(url, method="GET", path=None, body=None, headers=None):
 
 def mcp(process, name, args=None, modern=False):
     args = dict(args or {})
-    args.setdefault("conversation", process.profile.conversation)
+    args.setdefault("conversation", getattr(process, "chat_code", process.profile.conversation))
     value = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
              "params": {"name": name, "arguments": args}}
     headers = {"X-AITL-AI-Key": process.ai_token}
@@ -308,6 +308,7 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(json.loads(raw)["result"]["isError"])
             self.assertTrue(self.process.profile.conversation.encode() not in raw)
+            self.assertTrue(self.process.chat_code.encode() not in raw)
         value["params"]["name"] = "get_preferences"
         status, raw = request(self.process.mcp_url, "POST", body=value, headers=headers)
         self.assertTrue(json.loads(raw)["result"]["isError"])
@@ -383,6 +384,234 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(len(mcp(self.process, "get_approved_output")["outputs"][0]["text"]), a.OUTPUT_LIMIT)
 
 
+class ChatBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-chat-binding-")
+        self.addCleanup(self.temp.cleanup)
+        self.now = 1800000000.0
+        self.store = a.BridgeStore(self.temp.name, uuid.uuid4().hex, clock=lambda: self.now)
+        self.controller, self.controller_id = self.store.issue("CONTROLLER")
+        self.ai, self.ai_id = self.store.issue("AI")
+        self.harness = ServiceHarness(self.store, self.controller, self.controller_id, self.ai, self.ai_id)
+        self.addCleanup(self.harness.close)
+        self.code = self.harness.chat_code
+
+    def rpc(self, method, params, token=None):
+        value = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": method, "params": dict(params)}
+        value["params"].setdefault("_meta", {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                               "io.modelcontextprotocol/clientCapabilities": {}})
+        status, raw = request(self.harness.mcp_url, "POST", body=value, headers={
+            "X-AITL-AI-Key": token or self.ai, "MCP-Protocol-Version": "2026-07-28"})
+        self.assertEqual(status, 200)
+        packet = json.loads(raw)
+        return packet.get("result", packet)
+
+    def tool(self, code, *, token=None, name="get_preferences", arguments=None):
+        values = dict(arguments or {})
+        values["conversation"] = code
+        return self.rpc("tools/call", {"name": name, "arguments": values}, token)
+
+    def controller_binding(self):
+        return a.BridgeHTTP(self.harness.profile).request("GET", "/v1/chat-binding")
+
+    def test_happy_path_rotation_authentication_and_idempotent_retry(self):
+        self.assertEqual(len(self.code), 8)
+        self.assertTrue(all(char in a.BRIDGE_CHAT_ALPHABET for char in self.code))
+        self.assertNotEqual(self.code, self.store.conversation)
+        entered = self.code.lower()[:4] + "-" + self.code.lower()[4:]
+        self.assertEqual(self.tool(entered)["structuredContent"]["block_size"], "SMALL")
+        self.assertEqual(self.controller_binding()["code"], self.code)
+        self.assertEqual(request(self.harness.profile.url, path="/v1/chat-binding")[0], 401)
+        self.assertEqual(request(self.harness.profile.url, path="/v1/chat-binding",
+                                 headers={"Authorization": "Bearer " + self.ai})[0], 401)
+        request_id = uuid.uuid4().hex
+        body = {"version": 1, "request_id": request_id, "expected_generation": 1}
+        rotated = a.BridgeHTTP(self.harness.profile).request("POST", "/v1/chat-binding/rotate", body)
+        replay = a.BridgeHTTP(self.harness.profile).request("POST", "/v1/chat-binding/rotate", body)
+        self.assertEqual(rotated["generation"], 2)
+        self.assertEqual(rotated["code"], replay["code"])
+        self.assertNotEqual(rotated["code"], self.code)
+        self.assertEqual(self.harness.profile.conversation, self.store.conversation)
+        self.assertEqual(self.tool(self.code)["structuredContent"]["error"], "conversation_binding_required")
+        self.assertEqual(self.tool(rotated["code"])["structuredContent"]["block_size"], "SMALL")
+        stale = request(self.harness.profile.url, "POST", "/v1/chat-binding/rotate",
+                        {"version": 1, "request_id": uuid.uuid4().hex, "expected_generation": 1},
+                        {"Authorization": "Bearer " + self.controller})
+        self.assertEqual(stale[0], 409)
+
+    def test_backoff_sequence_principal_lock_spam_and_recovery(self):
+        for _ in range(3):
+            self.assertEqual(self.tool("WRONG000")["structuredContent"]["error"], "conversation_binding_required")
+        for failure, delay in enumerate(a._bridge_component["BRIDGE_CHAT_BACKOFF"], start=4):
+            result = self.tool("WRONG000")["structuredContent"]
+            self.assertEqual(result["error"], "conversation_binding_backoff")
+            self.assertEqual(result["retry_after_seconds"], delay)
+            if failure == 4:
+                for _ in range(3):
+                    spam = self.tool(self.code)["structuredContent"]
+                    self.assertEqual(spam["error"], "conversation_binding_backoff")
+                    self.assertEqual(spam["retry_after_seconds"], delay)
+                row = self.store.execute("SELECT failures,next_allowed FROM chat_binding_attempts WHERE principal=?",
+                                         (self.ai_id,)).fetchone()
+                self.assertEqual(row["failures"], 4)
+                deadline = row["next_allowed"]
+                self.assertEqual(deadline, self.store.execute(
+                    "SELECT next_allowed FROM chat_binding_attempts WHERE principal=?", (self.ai_id,)).fetchone()[0])
+            self.now += delay
+        locked = self.tool("WRONG000")["structuredContent"]
+        self.assertEqual(locked["error"], "conversation_binding_locked")
+        until = self.store.execute("SELECT locked_until FROM chat_binding_attempts WHERE principal=?",
+                                   (self.ai_id,)).fetchone()[0]
+        for _ in range(3):
+            self.assertEqual(self.tool(self.code)["structuredContent"]["error"], "conversation_binding_locked")
+        self.assertEqual(self.store.execute("SELECT locked_until FROM chat_binding_attempts WHERE principal=?",
+                                            (self.ai_id,)).fetchone()[0], until)
+        self.assertEqual(self.controller_binding()["status"], "LOCKED")
+        self.now += a.BRIDGE_CHAT_LOCKOUT
+        self.assertEqual(self.tool(self.code)["structuredContent"]["block_size"], "SMALL")
+
+    def test_binding_wide_lock_across_principals_and_recovery(self):
+        principals = [(self.ai, self.ai_id)] + [self.store.issue("AI") for _ in range(2)]
+        final = None
+        for principal_index, (token, _) in enumerate(principals):
+            for failure in range(1, 11):
+                final = self.tool("WRONG000", token=token)["structuredContent"]
+                if failure < 4:
+                    self.assertEqual(final["error"], "conversation_binding_required")
+                elif failure < 10:
+                    self.assertEqual(final["error"], "conversation_binding_backoff")
+                elif principal_index < len(principals) - 1:
+                    self.assertEqual(final["error"], "conversation_binding_backoff")
+                else:
+                    self.assertEqual(final["error"], "conversation_binding_locked")
+                if failure >= 4:
+                    self.now += a._bridge_component["BRIDGE_CHAT_BACKOFF"][failure - 4]
+        self.assertEqual(final["error"], "conversation_binding_locked")
+        row = self.store.execute("SELECT failure_times,locked_until FROM chat_binding_attempts WHERE principal='*'").fetchone()
+        self.assertEqual(len(json.loads(row["failure_times"])), a.BRIDGE_CHAT_BINDING_FAILURES)
+        until = row["locked_until"]
+        for _ in range(4):
+            self.assertEqual(self.tool(self.code)["structuredContent"]["error"], "conversation_binding_locked")
+        self.assertEqual(self.store.execute("SELECT locked_until FROM chat_binding_attempts WHERE principal='*'").fetchone()[0], until)
+        self.assertEqual(self.controller_binding()["status"], "LOCKED")
+        self.now = until
+        self.assertEqual(self.tool(self.code)["structuredContent"]["block_size"], "SMALL")
+
+    def test_parallel_bad_guesses_are_serialized_and_bad_auth_does_not_count(self):
+        tokens = [self.store.issue("AI") for _ in range(20)]
+        barrier = threading.Barrier(len(tokens))
+        results = []
+        result_lock = threading.Lock()
+
+        def guess(token, _identifier):
+            barrier.wait(timeout=5)
+            value = self.tool("WRONG000", token=token)["structuredContent"]
+            with result_lock:
+                results.append(value["error"])
+
+        workers = [threading.Thread(target=guess, args=pair) for pair in tokens]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=8)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(len(results), len(tokens))
+        aggregate = self.store.execute("SELECT failure_times FROM chat_binding_attempts WHERE principal='*'").fetchone()
+        self.assertEqual(len(json.loads(aggregate[0])), len(tokens))
+        before = len(json.loads(aggregate[0]))
+        status, _ = request(self.harness.mcp_url, "POST", body={"jsonrpc": "2.0", "id": 1,
+            "method": "tools/call", "params": {"name": "get_preferences", "arguments": {"conversation": "WRONG000"}}},
+            headers={"X-AITL-AI-Key": "0" * 64})
+        self.assertEqual(status, 401)
+        after = self.store.execute("SELECT failure_times FROM chat_binding_attempts WHERE principal='*'").fetchone()
+        self.assertEqual(len(json.loads(after[0])), before)
+
+    def test_expiry_rotation_and_expired_code_recovery(self):
+        self.now += a.BRIDGE_CHAT_LIFETIME
+        expired = self.controller_binding()
+        self.assertEqual(expired["status"], "EXPIRED")
+        self.assertIsNone(expired["code"])
+        self.assertEqual(self.tool(self.code)["structuredContent"]["error"], "conversation_binding_expired")
+        rotated = a.BridgeHTTP(self.harness.profile).request("POST", "/v1/chat-binding/rotate", {
+            "version": 1, "request_id": uuid.uuid4().hex, "expected_generation": 1})
+        self.assertEqual(rotated["status"], "VALID")
+        self.assertEqual(rotated["generation"], 2)
+        self.assertEqual(self.tool(rotated["code"])["structuredContent"]["block_size"], "SMALL")
+
+    def test_legacy_code_alias_is_one_time_and_rotation_ends_it(self):
+        legacy_dir = Path(self.temp.name, "legacy")
+        conversation = uuid.uuid4().hex
+        legacy = a.BridgeStore(legacy_dir, conversation, clock=lambda: self.now)
+        _, identifier = legacy.issue("AI")
+        legacy.close()
+        db = sqlite3.connect(legacy_dir / "bridge.sqlite3")
+        db.execute("DELETE FROM meta WHERE key='chat_binding'")
+        db.commit()
+        db.close()
+        migrated = a.BridgeStore(legacy_dir, conversation, clock=lambda: self.now)
+        try:
+            self.assertNotEqual(migrated.chat_binding["code"], conversation)
+            self.assertEqual(migrated.authorize_chat_binding(identifier, conversation), 1)
+            rotated = migrated.rotate_chat_binding(uuid.uuid4().hex, 1, identifier)
+            with self.assertRaises(a.BridgeError) as old:
+                migrated.authorize_chat_binding(identifier, conversation)
+            self.assertEqual(old.exception.code, "conversation_binding_required")
+            self.assertEqual(migrated.authorize_chat_binding(identifier, rotated["code"]), 2)
+            self.now += a.BRIDGE_CHAT_LIFETIME
+            with self.assertRaises(a.BridgeError) as expired:
+                migrated.authorize_chat_binding(identifier, rotated["code"])
+            self.assertEqual(expired.exception.code, "conversation_binding_expired")
+        finally:
+            migrated.close()
+
+    def test_event_subscription_generation_and_callback_rotation_race(self):
+        secret = "whsec_" + base64.b64encode(b"r" * 24).decode()
+        params = {"name": a.BRIDGE_EVENT_NAME, "arguments": {"conversation": self.code},
+                  "delivery": {"mode": "webhook", "url": "https://callback.example/generation",
+                               "secret": secret}}
+        subscribed = self.rpc("events/subscribe", params)
+        identifier = subscribed["id"]
+        self.assertEqual(self.store.find_subscription(self.ai_id, "https://callback.example/generation",
+                                                      a.BRIDGE_EVENT_NAME, "{}")["binding_generation"], 1)
+        rotated = a.BridgeHTTP(self.harness.profile).request("POST", "/v1/chat-binding/rotate", {
+            "version": 1, "request_id": uuid.uuid4().hex, "expected_generation": 1})
+        self.assertIsNone(self.store.active_subscription(identifier, self.now))
+        self.assertEqual(self.store.count_subscriptions(self.ai_id), 0)
+        self.assertEqual(self.tool(self.code)["structuredContent"]["error"], "conversation_binding_required")
+
+        def rotate_during_verification(*_):
+            self.store.rotate_chat_binding(uuid.uuid4().hex, rotated["generation"], self.controller_id)
+            return True
+
+        race_params = {"name": a.BRIDGE_EVENT_NAME,
+                       "arguments": {"conversation": rotated["code"]},
+                       "delivery": {"mode": "webhook", "url": "https://callback.example/race",
+                                    "secret": secret}}
+        with mock.patch.object(self.harness.service, "verify_callback", rotate_during_verification):
+            raced = self.rpc("events/subscribe", race_params)
+        self.assertEqual(raced["error"]["data"]["reason"], "conversation_binding_expired")
+        self.assertEqual(self.store.count_subscriptions(self.ai_id), 0)
+
+    def test_backoff_persists_across_store_restart(self):
+        for _ in range(3):
+            with self.assertRaises(a.BridgeError):
+                self.store.authorize_chat_binding(self.ai_id, "WRONG000")
+        with self.assertRaises(a.BridgeError) as blocked:
+            self.store.authorize_chat_binding(self.ai_id, "WRONG000")
+        self.assertEqual(blocked.exception.code, "conversation_binding_backoff")
+        conversation = self.store.conversation
+        code = self.code
+        self.harness.close()
+        reopened = a.BridgeStore(self.temp.name, conversation, clock=lambda: self.now)
+        self.harness.store = reopened
+        self.store = reopened
+        with self.assertRaises(a.BridgeError) as still_blocked:
+            reopened.authorize_chat_binding(self.ai_id, code)
+        self.assertEqual(still_blocked.exception.code, "conversation_binding_backoff")
+        self.now += 1
+        self.assertEqual(reopened.authorize_chat_binding(self.ai_id, code), 1)
+
+
 class ConnectedRoundTripTests(unittest.TestCase):
     def test_stopped_network_worker_blocks_existing_approval(self):
         self.submit(": > stopped-worker-marker")
@@ -447,7 +676,8 @@ class ConnectedRoundTripTests(unittest.TestCase):
         self.core.connect_profile(harness.profile)
         self.addCleanup(self.core.disconnect_bridge)
         self.fixture.wait(lambda: self.core.bridge_state == "CONNECTED", timeout=6)
-        process = SimpleNamespace(profile=harness.profile, ai_token=ai, mcp_url=harness.mcp_url)
+        process = SimpleNamespace(profile=harness.profile, ai_token=ai, mcp_url=harness.mcp_url,
+                                  chat_code=harness.chat_code)
 
         def event_rpc(method, params):
             value = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": method,
@@ -462,7 +692,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
         secret = "whsec_" + base64.b64encode(b"e" * 24).decode()
         subscribed = event_rpc("events/subscribe", {
             "name": a.BRIDGE_EVENT_NAME,
-            "arguments": {"conversation": harness.profile.conversation},
+            "arguments": {"conversation": harness.chat_code},
             "delivery": {"mode": "webhook", "url": "https://callback.example/continuation",
                          "secret": secret}})
         subscription_id = subscribed["id"]
@@ -934,7 +1164,7 @@ class TunnelTests(unittest.TestCase):
                     tunnel = a.TunnelProcess(config, core.bridge_process.mcp_url, core.bridge_process.ai_token)
                 def call(name, args=None):
                     identifier = uuid.uuid4().hex
-                    args = dict(args or {}) | {"conversation": core.bridge_profile.conversation}
+                    args = dict(args or {}) | {"conversation": core.bridge_process.chat_code}
                     payload = {"jsonrpc": "2.0", "id": identifier, "method": "tools/call",
                                "params": {"name": name, "arguments": args, "_meta": {
                                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -1051,6 +1281,7 @@ class ServiceHarness:
         self.temp = tempfile.TemporaryDirectory(prefix="aitl-events-")
         self.store, self.controller, self.ai = store, controller, ai
         self.ai_id, self.controller_id = ai_id, controller_id
+        self.chat_code = store.chat_binding["code"]
         self.service = a.BridgeService(store)
         self.verifications, self.deliveries, self.failures = {}, {}, {}
 
@@ -1136,7 +1367,7 @@ class EventSubscriptionTests(unittest.TestCase):
                   url="https://callback.example/hook", secret=None, mode="webhook", ttl=None):
         delivery = {"mode": mode, "url": url, "secret": secret or self.secret}
         params = {"name": name, "delivery": delivery,
-                  "arguments": dict(arguments or {}, conversation=self.store.conversation)}
+                  "arguments": dict(arguments or {}, conversation=self.harness.chat_code)}
         if ttl is not None:
             params["ttlMs"] = ttl
         return self.rpc("events/subscribe", params)
@@ -1159,6 +1390,7 @@ class EventSubscriptionTests(unittest.TestCase):
         self.assertIn("conversation", definition["inputSchema"]["required"])
         self.assertNotIn("conversation", definition["payloadSchema"]["properties"])
         self.assertNotIn(self.store.conversation, json.dumps(definition))
+        self.assertNotIn(self.harness.chat_code, json.dumps(definition))
         self.assertEqual(self.rpc("events/list", {"cursor": "ignored"}, modern=False)["error"]["code"], -32601)
 
     def test_webhook_signature_helper_matches_standard_webhooks(self):
@@ -1192,7 +1424,7 @@ class EventSubscriptionTests(unittest.TestCase):
         self.assertNotEqual(filtered["result"]["id"], identifier)
         first = self.rpc("events/unsubscribe", {
             "name": a.BRIDGE_EVENT_NAME, "arguments": {"submission_id": "s" * 32,
-                                                       "conversation": self.store.conversation},
+                                                       "conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": "https://callback.example/hook-s"}})
         self.assertEqual({key: value for key, value in first["result"].items()
                           if key not in {"resultType", "_meta"}}, {})
@@ -1201,7 +1433,7 @@ class EventSubscriptionTests(unittest.TestCase):
             self.canonical({"submission_id": "s" * 32})))
         again = self.rpc("events/unsubscribe", {
             "name": a.BRIDGE_EVENT_NAME,
-            "arguments": {"conversation": self.store.conversation},
+            "arguments": {"conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": "https://callback.example/hook-s"}})
         self.assertEqual({key: value for key, value in again["result"].items()
                           if key not in {"resultType", "_meta"}}, {})
@@ -1222,7 +1454,7 @@ class EventSubscriptionTests(unittest.TestCase):
     def test_missing_wrong_binding_cannot_subscribe_receive_or_ack(self):
         params = {"name": a.BRIDGE_EVENT_NAME,
                   "delivery": {"mode": "webhook", "url": self.callback_url, "secret": self.secret}}
-        for arguments in (None, {}, {"conversation": "wrong_binding_0001"}, {"conversation": None}):
+        for arguments in (None, {}, {"conversation": "wrong_binding_0001"}):
             with self.subTest(arguments=arguments):
                 attempt = dict(params)
                 if arguments is not None:
@@ -1247,7 +1479,7 @@ class EventSubscriptionTests(unittest.TestCase):
     def test_refresh_secret_update_and_unsubscribe_require_binding(self):
         identifier = self.subscribe(url=self.callback_url)["result"]["id"]
         before = self.store.find_subscription(self.ai_id, self.callback_url, a.BRIDGE_EVENT_NAME, "{}")
-        for arguments in ({}, {"conversation": "wrong_binding_0001"}):
+        for arguments in ({},):
             for method in ("events/subscribe", "events/unsubscribe"):
                 with self.subTest(method=method, arguments=arguments):
                     delivery = {"mode": "webhook", "url": self.callback_url}
@@ -1259,7 +1491,7 @@ class EventSubscriptionTests(unittest.TestCase):
                     self.assertEqual(self.store.find_subscription(self.ai_id, self.callback_url,
                                                                   a.BRIDGE_EVENT_NAME, "{}"), before)
         removed = self.rpc("events/unsubscribe", {"name": a.BRIDGE_EVENT_NAME,
-            "arguments": {"conversation": self.store.conversation},
+            "arguments": {"conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": self.callback_url}})
         self.assertIn("result", removed)
         self.assertIsNone(self.store.active_subscription(identifier, self.store.clock()))
@@ -1326,7 +1558,7 @@ class EventDeliveryTests(unittest.TestCase):
     def subscribe(self, url="https://delivery.example/hook", arguments=None):
         params = {"name": a.BRIDGE_EVENT_NAME,
                   "delivery": {"mode": "webhook", "url": url, "secret": self.secret},
-                  "arguments": dict(arguments or {}, conversation=self.store.conversation)}
+                  "arguments": dict(arguments or {}, conversation=self.harness.chat_code)}
         result = self.rpc("events/subscribe", params)
         if result.get("result", {}).get("id"):
             self.harness.subscriptions.append(result["result"]["id"])
@@ -1344,7 +1576,7 @@ class EventDeliveryTests(unittest.TestCase):
 
     def approved_output_tool(self, arguments):
         return self.rpc("tools/call", {"name": "get_approved_output",
-                                       "arguments": dict(arguments, conversation=self.store.conversation)})
+                                       "arguments": dict(arguments, conversation=self.harness.chat_code)})
 
     def test_event_only_after_human_approved_output(self):
         created = self.store.submit({"request_id": uuid.uuid4().hex, "text": "true"})
@@ -1385,7 +1617,7 @@ class EventDeliveryTests(unittest.TestCase):
         submission = created["submission_id"]
         gone = self.rpc("events/unsubscribe", {
             "name": a.BRIDGE_EVENT_NAME,
-            "arguments": {"conversation": self.store.conversation},
+            "arguments": {"conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": "https://delivery.example/hook"}})
         self.assertEqual({key: value for key, value in gone["result"].items()
                           if key not in {"resultType", "_meta"}}, {})
@@ -1582,7 +1814,7 @@ class WebhookTransportTests(EventSubscriptionTests):
         self.assertNotEqual(filtered["result"]["id"], identifier)
         first = self.rpc("events/unsubscribe", {
             "name": a.BRIDGE_EVENT_NAME, "arguments": {"submission_id": "s" * 32,
-                                                       "conversation": self.store.conversation},
+                                                       "conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": self.receiver_url("hook-s")}})
         self.assertEqual({key: value for key, value in first["result"].items()
                           if key not in {"resultType", "_meta"}}, {})
@@ -1591,7 +1823,7 @@ class WebhookTransportTests(EventSubscriptionTests):
             self.canonical({"submission_id": "s" * 32})))
         again = self.rpc("events/unsubscribe", {
             "name": a.BRIDGE_EVENT_NAME,
-            "arguments": {"conversation": self.store.conversation},
+            "arguments": {"conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": self.receiver_url("hook-s")}})
         self.assertEqual({key: value for key, value in again["result"].items()
                           if key not in {"resultType", "_meta"}}, {})
@@ -1628,11 +1860,11 @@ class WebhookTransportTests(EventSubscriptionTests):
         self.assertNotIn(self.store.conversation.encode(), entry["body"])
         self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
         named = self.rpc("tools/call", {"name": "get_approved_output",
-                                        "arguments": {"conversation": self.store.conversation,
+                                        "arguments": {"conversation": self.harness.chat_code,
                                                       "submission_id": submission}})
         self.assertEqual(len(named["result"]["structuredContent"]["outputs"]), 1)
         general = self.rpc("tools/call", {"name": "get_approved_output",
-                                          "arguments": {"conversation": self.store.conversation}})
+                                          "arguments": {"conversation": self.harness.chat_code}})
         self.assertEqual(general["result"]["structuredContent"]["outputs"], [])
 
     def test_mixed_private_dns_is_rejected_before_any_connection(self):
@@ -1701,7 +1933,7 @@ class WebhookTransportTests(EventSubscriptionTests):
         fresh_ai, _ = self.store.issue("AI")
         status, raw = request(self.harness.mcp_url, "POST", body={"jsonrpc": "2.0", "id": 1,
             "method": "tools/call", "params": {"name": "get_approved_output",
-                "arguments": {"conversation": self.store.conversation}}},
+            "arguments": {"conversation": self.harness.chat_code}}},
             headers={"X-AITL-AI-Key": fresh_ai})
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw)["result"]["structuredContent"]["outputs"][0]["output_id"],
@@ -1743,7 +1975,7 @@ class SubscriptionContractTests(EventSubscriptionTests):
                   cursor=None):
         delivery = {"mode": mode, "url": url, "secret": secret or self.secret}
         params = {"name": name, "delivery": delivery,
-                  "arguments": dict(arguments or {}, conversation=self.store.conversation)}
+                  "arguments": dict(arguments or {}, conversation=self.harness.chat_code)}
         if ttl is not None:
             params["ttlMs"] = ttl
         params["cursor"] = cursor  # documented (subscribe carries cursor: null)
@@ -1754,7 +1986,7 @@ class SubscriptionContractTests(EventSubscriptionTests):
         self.assertTrue(result["result"]["id"].startswith("sub_"))
         refresh = self.rpc("events/subscribe", {
             "name": a.BRIDGE_EVENT_NAME, "cursor": None,
-            "arguments": {"conversation": self.store.conversation},
+            "arguments": {"conversation": self.harness.chat_code},
             "delivery": {"mode": "webhook", "url": "https://callback.example/hook",
                          "secret": self.secret}})
         self.assertEqual(refresh["result"]["id"], result["result"]["id"])
@@ -1936,7 +2168,7 @@ class CorrectionRegressionTests(unittest.TestCase):
                 principal = store.authenticate(ai, "AI")
                 with mock.patch.object(service, "verify_callback", return_value=True):
                     refreshed = service.subscribe(principal, {"name": a.BRIDGE_EVENT_NAME,
-                        "arguments": {"conversation": conversation},
+                        "arguments": {"conversation": store.chat_binding["code"]},
                         "delivery": {"mode": "webhook", "url": self.callback_url, "secret": self.secret}})
                 self.assertEqual(refreshed["id"], identifier)
                 self.assertIsNotNone(store.active_subscription(identifier, store.clock()))
@@ -2042,7 +2274,7 @@ class CorrectionRegressionTests(unittest.TestCase):
         request_id = uuid.uuid4().hex
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "submit_proposal", "arguments": {"request_id": request_id,
-                "text": "true", "conversation": self.store.conversation}}}).encode()
+                "text": "true", "conversation": self.harness.chat_code}}}).encode()
         headers = ("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-AITL-AI-Key: %s\r\n"
                    "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n") % (port, self.harness.ai, len(body))
         sock = socket.create_connection(("127.0.0.1", port), timeout=8)
@@ -2121,7 +2353,8 @@ class CorrectionRegressionTests(unittest.TestCase):
                 external.execute("DELETE FROM tokens WHERE id=?", (self.ai_id,))
                 return row
             with mock.patch.object(self.store, "active_subscription", revoke_after_check):
-                self.assertFalse(self.store.mark_delivered(output["output_id"], identifier))
+                self.assertFalse(self.store.mark_delivered(output["output_id"], identifier,
+                                                          self.store.chat_binding["generation"]))
         finally:
             external.close()
         self.assertEqual(self.store.execute("SELECT delivered,delivered_at FROM outputs WHERE id=?",

@@ -91,11 +91,17 @@ class GUISmokeTests(unittest.TestCase):
                 self.assertIsNone(core.bridge_process)
                 core.connect_local_bridge()  # Exercise the transport smoke without real Platform credentials.
                 until(lambda: core.bridge_state == "CONNECTED")
+                until(lambda: core.chat_binding is not None)
                 self.assertIn("Lokale Bridge verbunden", dialog.summary.get())
+                shown = core.chat_binding["code"][:4] + "-" + core.chat_binding["code"][4:]
+                self.assertEqual(ui.chat_code.get(), shown)
+                self.assertTrue(ui.chat_code_copy.instate(["!disabled"]))
+                ui.chat_code_copy.invoke()
+                self.assertEqual(root.clipboard_get(), shown)
                 dialog.buttons["chat_show"].invoke()
-                self.assertEqual(dialog.binding.get(), core.bridge_profile.conversation)
+                self.assertEqual(dialog.binding.get(), shown)
                 dialog.buttons["chat_copy"].invoke()
-                self.assertEqual(root.clipboard_get(), core.bridge_profile.conversation)
+                self.assertEqual(root.clipboard_get(), shown)
                 mcp(core.bridge_process, "submit_proposal", {"request_id": "GUI_SMOKE_REQUEST_0001", "text": "printf 'GUI_MCP\\n'"})
                 until(lambda: bool(core.inbox))
                 ui.from_ai_button.invoke()
@@ -350,8 +356,30 @@ class ConnectionDialogTests(unittest.TestCase):
             local.assert_not_called()
             tunnel.assert_not_called()
         self.assertEqual(dialog.binding.get(), "")
+        self.until(lambda: self.core.chat_binding is not None)
         dialog.buttons["chat_show"].invoke()
-        self.assertEqual(dialog.binding.get(), self.core.bridge_profile.conversation)
+        shown = self.core.chat_binding["code"][:4] + "-" + self.core.chat_binding["code"][4:]
+        self.assertEqual(dialog.binding.get(), shown)
+        self.assertTrue(self.ui.chat_code_copy.instate(["!disabled"]))
+        self.ui.chat_code_copy.invoke()
+        self.assertEqual(self.root.clipboard_get(), shown)
+        original_binding = dict(self.core.chat_binding)
+        self.core.chat_binding = dict(original_binding, status="BACKOFF",
+                                      retry_at=original_binding["server_time"] + 45,
+                                      restriction_scope="PRINCIPAL")
+        self.ui.render()
+        self.assertEqual(self.ui.chat_code.get(), shown)
+        self.assertIn("Wartezeit", self.ui.chat_code_status.get())
+        self.assertTrue(self.ui.chat_code_copy.instate(["disabled"]))
+        self.core.chat_binding = original_binding
+        self.ui.render()
+        old_code = original_binding["code"]
+        dialog.buttons["chat_rotate"].invoke()
+        self.until(lambda: self.core.chat_binding and self.core.chat_binding["generation"] == 2)
+        self.root.update()
+        self.assertNotEqual(self.core.chat_binding["code"], old_code)
+        self.assertEqual(self.ui.chat_code.get(), self.core.chat_binding["code"][:4] + "-" +
+                         self.core.chat_binding["code"][4:])
         self.assertEqual(sum(isinstance(widget, tk.Toplevel) for widget in self.root.winfo_children()), 1)
         self.core.disconnect_bridge()
         self.ui.render()

@@ -2547,6 +2547,10 @@ class BridgeSnapshot:
     tunnel_state: str
     last_error: str | None
     certificate_warning: bool = False
+    chat_binding: dict | None = None
+    chat_binding_received_at: float | None = None
+    chat_binding_busy: bool = False
+    chat_binding_error: str | None = None
 
 
 class TransportError(ProbeError):
@@ -2729,6 +2733,35 @@ def validate_status(value, profile):
     return value["instance"]
 
 
+def validate_chat_binding(value, profile, instance):
+    fields(value, {"version", "instance", "conversation", "generation", "code", "issued_at",
+                   "expires_at", "server_time", "status", "retry_at", "restriction_scope", "locked_principals"})
+    require(type(value["version"]) is int and value["version"] == 1
+            and value["instance"] == instance and value["conversation"] == profile.conversation
+            and type(value["generation"]) is int and value["generation"] > 0,
+            "network_binding_mismatch")
+    for key in ("issued_at", "expires_at", "server_time"):
+        require(type(value[key]) in {float, int} and value[key] == value[key]
+                and abs(value[key]) != float("inf"), "network_schema")
+    require(value["expires_at"] == value["issued_at"] + BRIDGE_CHAT_LIFETIME
+            and value["issued_at"] <= value["server_time"], "network_schema")
+    require(value["code"] is None and value["status"] == "EXPIRED"
+            or type(value["code"]) is str and re.fullmatch("[" + BRIDGE_CHAT_ALPHABET + "]{8}", value["code"])
+            and value["status"] in {"VALID", "BACKOFF", "LOCKED"}, "network_schema")
+    require(value["status"] in {"VALID", "BACKOFF", "LOCKED", "EXPIRED"}
+            and type(value["locked_principals"]) is int and 0 <= value["locked_principals"] <= 32,
+            "network_schema")
+    require(value["retry_at"] is None or type(value["retry_at"]) in {int, float}
+            and value["retry_at"] == value["retry_at"] and abs(value["retry_at"]) != float("inf"),
+            "network_schema")
+    require(value["restriction_scope"] in {None, "BINDING", "PRINCIPAL"}, "network_schema")
+    require((value["status"] in {"BACKOFF", "LOCKED"}) == (value["retry_at"] is not None)
+            and (value["status"] in {"BACKOFF", "LOCKED"}) == (value["restriction_scope"] is not None),
+            "network_schema")
+    require(value["status"] != "EXPIRED" or value["code"] is None, "network_schema")
+    return value
+
+
 class ConnectionStore(PreferenceStore):
     """Separate private config. Only connection credentials, never approvals."""
     def load_connection(self):
@@ -2843,6 +2876,8 @@ class LocalBridgeProcess:
             status = BridgeHTTP(provisional).request("GET", "/v1/status")
             self.profile = replace(provisional, controller_id=status.get("controller_id"))
             validate_status(status, self.profile)
+            binding = BridgeHTTP(self.profile).request("GET", "/v1/chat-binding")
+            self.chat_code = validate_chat_binding(binding, self.profile, status["instance"])["code"]
             self.mcp_url = "http://127.0.0.1:" + str(value["mcp_port"]) + "/mcp"
         except BaseException:
             self.close()
@@ -2861,6 +2896,7 @@ class LocalBridgeProcess:
                 self.process.kill()
                 self.process.wait(timeout=2)
         self.ai_token = ""
+        self.chat_code = ""
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
@@ -3421,8 +3457,21 @@ class BridgeWorker:
         except queue.Full:
             self.stop.set()
 
+    def fetch_chat_binding(self, instance):
+        value = self.client.request("GET", "/v1/chat-binding")
+        return validate_chat_binding(value, self.profile, instance)
+
+    def emit_chat_binding(self, instance):
+        try:
+            self.emit("chat_binding", self.fetch_chat_binding(instance))
+        except (ProbeError, OSError):
+            # Binding presentation is independent of the established bridge auth and
+            # poll flow. On a failed refresh, hide the potentially stale credential.
+            self.emit("chat_binding_unavailable")
+
     def run(self):
         instance, delay = None, 1
+        next_binding_check = 0.0
         try:
             while not self.stop.is_set():
                 try:
@@ -3433,6 +3482,8 @@ class BridgeWorker:
                         self.client.request("PUT", "/v1/preferences", {"version": 1, "block_size": self.preference})
                         self.emit("connected", instance)
                         self.emit("certificate_warning", self.client.certificate_warning)
+                        self.emit_chat_binding(instance)
+                        next_binding_check = time.monotonic() + 2
                         delay = 1
                     while not self.commands.empty():
                         name, value = self.commands.get_nowait()
@@ -3446,6 +3497,27 @@ class BridgeWorker:
                             fields(result, {"version", "block_size"})
                             require(type(result["version"]) is int and result["version"] == 1
                                     and result["block_size"] == value, "network_schema")
+                        elif name == "rotate_chat_binding":
+                            request_id, expected_generation = value
+                            body = {"version": 1, "request_id": request_id,
+                                    "expected_generation": expected_generation}
+                            try:
+                                try:
+                                    result = self.client.request("POST", "/v1/chat-binding/rotate", body)
+                                except TransportError as exc:
+                                    if not exc.retryable:
+                                        raise
+                                    # Idempotent retry: a lost response must not rotate a
+                                    # second time or make the previous code recoverable.
+                                    result = self.client.request("POST", "/v1/chat-binding/rotate", body)
+                                result = validate_chat_binding(result, self.profile, instance)
+                                self.emit("chat_binding", result)
+                                self.emit("chat_binding_rotated", None)
+                            except ProbeError as exc:
+                                reason = str(exc)
+                                if reason == "network_http_409":
+                                    reason = "chat_binding_generation_conflict"
+                                self.emit("chat_binding_error", reason)
                         elif name == "output":
                             identifier, body = value
                             try:
@@ -3482,6 +3554,9 @@ class BridgeWorker:
                         status = self.client.request("GET", "/v1/status")
                         require(validate_status(status, self.profile) == instance, "network_instance_changed")
                         self.stop.wait(1)
+                    if time.monotonic() >= next_binding_check:
+                        self.emit_chat_binding(instance)
+                        next_binding_check = time.monotonic() + 2
                 except (ProbeError, OSError) as exc:
                     error = str(exc) if isinstance(exc, ProbeError) else "network_unavailable"
                     if error == "network_cursor_expired":
@@ -3540,6 +3615,11 @@ class AppCore:
         self.worker_id = 0
         self.bridge_error = None
         self.certificate_warning = False
+        self.chat_binding = None
+        self.chat_binding_received_at = None
+        self.chat_binding_busy = False
+        self.chat_binding_error = None
+        self.chat_binding_notice = None
         self.proposal_metadata = {}
         self.received_messages = {}
         self.bridge_cursor = ""
@@ -3665,7 +3745,8 @@ class AppCore:
                               profile.url if profile else None, profile.conversation if profile else None,
                               self.bridge_instance, self.bridge_generation,
                               self.tunnel.state if self.tunnel else "STOPPED", self.bridge_error,
-                              self.certificate_warning)
+                              self.certificate_warning, dict(self.chat_binding) if self.chat_binding else None,
+                              self.chat_binding_received_at, self.chat_binding_busy, self.chat_binding_error)
 
     def _bridge_binding(self):
         if self.bridge_state != "CONNECTED" or self.bridge_profile is None:
@@ -3711,6 +3792,10 @@ class AppCore:
         self.bridge_generation += 1
         self.worker_id += 1
         self.bridge_instance = None
+        self.chat_binding = None
+        self.chat_binding_received_at = None
+        self.chat_binding_busy = False
+        self.chat_binding_error = None
         self.bridge_state, self.bridge_error = "CONNECTING", None
         self.bridge_worker = BridgeWorker(self.bridge_profile, self.preferences, self.worker_id,
                                           self.bridge_cursor, not self.inbox)
@@ -3743,6 +3828,11 @@ class AppCore:
         self.bridge_generation += 1
         self.bridge_state = "DISCONNECTED"
         self.bridge_instance = None
+        self.chat_binding = None
+        self.chat_binding_received_at = None
+        self.chat_binding_busy = False
+        self.chat_binding_error = None
+        self.chat_binding_notice = None
         self.worker_id += 1
         if self.bridge_worker:
             self.bridge_worker.close()
@@ -3751,6 +3841,14 @@ class AppCore:
         if self.bridge_process:
             self.bridge_process.close()
             self.bridge_process = None
+
+    def rotate_chat_binding(self):
+        require(self.bridge_state == "CONNECTED" and self.bridge_worker is not None, "bridge_disconnected")
+        require(self.chat_binding is not None and not self.chat_binding_busy, "chat_binding_unavailable")
+        self.bridge_worker.post("rotate_chat_binding", (uuid.uuid4().hex, self.chat_binding["generation"]))
+        self.chat_binding_busy = True
+        self.chat_binding_error = None
+        self.chat_binding_notice = None
 
     def pair_remote(self, url, pin, code):
         """Synchronous headless setup action; no terminal or review side effects."""
@@ -3941,6 +4039,10 @@ class AppCore:
                     self._invalidate_bridge_review()
                     self.bridge_generation += 1
                     self.bridge_instance = None
+                    self.chat_binding = None
+                    self.chat_binding_received_at = None
+                    self.chat_binding_busy = False
+                    self.chat_binding_error = None
                     error, retryable = value
                     self.bridge_state = "RETRYING" if retryable else "BLOCKED"
                     self.bridge_error = error
@@ -3975,11 +4077,35 @@ class AppCore:
                 elif kind == "certificate_warning":
                     require(type(value) is bool, "network_schema")
                     self.certificate_warning = value
+                elif kind == "chat_binding":
+                    require(type(value) is dict and value["instance"] == self.bridge_instance
+                            and value["conversation"] == self.bridge_profile.conversation,
+                            "network_binding_mismatch")
+                    self.chat_binding = value
+                    self.chat_binding_received_at = time.monotonic()
+                    self.chat_binding_busy = False
+                    self.chat_binding_error = None
+                    self.chat_binding_notice = None
+                elif kind == "chat_binding_unavailable":
+                    self.chat_binding = None
+                    self.chat_binding_received_at = None
+                    self.chat_binding_busy = False
+                    self.chat_binding_error = "chat_binding_unavailable"
+                elif kind == "chat_binding_error":
+                    self.chat_binding = None
+                    self.chat_binding_received_at = None
+                    self.chat_binding_busy = False
+                    self.chat_binding_error = value
+                elif kind == "chat_binding_rotated":
+                    self.chat_binding_notice = "Chat-Code neu erzeugt · alten Code nicht mehr verwenden"
                 else:
                     raise ProbeError("network_event_unknown")
             if worker.stop.is_set() and self.bridge_state in {"CONNECTED", "CONNECTING", "RETRYING"}:
                 self._invalidate_bridge_review()
                 self.bridge_generation += 1
+                self.chat_binding = None
+                self.chat_binding_received_at = None
+                self.chat_binding_busy = False
                 self.bridge_state, self.bridge_error = "BLOCKED", "network_worker_stopped"
         if self.tunnel and time.monotonic() >= self.tunnel_check_at:
             self.tunnel_check_at = time.monotonic() + 2
@@ -4435,6 +4561,33 @@ def connection_summary(bridge):
     return transport + "\nChatGPT-Verbindung noch nicht verifiziert"
 
 
+def chat_binding_presentation(bridge):
+    """Return the display code, lifecycle status and whether deliberate copy is allowed."""
+    binding = bridge.chat_binding
+    if bridge.state != "CONNECTED":
+        return "", "Verbindung getrennt · Chat-Code ausgeblendet", False
+    if binding is None or bridge.chat_binding_received_at is None:
+        error = " · Status nicht verfügbar" if bridge.chat_binding_error else ""
+        return "", "Chat-Code wird geprüft" + error, False
+    elapsed = max(0.0, time.monotonic() - bridge.chat_binding_received_at)
+    if elapsed > 6:
+        return "", "Chat-Code-Status wird erneut geprüft", False
+    now = binding["server_time"] + elapsed
+    if now >= binding["expires_at"] or binding["status"] == "EXPIRED":
+        return "", "Abgelaufen · im Verbindungsdialog neuen Code erzeugen", False
+    code = binding["code"]
+    visible_code = code[:4] + "-" + code[4:] if type(code) is str else ""
+    if binding["status"] == "LOCKED":
+        seconds = max(1, int(binding["retry_at"] - now + .999))
+        target = "Chatbindung" if binding["restriction_scope"] == "BINDING" else "AI-Zugang"
+        return visible_code, "%s temporär gesperrt · noch %ds" % (target, seconds), False
+    if binding["status"] == "BACKOFF":
+        seconds = max(1, int(binding["retry_at"] - now + .999))
+        return visible_code, "Wartezeit nach Fehlversuchen · noch %ds" % seconds, False
+    expiry = datetime.fromtimestamp(binding["expires_at"], timezone.utc).astimezone().strftime("%d.%m. %H:%M")
+    return visible_code, "Gültig bis %s · Code nur dem gewählten Chat geben" % expiry, True
+
+
 def local_setup_summary(core):
     stages = {"PREPARING": "Client wird gesucht…", "INSTALLING": "Offizieller Client wird installiert…",
               "STARTING": "Lokale Verbindung wird vorbereitet…", "CONNECTING": "Lokale Verbindung wird aufgebaut…",
@@ -4471,6 +4624,7 @@ class ConnectionDialog:
         self.errors = {name: self.tk.StringVar(master=self.window) for name in ("bridge", "tunnel")}
         self.summary = self.tk.StringVar(master=self.window)
         self.binding = self.tk.StringVar(master=self.window)
+        self.binding_status = self.tk.StringVar(master=self.window)
         self.failure_cause = self.tk.StringVar(master=self.window)
         self.technical_open = self.tk.BooleanVar(master=self.window, value=False)
         self.last_diagnostic = None
@@ -4587,13 +4741,17 @@ class ConnectionDialog:
         self.technical_details.frame.grid(row=4, column=0, sticky="ew", pady=6)
 
         self.chat_section = chat = self.section(4, "3 · Gewählten Chat bewusst binden")
-        self.label(chat, 0, "Diesen Bearer-Code nur dem gewählten AI-Chat geben. Wer Code und App-Zugriff besitzt, "
-                   "kann freigegebenen Output lesen. Dies ist keine vom Provider bestätigte Chat-ID.")
+        self.label(chat, 0, "Den 24 Stunden gültigen Chat-Code nur dem gewählten AI-Chat geben. Wer Code und "
+                   "App-Zugriff besitzt, kann freigegebenen Output lesen. Dies ist keine vom Provider bestätigte Chat-ID.")
         self.button(chat, 1, "chat_show", "Chatbindung anzeigen", "bridge", self.show_binding)
         self.binding_entry = self.ttk.Entry(chat, textvariable=self.binding, state="readonly")
         self.binding_entry.grid(row=2, column=0, sticky="ew", pady=6)
         self.button(chat, 3, "chat_copy", "Chat-Code kopieren", "bridge", self.copy_binding)
-        self.label(chat, 4, "ChatGPT-Verbindung manuell prüfen: im gewählten Chat einen harmlosen Vorschlag für eine "
+        self.label(chat, 4, variable=self.binding_status)
+        self.label(chat, 5, "Nach Ablauf oder Rotation den neuen Code erneut bewusst mitteilen und MCP-Event-Abos "
+                   "im ausgewählten Chat erneuern. Rotation beendet auch den Legacy-Code.")
+        self.button(chat, 6, "chat_rotate", "Neuen Chat-Code erzeugen", "bridge", self.core.rotate_chat_binding)
+        self.label(chat, 7, "ChatGPT-Verbindung manuell prüfen: im gewählten Chat einen harmlosen Vorschlag für eine "
                    "Testshell anfordern, Command lokal prüfen/freigeben, Output separat wählen/prüfen/freigeben und "
                    "dessen Empfang im Chat bestätigen. Die App behauptet keine Provider-Verifikation.")
         self.details = self.tk.BooleanVar(master=self.window, value=False)
@@ -4708,6 +4866,8 @@ class ConnectionDialog:
             "no_saved_remote_connection": "Keine gespeicherte Remote-Verbindung vorhanden; Gateway-Pairing einrichten.",
             "saved_connection_mismatch": "Gespeicherte Verbindung passt nicht zur eingegebenen Adresse und zum Fingerprint.",
             "bridge_disconnected": "Zuerst eine authentifizierte Bridge-Verbindung herstellen.",
+            "chat_binding_unavailable": "Chat-Code-Status wird geladen; Verbindung prüfen und erneut versuchen.",
+            "chat_binding_generation_conflict": "Der Code wurde bereits geändert. Aktuellen Status abwarten; keine weitere Rotation gestartet.",
             "remote_command_not_ready": "HTTPS-Adresse mit Host/Port sowie gültige absolute Remote-Pfade und Bind-IP eingeben.",
             "homebrew_required": "Auf macOS unterstützt OpenAI Homebrew: Homebrew installieren (brew.sh), danach hier erneut starten. Alternativ den offiziellen Client mit brew install openai/tools/tunnel-client installieren; kein Gatekeeper-Bypass.",
             "client_download_failed": "Tunnel-Client konnte nicht heruntergeladen werden. Internetzugang zu GitHub prüfen und erneut starten.",
@@ -4835,14 +4995,18 @@ class ConnectionDialog:
 
     def show_binding(self):
         bridge = self.core.bridge_snapshot()
-        require(bridge.state == "CONNECTED", "bridge_disconnected")
-        self.revealed_binding = (bridge.instance, bridge.generation, bridge.conversation)
-        self.binding.set(bridge.conversation)
+        code, _, _ = chat_binding_presentation(bridge)
+        require(bridge.state == "CONNECTED" and code, "chat_binding_unavailable")
+        self.revealed_binding = (bridge.instance, bridge.generation, bridge.conversation,
+                                 bridge.chat_binding["generation"])
+        self.binding.set(code)
 
     def copy_binding(self):
-        require(bool(self.binding.get()) and self.core.bridge_state == "CONNECTED", "bridge_disconnected")
+        bridge = self.core.bridge_snapshot()
+        code, _, can_copy = chat_binding_presentation(bridge)
+        require(can_copy and self.binding.get() == code, "chat_binding_unavailable")
         self.window.clipboard_clear()
-        self.window.clipboard_append(self.binding.get())
+        self.window.clipboard_append(code)
 
     def render(self):
         bridge = self.core.bridge_snapshot()
@@ -4863,8 +5027,11 @@ class ConnectionDialog:
         self.chat_section.grid() if not local or ready or self.details.get() else self.chat_section.grid_remove()
         for name in ("reconnect", "disconnect"):
             self.buttons[name].grid_remove() if local else self.buttons[name].grid()
-        active_binding = (bridge.instance, bridge.generation, bridge.conversation)
-        if bridge.state != "CONNECTED" or active_binding != self.revealed_binding:
+        code, binding_status, _ = chat_binding_presentation(bridge)
+        self.binding_status.set(binding_status)
+        active_binding = (bridge.instance, bridge.generation, bridge.conversation,
+                          bridge.chat_binding["generation"] if bridge.chat_binding else None)
+        if bridge.state != "CONNECTED" or not code or active_binding != self.revealed_binding:
             self.binding.set("")
             self.revealed_binding = None
         visible = bool(self.binding.get())
@@ -4878,7 +5045,10 @@ class ConnectionDialog:
             "tunnel_help": True, "key_help": True,
             "pair": not local and self.compared.get() and bool(self.fields["code"].get()),
             "saved_connect": not local and self.saved_matches(), "remote_copy": bool(self.remote_command),
-            "chat_show": bridge.state == "CONNECTED", "chat_copy": visible,
+            "chat_show": bridge.state == "CONNECTED" and bool(code), "chat_copy": visible
+                and chat_binding_presentation(bridge)[2],
+            "chat_rotate": bridge.state == "CONNECTED" and bridge.chat_binding is not None
+                and not bridge.chat_binding_busy,
             "reconnect": self.core.bridge_profile is not None and
                 (self.core.bridge_profile.mode == "REMOTE" or self.core.bridge_process is not None
                  and self.core.bridge_process.process.poll() is None),
@@ -5335,6 +5505,18 @@ class ReviewUI:
                                   values=BLOCK_SIZES, state="readonly", width=12, justify="center")
         preference.pack(fill="x")
         preference.bind("<<ComboboxSelected>>", lambda _: self.action(lambda: core.set_preferences(self.preference.get())))
+        ttk.Separator(right_space, orient="horizontal").pack(fill="x", pady=(20, 12))
+        ttk.Label(right_space, text="Chat-Code", anchor="center", justify="center",
+                  font=("TkDefaultFont", 10, "bold")).pack(fill="x", pady=(0, 4))
+        self.chat_code = tk.StringVar(value="")
+        self.chat_code_label = tk.Label(right_space, textvariable=self.chat_code, font=("TkFixedFont", 16, "bold"),
+                                        anchor="center", padx=4, pady=5)
+        self.chat_code_label.pack(fill="x")
+        self.chat_code_status = tk.StringVar(value="Noch nicht verbunden")
+        ttk.Label(right_space, textvariable=self.chat_code_status, anchor="center", justify="center",
+                  wraplength=230).pack(fill="x", pady=(0, 4))
+        self.chat_code_copy = ttk.Button(right_space, text="Chat-Code kopieren", command=self.copy_chat_binding)
+        self.chat_code_copy.pack(fill="x")
         self.readiness = tk.Label(right, text="", wraplength=170, justify="center", padx=8, pady=10)
         self.readiness.grid(row=2, column=0, sticky="ew", pady=(12, 4))
 
@@ -5444,6 +5626,13 @@ class ReviewUI:
             return self.connection_dialog
         self.connection_dialog = self.action(lambda: ConnectionDialog(self))
         return self.connection_dialog
+
+    def copy_chat_binding(self):
+        bridge = self.core.bridge_snapshot()
+        code, _, can_copy = chat_binding_presentation(bridge)
+        require(can_copy and bool(code), "chat_binding_unavailable")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(code)
 
     def show_chat_binding(self):
         dialog = self.connection_settings()
@@ -5681,6 +5870,14 @@ class ReviewUI:
         busy = snapshot.review_state in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN"}
         bridge = snapshot.bridge
         self.ai_status.set(local_setup_summary(self.core) if self.core.local_setup_state != "IDLE" else connection_summary(bridge))
+        chat_code, chat_status, can_copy = chat_binding_presentation(bridge)
+        self.chat_code.set(chat_code)
+        if self.core.chat_binding_notice:
+            chat_status = self.core.chat_binding_notice
+        elif bridge.chat_binding_error == "chat_binding_generation_conflict":
+            chat_status = "Code wurde bereits geändert · Status wird aktualisiert"
+        self.chat_code_status.set(chat_status)
+        self.chat_code_copy.configure(state="normal" if can_copy else "disabled")
         self.from_terminal_button.configure(state="normal" if connected and not busy else "disabled")
         self.from_ai_button.configure(state="normal" if connected and snapshot.inbox and not busy else "disabled")
         ready = bool(snapshot.inbox)
@@ -6305,6 +6502,33 @@ BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
 BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.8.0"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+BRIDGE_CHAT_ALPHABET = "23456789ACFHJKMNPQRTVWXY"
+BRIDGE_CHAT_LIFETIME = 24 * 3600
+BRIDGE_CHAT_BACKOFF = (1, 2, 4, 8, 16, 32, 60, 60)
+BRIDGE_CHAT_PRINCIPAL_FAILURES = 12
+BRIDGE_CHAT_BINDING_FAILURES = 30
+BRIDGE_CHAT_WINDOW = 900
+BRIDGE_CHAT_LOCKOUT = 900
+BRIDGE_CHAT_CODE_SCHEMA = {"type": "string", "minLength": 8, "maxLength": 64,
+                           "pattern": "^[A-Za-z0-9 -]+$",
+                           "description": "The short human-shared chat code, formatted XXXX-XXXX. Never guess it."}
+
+
+def new_chat_code(except_code=None):
+    while True:
+        value = "".join(secrets.choice(BRIDGE_CHAT_ALPHABET) for _ in range(8))
+        if value != except_code:
+            return value
+
+
+def normalize_chat_code(value):
+    if type(value) is not str or len(value) > 64:
+        return ""
+    if any(ord(char) > 127 or char not in BRIDGE_CHAT_ALPHABET + BRIDGE_CHAT_ALPHABET.lower() + " -"
+           for char in value):
+        return ""
+    normalized = value.replace("-", "").replace(" ", "").upper()
+    return normalized if len(normalized) == 8 and all(char in BRIDGE_CHAT_ALPHABET for char in normalized) else ""
 
 
 class BridgeError(Exception):
@@ -6456,6 +6680,11 @@ class BridgeStore:
             url TEXT NOT NULL, name TEXT NOT NULL, args TEXT NOT NULL, secret TEXT NOT NULL,
             expires REAL NOT NULL);
           CREATE INDEX IF NOT EXISTS subscriptions_principal ON subscriptions(principal, expires);
+          CREATE TABLE IF NOT EXISTS chat_binding_attempts(
+            conversation TEXT NOT NULL, generation INTEGER NOT NULL, principal TEXT NOT NULL,
+            failures INTEGER NOT NULL, last_failure REAL, next_allowed REAL, locked_until REAL,
+            failure_times TEXT NOT NULL DEFAULT '[]',
+            PRIMARY KEY(conversation,generation,principal));
         """)
         for column, definition in (("delivered", "INTEGER NOT NULL DEFAULT 0"), ("delivered_at", "REAL")):
             try:
@@ -6468,9 +6697,71 @@ class BridgeStore:
             self.execute("ALTER TABLE subscriptions ADD COLUMN bound INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        try:
+            self.execute("ALTER TABLE subscriptions ADD COLUMN binding_generation INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         row = self.execute("SELECT value FROM meta WHERE key='conversation'").fetchone()
         check(row is None or row[0] == conversation, "conversation_state_mismatch")
         self.execute("INSERT OR IGNORE INTO meta VALUES('conversation',?)", (conversation,))
+        self.chat_binding = None
+        binding_row = self.execute("SELECT value FROM meta WHERE key='chat_binding'").fetchone()
+        if binding_row is None:
+            now = float(self.clock())
+            check(now == now and abs(now) != float("inf"), "chat_binding_clock_invalid", 500)
+            code = new_chat_code()
+            self.chat_binding = {
+                "code": code,
+                "code_digest": hashlib.sha256(code.encode("ascii")).hexdigest(),
+                "generation": 1,
+                "issued_at": now,
+                "expires_at": now + BRIDGE_CHAT_LIFETIME,
+                # Only a database that already existed with the old stable bearer ID
+                # receives this exact, one-time 24-hour compatibility alias.
+                "legacy_digest": hashlib.sha256(conversation.encode("ascii")).hexdigest(),
+                "legacy_until": now + BRIDGE_CHAT_LIFETIME if row is not None else 0,
+                "last_seen": now,
+                "last_rotation_request": None,
+                "last_rotation_from_generation": None,
+            }
+            self._save_chat_binding()
+            if row is not None:
+                self.execute("UPDATE subscriptions SET binding_generation=1 WHERE bound=1 AND binding_generation=0")
+        else:
+            try:
+                self.chat_binding = json.loads(binding_row[0])
+            except (TypeError, ValueError):
+                raise BridgeError("chat_binding_state_invalid", 500) from None
+            binding_fields = {"code", "code_digest", "generation", "issued_at", "expires_at",
+                              "legacy_digest", "legacy_until", "last_seen", "last_rotation_request",
+                              "last_rotation_from_generation"}
+            check(type(self.chat_binding) is dict and set(self.chat_binding) == binding_fields,
+                  "chat_binding_state_invalid", 500)
+            binding = self.chat_binding
+            check(type(binding["code"]) is str
+                  and re.fullmatch("[" + BRIDGE_CHAT_ALPHABET + "]{8}", binding["code"]) is not None
+                  and type(binding["generation"]) is int and binding["generation"] > 0
+                  and all(type(binding[key]) in {int, float} and binding[key] == binding[key]
+                          and abs(binding[key]) != float("inf")
+                          for key in ("issued_at", "expires_at", "legacy_until", "last_seen"))
+                  and binding["expires_at"] == binding["issued_at"] + BRIDGE_CHAT_LIFETIME
+                  and binding["issued_at"] <= binding["last_seen"]
+                  and 0 <= binding["legacy_until"] <= binding["expires_at"]
+                  and type(binding["code_digest"]) is str
+                  and re.fullmatch(r"[0-9a-f]{64}", binding["code_digest"]) is not None
+                  and hmac.compare_digest(binding["code_digest"], hashlib.sha256(
+                      binding["code"].encode("ascii")).hexdigest())
+                  and type(binding["legacy_digest"]) is str
+                  and re.fullmatch(r"[0-9a-f]{64}", binding["legacy_digest"]) is not None,
+                  "chat_binding_state_invalid", 500)
+            request_id = binding["last_rotation_request"]
+            from_generation = binding["last_rotation_from_generation"]
+            check((request_id is None and from_generation is None)
+                  or (type(request_id) is str and re.fullmatch(r"[a-zA-Z0-9_-]{16,64}", request_id) is not None
+                      and type(from_generation) is int and from_generation + 1 == binding["generation"]),
+                  "chat_binding_state_invalid", 500)
+        self.execute("DELETE FROM chat_binding_attempts WHERE conversation<>? OR generation<>?",
+                     (conversation, self.chat_binding["generation"]))
         self.preference = "SMALL"
         self.pair = None
         self.cleanup()
@@ -6487,12 +6778,228 @@ class BridgeStore:
         with self.lock:
             return self.db.executescript(sql)
 
+    def _save_chat_binding(self):
+        self.execute("INSERT INTO meta(key,value) VALUES('chat_binding',?)"
+                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (json.dumps(self.chat_binding, separators=(",", ":")),))
+
+    def _safe_chat_time(self):
+        try:
+            now = float(self.clock())
+        except (TypeError, ValueError, OverflowError):
+            raise BridgeError("chat_binding_clock_invalid", 500) from None
+        check(now == now and abs(now) != float("inf"), "chat_binding_clock_invalid", 500)
+        previous = float(self.chat_binding["last_seen"])
+        now = max(now, previous)
+        if now > previous:
+            self.chat_binding["last_seen"] = now
+            self._save_chat_binding()
+        return now
+
+    def _attempt(self, principal):
+        row = self.execute("SELECT * FROM chat_binding_attempts WHERE conversation=? AND generation=? AND principal=?",
+                           (self.conversation, self.chat_binding["generation"], principal)).fetchone()
+        if row is None:
+            return {"failures": 0, "last_failure": None, "next_allowed": None,
+                    "locked_until": None, "failure_times": "[]"}
+        value = dict(row)
+        failure_limit = BRIDGE_CHAT_BINDING_FAILURES if principal == "*" else BRIDGE_CHAT_PRINCIPAL_FAILURES
+        try:
+            times = json.loads(value["failure_times"])
+        except (TypeError, ValueError):
+            raise BridgeError("chat_binding_state_invalid", 500) from None
+        check(type(times) is list and len(times) <= BRIDGE_CHAT_BINDING_FAILURES
+              and all(type(stamp) in {int, float} and stamp == stamp and abs(stamp) != float("inf")
+                      for stamp in times), "chat_binding_state_invalid", 500)
+        check(type(value["failures"]) is int and 0 <= value["failures"] <= failure_limit
+              and all(value[key] is None or type(value[key]) in {int, float}
+                      and value[key] == value[key] and abs(value[key]) != float("inf")
+                      for key in ("last_failure", "next_allowed", "locked_until"))
+              and type(value["failure_times"]) is str and len(value["failure_times"]) <= 4096,
+              "chat_binding_state_invalid", 500)
+        failures, last = value["failures"], value["last_failure"]
+        if principal == "*":
+            valid = (failures == len(times) and times == sorted(times)
+                     and last == (times[-1] if times else None)
+                     and value["next_allowed"] is None
+                     and value["locked_until"] == (last + BRIDGE_CHAT_LOCKOUT
+                         if failures == BRIDGE_CHAT_BINDING_FAILURES else None))
+        else:
+            valid = (not times and (last is not None if failures else last is None)
+                     and value["next_allowed"] == (last + BRIDGE_CHAT_BACKOFF[failures - 4]
+                         if 4 <= failures < BRIDGE_CHAT_PRINCIPAL_FAILURES else None)
+                     and value["locked_until"] == (last + BRIDGE_CHAT_LOCKOUT
+                         if failures == BRIDGE_CHAT_PRINCIPAL_FAILURES and last is not None else None))
+        check(valid, "chat_binding_state_invalid", 500)
+        return value
+
+    def _save_attempt(self, principal, state):
+        self.execute("INSERT INTO chat_binding_attempts(conversation,generation,principal,failures,last_failure,"
+                     "next_allowed,locked_until,failure_times) VALUES(?,?,?,?,?,?,?,?) "
+                     "ON CONFLICT(conversation,generation,principal) DO UPDATE SET failures=excluded.failures,"
+                     "last_failure=excluded.last_failure,next_allowed=excluded.next_allowed,"
+                     "locked_until=excluded.locked_until,failure_times=excluded.failure_times",
+                     (self.conversation, self.chat_binding["generation"], principal, state["failures"],
+                      state["last_failure"], state["next_allowed"], state["locked_until"],
+                      state["failure_times"]))
+
+    def _binding_is_live(self, generation, now=None):
+        now = self._safe_chat_time() if now is None else now
+        return generation == self.chat_binding["generation"] and now < self.chat_binding["expires_at"]
+
+    def authorize_chat_binding(self, principal, supplied):
+        """Atomically authorize a chat code and persist online-guess controls."""
+        check(type(principal) is str and re.fullmatch("[0-9a-f]{32}", principal), "unauthorized", 401)
+        with self.lock:
+            now = self._safe_chat_time()
+            binding = self.chat_binding
+            if now >= binding["expires_at"]:
+                raise BridgeError("conversation_binding_expired", 403, rpc=-32602)
+            aggregate = self._attempt("*")
+            try:
+                times = json.loads(aggregate["failure_times"])
+            except (TypeError, ValueError):
+                raise BridgeError("chat_binding_state_invalid", 500) from None
+            check(type(times) is list and len(times) <= BRIDGE_CHAT_BINDING_FAILURES
+                  and all(type(value) in {int, float} for value in times), "chat_binding_state_invalid", 500)
+            times = [float(value) for value in times if value > now - BRIDGE_CHAT_WINDOW]
+            principal_state = self._attempt(principal)
+            if principal_state["locked_until"] is not None and principal_state["locked_until"] <= now:
+                principal_state = {"failures": 0, "last_failure": None, "next_allowed": None,
+                                   "locked_until": None, "failure_times": "[]"}
+            if aggregate["locked_until"] is not None and aggregate["locked_until"] > now:
+                raise BridgeError("conversation_binding_locked", 403, rpc=-32602,
+                                  data={"retry_after_seconds": max(1, int(aggregate["locked_until"] - now + .999)),
+                                        "scope": "binding"})
+            if principal_state["locked_until"] is not None and principal_state["locked_until"] > now:
+                raise BridgeError("conversation_binding_locked", 403, rpc=-32602,
+                                  data={"retry_after_seconds": max(1, int(principal_state["locked_until"] - now + .999)),
+                                        "scope": "principal"})
+            if principal_state["next_allowed"] is not None and principal_state["next_allowed"] > now:
+                raise BridgeError("conversation_binding_backoff", 403, rpc=-32602,
+                                  data={"retry_after_seconds": max(1, int(principal_state["next_allowed"] - now + .999))})
+
+            raw = supplied if type(supplied) is str and len(supplied) <= 64 else ""
+            normalized = normalize_chat_code(raw)
+            candidate_digest = hashlib.sha256(normalized.encode("ascii")).hexdigest()
+            code_matches = hmac.compare_digest(candidate_digest, binding["code_digest"])
+            legacy_digest = binding["legacy_digest"]
+            alias_matches = (type(legacy_digest) is str and binding.get("legacy_until", 0) > now
+                             and hmac.compare_digest(hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest(),
+                                                     legacy_digest))
+            if code_matches or alias_matches:
+                self.execute("DELETE FROM chat_binding_attempts WHERE conversation=? AND generation=? AND principal=?",
+                             (self.conversation, binding["generation"], principal))
+                return binding["generation"]
+
+            failures = principal_state["failures"] if principal_state["last_failure"] is not None \
+                and now - principal_state["last_failure"] < BRIDGE_CHAT_WINDOW else 0
+            failures += 1
+            principal_state["failures"] = failures
+            principal_state["last_failure"] = now
+            principal_state["failure_times"] = "[]"
+            principal_state["next_allowed"] = None
+            principal_state["locked_until"] = None
+            if failures >= BRIDGE_CHAT_PRINCIPAL_FAILURES:
+                principal_state["locked_until"] = now + BRIDGE_CHAT_LOCKOUT
+            elif failures >= 4:
+                principal_state["next_allowed"] = now + BRIDGE_CHAT_BACKOFF[min(
+                    failures - 4, len(BRIDGE_CHAT_BACKOFF) - 1)]
+            times.append(now)
+            aggregate["failures"] = len(times)
+            aggregate["last_failure"] = now
+            aggregate["next_allowed"] = None
+            aggregate["locked_until"] = now + BRIDGE_CHAT_LOCKOUT if len(times) >= BRIDGE_CHAT_BINDING_FAILURES else None
+            aggregate["failure_times"] = json.dumps(times, separators=(",", ":"))
+            # Both counters are one persistent attempt, even if the second write
+            # fails. Counted binding errors below are raised only after COMMIT.
+            self.execute("BEGIN IMMEDIATE")
+            try:
+                self._save_attempt(principal, principal_state)
+                self._save_attempt("*", aggregate)
+                self.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.execute("ROLLBACK")
+                raise
+            if aggregate["locked_until"] is not None:
+                raise BridgeError("conversation_binding_locked", 403, rpc=-32602,
+                                  data={"retry_after_seconds": BRIDGE_CHAT_LOCKOUT, "scope": "binding"})
+            if principal_state["locked_until"] is not None:
+                raise BridgeError("conversation_binding_locked", 403, rpc=-32602,
+                                  data={"retry_after_seconds": BRIDGE_CHAT_LOCKOUT, "scope": "principal"})
+            if principal_state["next_allowed"] is not None:
+                raise BridgeError("conversation_binding_backoff", 403, rpc=-32602,
+                                  data={"retry_after_seconds": max(1, int(principal_state["next_allowed"] - now + .999))})
+            raise BridgeError("conversation_binding_required", 403, rpc=-32602)
+
+    def chat_binding_status(self, principal):
+        with self.lock:
+            now = self._safe_chat_time()
+            binding = self.chat_binding
+            aggregate = self._attempt("*")
+            role = self.execute("SELECT role FROM tokens WHERE id=?", (principal,)).fetchone()
+            principals = [principal] if role and role["role"] == "AI" else [row[0] for row in self.execute(
+                "SELECT id FROM tokens WHERE role='AI' AND state='PAIRED'").fetchall()]
+            attempts = [self._attempt(identifier) for identifier in principals]
+            locks = [attempt["locked_until"] for attempt in attempts
+                     if attempt["locked_until"] is not None and attempt["locked_until"] > now]
+            waits = [attempt["next_allowed"] for attempt in attempts
+                     if attempt["next_allowed"] is not None and attempt["next_allowed"] > now]
+            principal_lock = max(locks) if locks else None
+            binding_lock = aggregate["locked_until"] if aggregate["locked_until"] and aggregate["locked_until"] > now else None
+            principal_wait = max(waits) if waits else None
+            if now >= binding["expires_at"]:
+                status, retry_at, scope, code = "EXPIRED", None, None, None
+            elif binding_lock or principal_lock:
+                status, retry_at, scope, code = "LOCKED", max(value for value in (binding_lock, principal_lock) if value), \
+                    "BINDING" if binding_lock and (not principal_lock or binding_lock >= principal_lock) else "PRINCIPAL", binding["code"]
+            elif principal_wait:
+                status, retry_at, scope, code = "BACKOFF", principal_wait, "PRINCIPAL", binding["code"]
+            else:
+                status, retry_at, scope, code = "VALID", None, None, binding["code"]
+            locked = len(locks)
+            return {"version": 1, "instance": self.instance, "conversation": self.conversation,
+                    "generation": binding["generation"], "code": code,
+                    "issued_at": binding["issued_at"], "expires_at": binding["expires_at"],
+                    "server_time": now, "status": status, "retry_at": retry_at,
+                    "restriction_scope": scope, "locked_principals": locked}
+
+    def require_chat_binding_generation(self, generation):
+        with self.lock:
+            check(self._binding_is_live(generation), "conversation_binding_expired", 403)
+
+    def rotate_chat_binding(self, request_id, expected_generation, principal):
+        opaque(request_id)
+        check(type(expected_generation) is int and expected_generation > 0, "invalid_schema")
+        with self.lock:
+            now = self._safe_chat_time()
+            binding = self.chat_binding
+            if binding.get("last_rotation_request") == request_id \
+                    and binding.get("last_rotation_from_generation") == expected_generation \
+                    and binding["generation"] == expected_generation + 1:
+                return self.chat_binding_status(principal)
+            check(binding["generation"] == expected_generation, "chat_binding_generation_conflict", 409)
+            code = new_chat_code(binding["code"])
+            binding.update({"code": code, "code_digest": hashlib.sha256(code.encode("ascii")).hexdigest(),
+                            "generation": expected_generation + 1, "issued_at": now,
+                            "expires_at": now + BRIDGE_CHAT_LIFETIME, "legacy_until": 0,
+                            "last_rotation_request": request_id,
+                            "last_rotation_from_generation": expected_generation})
+            self._save_chat_binding()
+            self.execute("DELETE FROM chat_binding_attempts WHERE conversation=?", (self.conversation,))
+            self.execute("DELETE FROM subscriptions WHERE binding_generation<>?", (binding["generation"],))
+            return self.chat_binding_status(principal)
+
     def cleanup(self):
         now = self.clock()
         with self.lock:
             for table in ("proposals", "outputs", "cursors", "subscriptions"):
                 self.execute("DELETE FROM " + table + " WHERE expires<=?", (now,))
             self.execute("DELETE FROM tokens WHERE state='PAIR_PENDING' AND deadline<=?", (now,))
+            self.execute("DELETE FROM chat_binding_attempts WHERE principal<>'*' AND NOT EXISTS "
+                         "(SELECT 1 FROM tokens WHERE tokens.id=chat_binding_attempts.principal "
+                         "AND tokens.role='AI' AND tokens.state='PAIRED')")
 
     def issue(self, role, token=None, pending=False):
         check(role in {"AI", "CONTROLLER"})
@@ -6521,7 +7028,10 @@ class BridgeStore:
 
     def revoke(self, identifier):
         opaque(identifier)
-        self.execute("DELETE FROM tokens WHERE id=?", (identifier,))
+        with self.lock:
+            self.execute("DELETE FROM tokens WHERE id=?", (identifier,))
+            self.execute("DELETE FROM chat_binding_attempts WHERE conversation=? AND principal=?",
+                         (self.conversation, identifier))
 
     def open_pair(self):
         code = "".join(secrets.choice(BRIDGE_BASE32) for _ in range(12))
@@ -6709,9 +7219,13 @@ class BridgeStore:
             return self.execute("SELECT count(*) AS total FROM subscriptions WHERE principal=? AND expires>?",
                                 (principal_id, self.clock())).fetchone()["total"]
 
-    def store_subscription(self, principal_id, url, name, args_json, secret, expires, *, bound=False):
+    def store_subscription(self, principal_id, url, name, args_json, secret, expires, *, bound=False,
+                           binding_generation=None):
         identifier = self.subscription_identity(principal_id, url, name, args_json)
         with self.lock:
+            if binding_generation is None:
+                binding_generation = self.chat_binding["generation"]
+            self.require_chat_binding_generation(binding_generation)
             check(self.execute("SELECT id FROM tokens WHERE id=? AND role='AI'"
                                " AND conversation=? AND state='PAIRED'",
                                (principal_id, self.conversation)).fetchone() is not None,
@@ -6721,11 +7235,12 @@ class BridgeStore:
                     and self.count_subscriptions(principal_id) >= BRIDGE_EVENT_SUBSCRIPTION_LIMIT:
                 raise BridgeError("subscription_limit", rpc=-32013,
                                   data={"limit": "subscriptions", "max": BRIDGE_EVENT_SUBSCRIPTION_LIMIT})
-            self.execute("INSERT INTO subscriptions(id,principal,url,name,args,secret,expires,bound)"
-                         " VALUES(?,?,?,?,?,?,?,?)"
+            self.execute("INSERT INTO subscriptions(id,principal,url,name,args,secret,expires,bound,binding_generation)"
+                         " VALUES(?,?,?,?,?,?,?,?,?)"
                          " ON CONFLICT(id) DO UPDATE SET url=excluded.url, secret=excluded.secret,"
-                         " expires=excluded.expires, bound=excluded.bound",
-                         (identifier, principal_id, url, name, args_json, secret, expires, int(bound)))
+                         " expires=excluded.expires, bound=excluded.bound,"
+                         " binding_generation=excluded.binding_generation",
+                         (identifier, principal_id, url, name, args_json, secret, expires, int(bound), binding_generation))
         return identifier
 
     def find_subscription(self, principal_id, url, name, args_json):
@@ -6739,7 +7254,12 @@ class BridgeStore:
                             (identifier, principal_id)).rowcount
 
     def matching_subscriptions(self, submission_id, now):
-        rows = self.execute("SELECT * FROM subscriptions WHERE expires>? AND bound=1 ORDER BY id", (now,)).fetchall()
+        with self.lock:
+            now = max(float(now), self._safe_chat_time())
+            if now >= self.chat_binding["expires_at"]:
+                return []
+            rows = self.execute("SELECT * FROM subscriptions WHERE expires>? AND bound=1 AND binding_generation=?"
+                                " ORDER BY id", (now, self.chat_binding["generation"])).fetchall()
         result = []
         for row in rows:
             args = json.loads(row["args"]) if row["args"] else {}
@@ -6752,14 +7272,21 @@ class BridgeStore:
 
     def active_subscription(self, identifier, now):
         """Subscription row only while its AI principal is still paired and authorized."""
-        row = self.execute("SELECT s.* FROM subscriptions s JOIN tokens t ON t.id = s.principal"
-                           " WHERE s.id=? AND s.expires>? AND s.bound=1 AND t.role='AI' AND t.conversation=?"
-                           " AND t.state='PAIRED'", (identifier, now, self.conversation)).fetchone()
-        return dict(row) if row else None
+        with self.lock:
+            now = max(float(now), self._safe_chat_time())
+            if now >= self.chat_binding["expires_at"]:
+                return None
+            row = self.execute("SELECT s.* FROM subscriptions s JOIN tokens t ON t.id = s.principal"
+                               " WHERE s.id=? AND s.expires>? AND s.bound=1 AND s.binding_generation=?"
+                               " AND t.role='AI' AND t.conversation=? AND t.state='PAIRED'",
+                               (identifier, now, self.chat_binding["generation"], self.conversation)).fetchone()
+            return dict(row) if row else None
 
-    def mark_delivered(self, output_id, subscription_id):
+    def mark_delivered(self, output_id, subscription_id, expected_generation):
         opaque(output_id)
         with self.lock:
+            if not self._binding_is_live(expected_generation):
+                return False
             if self.active_subscription(subscription_id, self.clock()) is None:
                 return False
             row = self.execute("SELECT delivered FROM outputs WHERE id=?", (output_id,)).fetchone()
@@ -6769,12 +7296,18 @@ class BridgeStore:
                 return True
             # The SQL authorization predicate also protects against revocation by
             # another SQLite connection (e.g. the local revoke CLI) at ACK time.
-            now = self.clock()
+            now = self._safe_chat_time()
+            if not self._binding_is_live(expected_generation, now):
+                return False
             return bool(self.execute("UPDATE outputs SET delivered=1, delivered_at=? WHERE id=?"
                                      " AND EXISTS (SELECT 1 FROM subscriptions s JOIN tokens t ON t.id=s.principal"
-                                     " WHERE s.id=? AND s.expires>? AND s.bound=1 AND t.role='AI'"
-                                     " AND t.conversation=? AND t.state='PAIRED')",
-                                     (now, output_id, subscription_id, now, self.conversation)).rowcount)
+                                     " WHERE s.id=? AND s.expires>? AND s.bound=1 AND s.binding_generation=?"
+                                     " AND t.role='AI' AND t.conversation=? AND t.state='PAIRED')"
+                                     " AND EXISTS (SELECT 1 FROM meta WHERE key='chat_binding'"
+                                     " AND json_extract(value,'$.generation')=?"
+                                     " AND json_extract(value,'$.expires_at')>?)",
+                                     (now, output_id, subscription_id, now, expected_generation,
+                                      self.conversation, expected_generation, now)).rowcount)
 
 
 def object_schema(properties, required=()):
@@ -6800,8 +7333,7 @@ for bridge_tool in BRIDGE_TOOLS:
     # Tunnel authentication identifies an app, not a particular ChatGPT chat.
     # This locally selected capability is disclosed by the human to one chat.
     # It is never discoverable from any AI-facing tool or status endpoint.
-    bridge_tool["inputSchema"]["properties"]["conversation"] = dict(BRIDGE_ID_SCHEMA,
-        description="The local chat binding code deliberately provided by the human. Do not guess or discover it.")
+    bridge_tool["inputSchema"]["properties"]["conversation"] = dict(BRIDGE_CHAT_CODE_SCHEMA)
     bridge_tool["inputSchema"]["required"].append("conversation")
 
 
@@ -6813,8 +7345,7 @@ BRIDGE_EVENT_DEFINITION = {
                    "canonical approved-output path.",
     "delivery": ["webhook"],
     "inputSchema": object_schema({"submission_id": BRIDGE_ID_SCHEMA,
-                                  "conversation": dict(BRIDGE_ID_SCHEMA,
-                                      description="The local chat binding code deliberately provided by the human. Do not guess or discover it.")},
+                                  "conversation": dict(BRIDGE_CHAT_CODE_SCHEMA)},
                                  ("conversation",)),
     "payloadSchema": {"type": "object",
                       "properties": {"submission_id": {"type": ["string", "null"]},
@@ -7192,11 +7723,13 @@ class BridgeService:
         self.webhook_thread = threading.Thread(target=self.webhook_loop, name="aitl-webhook", daemon=True)
         self.routes = {
             "CONTROLLER": {"/v1/status": (self._controller_status, "GET"),
-                           "/v1/inbox": (self._controller_inbox, "GET"),
-                           "/v1/approved-output": (self._controller_output, "POST"),
-                           "/v1/preferences": (self._controller_preferences, "PUT"),
-                           "/v1/pair/claim": (self._controller_claim, "POST"),
-                           "/v1/pair/confirm": (self._controller_confirm, "POST")},
+                            "/v1/inbox": (self._controller_inbox, "GET"),
+                            "/v1/approved-output": (self._controller_output, "POST"),
+                            "/v1/preferences": (self._controller_preferences, "PUT"),
+                            "/v1/chat-binding": (self._controller_chat_binding, "GET"),
+                            "/v1/chat-binding/rotate": (self._controller_chat_binding_rotate, "POST"),
+                            "/v1/pair/claim": (self._controller_claim, "POST"),
+                            "/v1/pair/confirm": (self._controller_confirm, "POST")},
             "MCP": {"/mcp": (self.mcp, "POST")},
         }
 
@@ -7280,6 +7813,20 @@ class BridgeService:
         token, _ = self.principal(request, "CONTROLLER")
         check(not request.query)
         return self.json(self.store.status(token))
+
+    def _controller_chat_binding(self, request):
+        _, principal = self.principal(request, "CONTROLLER")
+        check(not request.query)
+        return self.json(self.store.chat_binding_status(principal["id"]))
+
+    def _controller_chat_binding_rotate(self, request):
+        _, principal = self.principal(request, "CONTROLLER")
+        value = self.body(request)
+        _, principal = self.principal(request, "CONTROLLER")
+        exact(value, {"version", "request_id", "expected_generation"})
+        check(type(value["version"]) is int and value["version"] == 1)
+        return self.json(self.store.rotate_chat_binding(value["request_id"],
+                                                        value["expected_generation"], principal["id"]))
 
     def _controller_inbox(self, request):
         token, _ = self.principal(request, "CONTROLLER")
@@ -7372,25 +7919,25 @@ class BridgeService:
                 exact(params, {"name"}, {"arguments"})
                 name = text(params["name"], 80)
                 args = params.get("arguments", {})
-                check(type(args) is dict and type(args.get("conversation")) is str
-                      and re.fullmatch(r"[A-Za-z0-9_-]{16,64}", args["conversation"]) is not None
-                      and hmac.compare_digest(args["conversation"], self.store.conversation),
-                      "conversation_binding_required", 403)
-                args = {key: val for key, val in args.items() if key != "conversation"}
-                if name == "submit_proposal":
-                    data = self.store.submit(args)
-                    self.changed.set()
-                elif name == "get_submission_status":
-                    exact(args, {"submission_id"})
-                    opaque(args["submission_id"])
-                    data = self.store.submission_status(args["submission_id"])
-                elif name == "get_approved_output":
-                    data = self.store.ai_output(principal, args)
-                elif name == "get_preferences":
-                    exact(args, set())
-                    data = {"block_size": self.store.preference}
-                else:
-                    raise BridgeError("unknown_tool")
+                with self.store.lock:
+                    if type(args) is not dict:
+                        self.store.authorize_chat_binding(principal["id"], None)
+                    self.store.authorize_chat_binding(principal["id"], args.get("conversation"))
+                    args = {key: val for key, val in args.items() if key != "conversation"}
+                    if name == "submit_proposal":
+                        data = self.store.submit(args)
+                        self.changed.set()
+                    elif name == "get_submission_status":
+                        exact(args, {"submission_id"})
+                        opaque(args["submission_id"])
+                        data = self.store.submission_status(args["submission_id"])
+                    elif name == "get_approved_output":
+                        data = self.store.ai_output(principal, args)
+                    elif name == "get_preferences":
+                        exact(args, set())
+                        data = {"block_size": self.store.preference}
+                    else:
+                        raise BridgeError("unknown_tool")
                 # Every MCP client can read content; some hosts discard structuredContent.
                 # Put approved text into its own plaintext block once, not into a nested
                 # JSON string or twice into the response. Metadata names its block index.
@@ -7418,7 +7965,9 @@ class BridgeService:
                                   "error": {"code": -32601, "message": "Method not found"}})
         except BridgeError as failure:
             if method == "tools/call":
-                result = {"content": [{"type": "text", "text": failure.code}], "isError": True}
+                result = {"content": [{"type": "text", "text": failure.code}],
+                          "structuredContent": dict({"error": failure.code}, **(failure.data or {})),
+                          "isError": True}
             elif method.startswith("events/"):
                 return self.json({"jsonrpc": "2.0", "id": rid,
                                   "error": {"code": failure.rpc if failure.rpc is not None else -32603,
@@ -7439,7 +7988,7 @@ class BridgeService:
         if "cursor" in params and params["cursor"] is not None:
             # This event type carries cursor: null only; replay stays on the pull path.
             raise BridgeError("replay_cursor_unsupported", rpc=-32602)
-        arguments = self.event_arguments(params)
+        arguments, binding_generation = self.event_arguments(params, principal)
         delivery = params["delivery"]
         exact(delivery, {"mode", "url", "secret"})
         if delivery["mode"] != "webhook":
@@ -7477,35 +8026,37 @@ class BridgeService:
             raise BridgeError("callback_verify_failed", rpc=-32015)
         expires = self.store.clock() + ttl_ms / 1000
         identifier = self.store.store_subscription(principal["id"], url, BRIDGE_EVENT_NAME,
-                                                   args_json, delivery["secret"], expires, bound=True)
+                                                   args_json, delivery["secret"], expires, bound=True,
+                                                   binding_generation=binding_generation)
         return {"id": identifier, "refreshBefore": iso_utc(expires), "cursor": None, "truncated": False}
 
     def unsubscribe(self, principal, params):
         exact(params, {"name", "delivery"}, {"arguments"})
         if params["name"] != BRIDGE_EVENT_NAME:
             raise BridgeError("unknown_event", rpc=-32011)
-        arguments = self.event_arguments(params)
+        arguments, binding_generation = self.event_arguments(params, principal)
         delivery = params["delivery"]
         exact(delivery, {"mode", "url"})
         check(delivery["mode"] == "webhook", "delivery_mode_unsupported")
         url = text(delivery["url"], 512)
         args_json = json.dumps(dict(sorted(arguments.items())), separators=(",", ":"))
         identifier = self.store.subscription_identity(principal["id"], url, BRIDGE_EVENT_NAME, args_json)
-        self.store.delete_subscription(principal["id"], identifier)
+        with self.store.lock:
+            self.store.require_chat_binding_generation(binding_generation)
+            self.store.delete_subscription(principal["id"], identifier)
         return {}
 
-    def event_arguments(self, params):
+    def event_arguments(self, params, principal):
         arguments = params.get("arguments", {})
-        if not (type(arguments) is dict and type(arguments.get("conversation")) is str
-                and re.fullmatch(r"[A-Za-z0-9_-]{16,64}", arguments["conversation"]) is not None
-                and hmac.compare_digest(arguments["conversation"], self.store.conversation)):
-            raise BridgeError("conversation_binding_required", 403, rpc=-32602)
+        if type(arguments) is not dict:
+            self.store.authorize_chat_binding(principal["id"], None)
+        generation = self.store.authorize_chat_binding(principal["id"], arguments.get("conversation"))
         # The code is authorization, never a persisted filter or event field.
         arguments = {key: value for key, value in arguments.items() if key != "conversation"}
         exact(arguments, set(), {"submission_id"})
         if "submission_id" in arguments:
             opaque(arguments["submission_id"])
-        return arguments
+        return arguments, generation
 
     def verify_callback(self, identifier, secret, url, key):
         # A recent successful challenge by this exact principal/URL/secret may be reused.
@@ -7628,7 +8179,8 @@ class BridgeService:
         # principals do not start a send. An in-flight send cannot be recalled;
         # its ACK must pass a second atomic authorization check.
         current = self.store.active_subscription(job["subscription"]["id"], self.store.clock())
-        if current is None:
+        expected_generation = job["subscription"]["binding_generation"]
+        if current is None or current["binding_generation"] != expected_generation:
             return
         subscription, event = current, job["event"]
         status, failure = None, None
@@ -7638,7 +8190,7 @@ class BridgeService:
         except WebhookFailure as exc:
             failure = exc
         if failure is None and 200 <= (status or 0) < 300:
-            self.store.mark_delivered(event["eventId"], subscription["id"])
+            self.store.mark_delivered(event["eventId"], subscription["id"], expected_generation)
             return
         if failure is not None and not failure.retryable:
             return  # Pull remains available; the subscription is not retried for this event.
@@ -7648,7 +8200,7 @@ class BridgeService:
         with self.jobs_cv:
             if len(self.jobs) < self.WEBHOOK_JOB_LIMIT:
                 delay = self.WEBHOOK_RETRY_DELAYS[min(attempts, len(self.WEBHOOK_RETRY_DELAYS) - 1)]
-                self.jobs.append({"subscription": subscription, "event": event,
+                self.jobs.append({"subscription": dict(job["subscription"]), "event": event,
                                   "attempts": attempts + 1, "ready": time.monotonic() + delay})
 
 def bridge_certificate(directory, names, renew=False):
@@ -7826,7 +8378,9 @@ _bridge_components = _load_bridge_component()
 _bridge_component = _bridge_components
 for _bridge_name in ("BridgeError", "BridgeStore", "BridgeService", "BRIDGE_BODY_LIMIT",
                      "BRIDGE_RETENTION", "BRIDGE_OUTPUT_LIMIT", "BRIDGE_BLOCK_SIZES",
-                     "BRIDGE_VERSIONS", "BRIDGE_TOOLS", "bridge_certificate", "bridge_serve",
+                     "BRIDGE_VERSIONS", "BRIDGE_TOOLS", "BRIDGE_CHAT_ALPHABET", "BRIDGE_CHAT_LIFETIME",
+                     "BRIDGE_CHAT_CODE_SCHEMA", "new_chat_code", "normalize_chat_code",
+                     "bridge_certificate", "bridge_serve",
                      "bridge_main", "parse", "encoded", "WebhookFailure",
                      "BRIDGE_EVENT_NAME", "BRIDGE_EVENT_DEFINITION", "WebhookConnection",
                      "standard_webhook_headers", "webhook_address_allowed"):

@@ -7,7 +7,7 @@ description: Coordinate human-reviewed terminal work through the Admin in the Lo
 
 ## Establish the connection
 
-Use the user's selected Admin in the Loop MCP connection. Discover the actual tools before calling them. Obtain the local chat binding code deliberately supplied by the user and pass it as `conversation` to every call. Do not guess, enumerate or extract the code from terminal output. Treat it as a credential: do not repeat it in reports or persist it in examples. If the code or connection is missing, ask only for that missing setup step.
+Use the user's selected Admin in the Loop MCP connection. Discover the actual tools before calling them. Obtain the current short chat-binding code deliberately supplied by the user and pass it as `conversation` to every tool call and event subscription/refresh/unsubscribe. The field name remains compatible; this code is separate from the stable internal Conversation-ID. It is displayed in the right AI/MCP column, expires after 24 hours, and is not discoverable through AI tools. Do not guess, enumerate or extract it from terminal output. Treat it as a credential: do not repeat it in reports or persist it in examples. If it is missing or expired, ask the user to provide the displayed current code; a controller-side rotation requires the user to share the new code and reauthorize event subscriptions.
 
 Use only these bridge tools:
 
@@ -34,7 +34,7 @@ Interpret `ACCEPTED` exclusively as transport receipt. It does not prove review,
 
 ## Wait and recover
 
-Use `get_submission_status` for the exact submission ID. Avoid tight polling; respect host limits and rate-limit responses. When no result is available, tell the user that human-shared output is still needed. Do not claim ongoing background monitoring or invent an execution state.
+Use `get_submission_status` for the exact submission ID. Avoid tight polling; respect host limits and rate-limit responses. For chat-binding backoff/lockout, honor the returned retry interval and wait; never retry rapidly or rotate automatically. The server tolerates a few entry mistakes, then applies progressive delays and temporary principal-/binding-wide lockouts. When no result is available, tell the user that human-shared output is still needed. Do not claim ongoing background monitoring or invent an execution state.
 
 After ambiguous proposal delivery, retry only the identical text with the identical request ID, because this submission operation is idempotent while its record is retained. Do not generate a new request ID merely because a response was lost. On expiry, idempotency conflict or unresolved ambiguity, stop and explain; a fresh proposal could execute the same action again. An unavailable submission is not proof that the command never ran.
 
