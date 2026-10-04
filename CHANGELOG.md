@@ -15,6 +15,8 @@ Integrationsstand `6108390d927c9247fdf4627ef0bc2a1b345d901c`.
   standardmäßig OFF, alle realen Pins weiterhin `approved=False`.
 - Die Hauptfenstertitelleiste zeigt die App-Version dynamisch aus der kanonischen
   MCP-Versionsmetadatenquelle.
+- Die zentrale Command-/Output-Review-Fläche verwendet eine maßvoll kleinere
+  Monospace-Schrift für mehr Übersicht bei großen Blöcken.
 
 Operatorentscheidung vom 4. Oktober 2026, 23:06 Europe/Berlin: Der alleinige Tester
 nimmt diesen Stand für persönliche Tests an; externe Vorab-Abnahmen sind kein

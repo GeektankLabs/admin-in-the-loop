@@ -5364,7 +5364,7 @@ class ReviewUI:
     """Three columns; immutable tagged review. Context editing creates a new revision."""
     def __init__(self, root, core):
         import tkinter as tk
-        from tkinter import ttk, messagebox
+        from tkinter import ttk, messagebox, font
         self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
         self.root, self.core = root, core
         self.last_snapshot = None
@@ -5455,6 +5455,13 @@ class ReviewUI:
         self.direction = tk.StringVar()
         ttk.Label(review_header, textvariable=self.direction, style="Review.TLabel").pack(anchor="w")
         self.editor = ScrollableText(middle, readonly=True, height=16)
+        self.review_font = font.nametofont("TkFixedFont", root=root).copy()
+        review_size = self.review_font.cget("size")
+        if review_size > 8:
+            self.review_font.configure(size=review_size - 1)
+        elif review_size < -10:
+            self.review_font.configure(size=review_size + 1)
+        self.editor.text.configure(font=self.review_font)
         self.editor.frame.grid(row=1, column=0, sticky="nsew")
         self.risk_row = ttk.Frame(middle, style="Review.TFrame")
         self.risk_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
