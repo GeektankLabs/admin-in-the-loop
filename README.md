@@ -14,12 +14,22 @@ genehmigt den exakten Text vor der Übergabe ans Terminal. Terminalausgabe wird
 separat ausgewählt, geprüft und erst nach einer weiteren Freigabe an die AI
 weitergegeben. Das Terminal bleibt unabhängig manuell bedienbar.
 
-## Früher Entwicklungsstand
+## Aktuelle persönliche Testversion
 
-**v0.0.1 ist in Vorbereitung, noch nicht veröffentlicht.** Die Anwendung ist ein
-früher MVP, keine Abnahme für kritische Infrastruktur. Die Bezeichnungen
-„Konzept V0.7“ und „MVP 0.8“ in vorhandenen Dokumenten sind interne historische
-Stände, keine veröffentlichten Release-Versionen.
+**v0.9.0 ist lokal als reguläre persönliche Testversion festgeschrieben; nicht
+veröffentlicht.** Der Operator hat am 4. Oktober 2026 den geprüften und integrierten
+Mainstand für seine eigenen Tests angenommen. Weitere externe Vorab-Abnahmen sind
+kein Gate für diesen Versionsstand. Änderungen stehen im [Changelog](CHANGELOG.md).
+
+Die Anwendung bleibt ein früher MVP, keine Abnahme für kritische Infrastruktur.
+„Konzept V0.7“, „MVP 0.8“ und der alte v0.0.1-Veröffentlichungsentwurf sind
+historische Stände. Die bestehende Runtime-Versionsquelle ist
+`BRIDGE_SERVER_INFO.version` in `admin_in_the_loop.py`.
+
+Hosted ChatGPT-Work, offizielles Tunnelbinary und native Desktop-Abnahmen bleiben
+offene separate Schritte (zuletzt vier externe Test-Skips). Die Mac-Vorschau ist
+nicht integriert. Der optionale sh-guard-Reviewer bleibt standardmäßig aus;
+alle realen Binary-Pins sind weiterhin `approved=False`.
 
 Der [Testbericht vom 30. September 2026](tests/MVP_0.8_TEST_REPORT.md) dokumentiert
 damalige Linux-/Ubuntu-Prüfungen. Er belegt keine aktuelle native macOS- oder
@@ -119,7 +129,8 @@ Python-Anwendungsdatei enthalten.
 - [Historischer MVP-0.8-Testbericht](tests/MVP_0.8_TEST_REPORT.md)
 - [Orchestrator-Skill-Beilage](skill/SKILL.md) – Bedienhilfe, keine Sicherheitsbarriere
 - [Branding-Assets und Hintergrundvarianten](doc/assets/branding/README.md)
-- [v0.0.1-Release-Vorbereitung](doc/RELEASE_V0.0.1.md)
+- [Changelog / aktuelle Testversion](CHANGELOG.md)
+- [Historische v0.0.1-Release-Vorbereitung](doc/RELEASE_V0.0.1.md)
 
 Aktuelle Arbeit und Abnahmen werden im Taskboard geführt; historische
 Statusdateien und Berichte sind keine laufenden Aufgabenlisten.

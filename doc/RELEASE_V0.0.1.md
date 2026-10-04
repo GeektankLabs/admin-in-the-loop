@@ -1,9 +1,15 @@
 # v0.0.1 – Release-Vorbereitung
 
-**Status: lokaler Dokumentationsentwurf, nicht veröffentlicht.**
+**Status: historischer Dokumentationsentwurf, nicht veröffentlicht.**
 Stand: 1. Oktober 2026. Zugeordnet zum Board-Task „Initial Git publish & v0.0.1
 release“. Diese Datei ist die Release-Dokumentation, keine zweite Aufgabenliste.
 Board-Scope und Ticketstatus bleiben maßgeblich.
+
+Aktueller Stand vom 4. Oktober 2026: Der integrierte Mainstand wird als reguläre
+persönliche Testversion **v0.9.0** geführt, siehe [Changelog](../CHANGELOG.md).
+Die Versionsquelle folgt der bisherigen Runtime-Version 0.8.0. Dieser alte
+v0.0.1-Veröffentlichungsentwurf bestimmt weder die aktuelle Testversion noch einen
+Tag oder eine Veröffentlichung; die folgenden Entwurfsangaben bleiben historisch.
 
 ## Versionszuordnung
 

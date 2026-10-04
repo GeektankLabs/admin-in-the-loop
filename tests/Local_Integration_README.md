@@ -1,4 +1,4 @@
-# Admin in the Loop – MVP 0.8
+# Admin in the Loop – v0.9.0 (persönliche Testversion)
 
 **AI assists, Admin decides.**
 
