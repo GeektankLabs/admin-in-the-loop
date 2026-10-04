@@ -1983,6 +1983,9 @@ def command_risk_release():
 
 RISK_DOWNLOAD_TIMEOUT = 120.0
 RISK_ARCHIVE_EXPANDED_LIMIT = 32 * 1024 * 1024
+# Shared by every request/controller in this process. close()/timeout does NOT
+# release admission while libc is still resolving; no persistent resolver service.
+_RISK_RESOLVER_ADMISSION = threading.BoundedSemaphore(1)
 
 
 class _RiskDownloadBudget:
@@ -2031,18 +2034,33 @@ class _RiskDownloadBudget:
     def resolve(self, host, port):
         # libc DNS cannot be force-cancelled in Python. Its helper returns only data:
         # after cancellation no late result is permitted to connect a socket.
-        result = queue.Queue(maxsize=1)
+        self.check()
+        if not _RISK_RESOLVER_ADMISSION.acquire(blocking=False):
+            self.check()  # Cancel/deadline takes precedence over busy.
+            raise ProbeError("risk_download_dns_busy")
+        thread = None
+        try:
+            result = queue.Queue(maxsize=1)
 
-        def resolve():
-            try:
-                value = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-            except Exception as exc:
-                value = exc
-            result.put_nowait(value)
+            def resolve():
+                try:
+                    try:
+                        value = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+                    except Exception as exc:
+                        value = exc
+                    result.put_nowait(value)
+                finally:
+                    _RISK_RESOLVER_ADMISSION.release()  # Actual resolver return only.
 
-        thread = threading.Thread(target=resolve, name="aitl-risk-download-dns", daemon=True)
-        self.resolvers.append(thread)
-        thread.start()
+            thread = threading.Thread(target=resolve, name="aitl-risk-download-dns", daemon=True)
+            self.resolvers.append(thread)
+            self.check()
+            thread.start()
+        except BaseException:
+            if thread in self.resolvers:
+                self.resolvers.remove(thread)
+            _RISK_RESOLVER_ADMISSION.release()
+            raise
         while True:
             self.check()
             try:
@@ -2100,7 +2118,11 @@ def _risk_download_handler(budget):
         def https_open(self, req):
             budget.check()
             value = self.do_open(Connection, req, context=self._context)
-            budget.check()
+            try:
+                budget.check()
+            except BaseException:
+                value.close()  # do_open produced a response, but no caller owns it yet.
+                raise
             return value
 
     return Handler(context=ssl.create_default_context())
@@ -2109,6 +2131,7 @@ def _risk_download_handler(budget):
 def download_command_risk(release, cancel):
     """Explicit installer path ONLY; all production entries are currently gated."""
     from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+    from urllib.error import HTTPError
     release.validate()
     hosts = {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
 
@@ -2125,11 +2148,13 @@ def download_command_risk(release, cancel):
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
         def http_error_302(self, req, fp, code, msg, headers):
-            location = headers.get("Location")
-            require(type(location) is str and len(location) <= 8192, "risk_download_redirect")
-            redirected = self.redirect_request(req, fp, code, msg, headers, urljoin(req.full_url, location))
-            fp.close()  # Never consume an unbounded redirect body via fp.read().
-            budget.check()
+            try:
+                location = headers.get("Location")
+                require(type(location) is str and len(location) <= 8192, "risk_download_redirect")
+                redirected = self.redirect_request(req, fp, code, msg, headers, urljoin(req.full_url, location))
+                budget.check()
+            finally:
+                fp.close()  # Includes every validation/budget/cancel failure.
             return self.parent.open(redirected, timeout=budget.timeout())
 
         http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
@@ -2150,8 +2175,12 @@ def download_command_risk(release, cancel):
                 raw.extend(chunk)
         budget.check()
         return bytes(raw)
-    except Exception:
-        budget.check()  # Deadline/cancel wins over the induced socket error.
+    except Exception as exc:
+        try:
+            if isinstance(exc, HTTPError):
+                exc.close()  # Retained exceptions/tracebacks must not retain live FDs.
+        finally:
+            budget.check()  # Deadline/cancel wins over the induced socket error.
         raise
     finally:
         budget.close()
