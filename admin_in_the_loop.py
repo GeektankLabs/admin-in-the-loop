@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import os
 import platform
 import re
 import select
+import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,6 +35,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 
 def _load_bridge_component(namespace=None):
@@ -1305,6 +1309,7 @@ class AppSnapshot:
     output_mode: str
     last_transfer_offset: int | None
     bridge: object = None
+    command_risk: object = None
 
 
 BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
@@ -1422,6 +1427,500 @@ import threading
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlencode
 from dataclasses import field, replace
+
+
+RISK_TIMEOUT = 2.0
+RISK_STDOUT_LIMIT = 1024 * 1024
+RISK_STDERR_LIMIT = 16 * 1024
+# JSON enums from sh-guard/types.rs at 92005d65b1232946924b524bcad267a29d8a2cb5.
+RISK_FACTORS = frozenset((
+    "recursive_delete", "force_flag", "broad_scope", "secrets_exposure",
+    "network_exfiltration", "pipe_to_execution", "command_substitution",
+    "process_substitution", "untrusted_execution", "privilege_escalation",
+    "path_injection", "git_history_destruction", "escapes_project_boundary",
+    "shell_injection", "zsh_module_loading", "zsh_glob_execution",
+    "obfuscated_command", "obfuscated_exfiltration", "command_execution", "write"))
+RISK_INTENTS = frozenset(("read", "write", "delete", "execute", "network",
+                         "process_control", "privilege", "package_install",
+                         "git_mutation", "env_modify", "search", "info"))
+RISK_CAPABILITIES = frozenset(("shell", "command", "reverse_shell", "bind_shell",
+                              "file_read", "file_write", "upload", "download",
+                              "library_load", "privilege_escalation"))
+RISK_LEVELS = ("safe", "caution", "danger", "critical")
+
+
+def _risk_fields(value, names):
+    require(type(value) is dict and set(value) == set(names.split()), "risk_schema")
+
+
+def _risk_number(value, low=0, high=100):
+    require(type(value) is int and low <= value <= high, "risk_number")
+
+
+def _risk_enum(value, choices):
+    require(type(value) is str and value in choices, "risk_enum")
+
+
+def _risk_enum_list(value, choices):
+    require(type(value) is list, "risk_schema")
+    for item in value:
+        _risk_enum(item, choices)
+
+
+def _risk_text(value, nullable=False):
+    require(type(value) is str or nullable and value is None, "risk_schema")
+
+
+def _risk_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, "risk_duplicate_key")
+        result[key] = value
+    return result
+
+
+def _risk_bad_number(_value):
+    raise ProbeError("risk_number")
+
+
+def _risk_json_bounds(value, depth=0):
+    require(depth <= 32, "risk_json_limit")
+    if type(value) is str:
+        require(len(value.encode("utf-8", errors="strict")) <= 8192, "risk_json_limit")
+    elif type(value) is list:
+        require(len(value) <= 512, "risk_json_limit")
+        for item in value:
+            _risk_json_bounds(item, depth + 1)
+    elif type(value) is dict:
+        for key, item in value.items():
+            _risk_json_bounds(key, depth + 1)
+            _risk_json_bounds(item, depth + 1)
+
+
+def _risk_freeze(value):
+    if type(value) is dict:
+        return MappingProxyType({key: _risk_freeze(item) for key, item in value.items()})
+    if type(value) is list:
+        return tuple(_risk_freeze(item) for item in value)
+    return value
+
+
+def validate_command_risk(raw, command, exit_code):
+    """Version-bound serde contract; no authorization and no content in errors."""
+    require(type(raw) is bytes and len(raw) <= RISK_STDOUT_LIMIT, "risk_output_limit")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        # Bound nesting BEFORE json.loads, without counting braces inside strings.
+        depth, quoted, escaped = 0, False, False
+        for char in text:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char in "[{":
+                depth += 1
+                require(depth <= 32, "risk_json_limit")
+            elif char in "]}":
+                depth -= 1
+        value = json.loads(text, object_pairs_hook=_risk_json_pairs,
+                           parse_constant=_risk_bad_number, parse_float=_risk_bad_number)
+        _risk_json_bounds(value)
+    except (UnicodeError, ValueError, RecursionError):
+        raise ProbeError("risk_json") from None
+    _risk_fields(value, "command score level quick_decision reason risk_factors "
+                        "sub_commands pipeline_flow mitre_mappings parse_confidence")
+    require(value["command"] == command and type(value["command"]) is str, "risk_command")
+    _risk_number(value["score"])
+    level = RISK_LEVELS[sum(value["score"] > boundary for boundary in (20, 50, 80))]
+    require(value["level"] == level and type(exit_code) is int
+            and exit_code == RISK_LEVELS.index(level), "risk_exit_level")
+    _risk_enum(value["quick_decision"], ("safe", "risky", "blocked"))
+    _risk_text(value["reason"])
+    _risk_enum_list(value["risk_factors"], RISK_FACTORS)
+    _risk_enum(value["parse_confidence"], ("full", "partial", "fallback"))
+    require(type(value["sub_commands"]) is list, "risk_schema")
+    for sub in value["sub_commands"]:
+        _risk_fields(sub, "command executable intent targets flags score risk_factors "
+                          "reversibility capabilities")
+        _risk_text(sub["command"])
+        _risk_text(sub["executable"], nullable=True)
+        _risk_enum_list(sub["intent"], RISK_INTENTS)
+        _risk_enum_list(sub["capabilities"], RISK_CAPABILITIES)
+        _risk_enum_list(sub["risk_factors"], RISK_FACTORS)
+        _risk_number(sub["score"])
+        _risk_enum(sub["reversibility"], ("reversible", "hard_to_reverse", "irreversible"))
+        require(type(sub["targets"]) is list and type(sub["flags"]) is list, "risk_schema")
+        for target in sub["targets"]:
+            _risk_fields(target, "path scope sensitivity")
+            _risk_text(target["path"], nullable=True)
+            _risk_enum(target["scope"], ("none", "single_file", "directory",
+                                       "directory_recursive", "system", "home", "root"))
+            _risk_enum(target["sensitivity"], ("normal", "config", "system", "secrets", "protected"))
+        for flag in sub["flags"]:
+            _risk_fields(flag, "flag modifier risk_factor description")
+            _risk_text(flag["flag"])
+            _risk_number(flag["modifier"], -128, 127)
+            _risk_enum(flag["risk_factor"], RISK_FACTORS)
+            _risk_text(flag["description"])
+    pipeline = value["pipeline_flow"]
+    if pipeline is not None:
+        _risk_fields(pipeline, "flow_type taint_flows composite_score")
+        _risk_enum(pipeline["flow_type"], ("pipe", "and", "or", "sequence", "mixed"))
+        _risk_number(pipeline["composite_score"])
+        require(type(pipeline["taint_flows"]) is list, "risk_schema")
+        for flow in pipeline["taint_flows"]:
+            _risk_fields(flow, "source propagators sink escalation escalation_reason")
+            for name, variants, path_variant in (
+                    ("source", ("sensitive_file", "environment_var", "command_output", "stdin"), "sensitive_file"),
+                    ("sink", ("network_send", "file_write", "execution", "display"), "file_write")):
+                tagged = flow[name]
+                require(type(tagged) is dict, "risk_schema")
+                _risk_enum(tagged.get("type"), variants)
+                _risk_fields(tagged, "type path" if tagged["type"] == path_variant else "type")
+                if "path" in tagged:
+                    _risk_text(tagged["path"])
+            require(type(flow["propagators"]) is list, "risk_schema")
+            for prop in flow["propagators"]:
+                if type(prop) is str:
+                    _risk_enum(prop, ("passthrough", "filtering", "aggregation"))
+                else:
+                    _risk_fields(prop, "encoding")
+                    _risk_fields(prop["encoding"], "method")
+                    _risk_text(prop["encoding"]["method"])
+            _risk_number(flow["escalation"], 0, 255)
+            _risk_text(flow["escalation_reason"])
+    require(type(value["mitre_mappings"]) is list, "risk_schema")
+    for mapping in value["mitre_mappings"]:
+        _risk_fields(mapping, "technique_id technique_name tactic")
+        for item in mapping.values():
+            _risk_text(item)
+    return _risk_freeze(value)
+
+
+@dataclass(frozen=True)
+class CommandRiskTool:
+    """Local caller-supplied descriptor. No manifest, discovery or pin admission."""
+    binary: str
+    sha256: str
+    size: int
+    version: str
+    generation: int
+
+    def __post_init__(self):
+        require(type(self.binary) is str and Path(self.binary).is_absolute(), "risk_binary_path")
+        require(type(self.sha256) is str and re.fullmatch("[0-9a-f]{64}", self.sha256), "risk_binary_hash")
+        _risk_number(self.size, 1, 16 * 1024 * 1024)
+        _risk_number(self.generation, 0, 2**63 - 1)
+        require(type(self.version) is str and len(self.version) <= 64
+                and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", self.version),
+                "risk_version")
+
+
+@dataclass(frozen=True)
+class CommandRiskKey:
+    epoch: int
+    tool: CommandRiskTool
+    review_id: str
+    revision: int
+    direction: str
+    session: str
+    bridge_binding: tuple | None
+    proposal_id: str | None
+    expires_at: float | None
+    final_return: bool
+    payload_sha256: str
+
+
+@dataclass(frozen=True)
+class CommandRiskJob:
+    key: CommandRiskKey
+    review: LocalReview = field(repr=False)
+    directory: str
+
+
+@dataclass(frozen=True)
+class CommandRiskResult:
+    key: CommandRiskKey
+    state: str
+    error: str | None = None
+    data: object = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
+class CommandRiskSnapshot:
+    state: str
+    result: CommandRiskResult | None = None
+    error: str | None = None
+
+
+def _risk_review_valid(review):
+    try:
+        return (type(review) is LocalReview and review.direction == "TO_TERMINAL"
+                and type(review.payload) is bytes
+                and normalize_command(review.text, review.final_return) == review.payload
+                and review.text.encode("utf-8", errors="strict") == review.payload)
+    except (ProbeError, UnicodeError):
+        return False
+
+
+def _risk_directory(path):
+    require(Path(path).is_absolute() and str(Path(path).resolve()) == str(path), "risk_directory")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700, "risk_directory")
+    finally:
+        os.close(fd)
+
+
+def _risk_verify_tool(tool, cancel):
+    require(str(Path(tool.binary).resolve()) == tool.binary, "risk_binary_path")
+    _risk_directory(str(Path(tool.binary).parent))
+    # A substituted FIFO must fail fstat, not block before the process deadline.
+    fd = os.open(tool.binary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o500 and info.st_size == tool.size,
+                "risk_binary_integrity")
+        digest = hashlib.sha256()
+        remaining = tool.size
+        while remaining:
+            require(not cancel.is_set(), "risk_cancelled")
+            chunk = source.read(min(65536, remaining))
+            require(bool(chunk), "risk_binary_integrity")
+            remaining -= len(chunk)
+            digest.update(chunk)
+        require(not source.read(1) and digest.hexdigest() == tool.sha256, "risk_binary_integrity")
+
+
+def _risk_reap(process):
+    # Kill the group even if its leader exited: descendants may hold our pipes.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.25 if sig == signal.SIGTERM else 1.0)
+        except subprocess.TimeoutExpired:
+            if sig == signal.SIGKILL:
+                raise ProbeError("risk_cleanup_failed") from None
+
+
+def _risk_process(argv, directory, environment, rules_fd, cancel):
+    require(not cancel.is_set(), "risk_cancelled")
+    deadline = time.monotonic() + RISK_TIMEOUT
+    process = subprocess.Popen(argv, shell=False, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               cwd=directory, env=environment, close_fds=True,
+                               pass_fds=(rules_fd,), start_new_session=True)
+    output = bytearray()
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream, limit in ((process.stdout, RISK_STDOUT_LIMIT),
+                                  (process.stderr, RISK_STDERR_LIMIT)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, limit)
+            while selector.get_map() or process.poll() is None:
+                require(not cancel.is_set(), "risk_cancelled")
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "risk_timeout")
+                for key, _mask in selector.select(min(remaining, 0.05)):
+                    chunk = os.read(key.fileobj.fileno(), min(65536, key.data + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    elif key.fileobj is process.stderr:
+                        # No warning is compatible with the rules-isolation contract.
+                        raise ProbeError("risk_stderr")
+                    else:
+                        require(len(output) + len(chunk) <= key.data, "risk_output_limit")
+                        output.extend(chunk)
+            require(not cancel.is_set(), "risk_cancelled")
+            code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            require(code in (0, 1, 2, 3), "risk_process_exit")
+            return bytes(output), code
+    finally:
+        try:
+            _risk_reap(process)
+        finally:
+            process.stdout.close()
+            process.stderr.close()
+
+
+def run_command_risk(job, cancel):
+    """Only text analysis. Errors are bounded metadata, never argv/stderr contents."""
+    try:
+        require(_risk_review_valid(job.review)
+                and hashlib.sha256(job.review.payload).hexdigest() == job.key.payload_sha256,
+                "risk_snapshot")
+        require((job.review.id, job.review.revision, job.review.direction, job.review.session,
+                 job.review.bridge_binding, job.review.proposal_id, job.review.expires_at,
+                 job.review.final_return) ==
+                (job.key.review_id, job.key.revision, job.key.direction, job.key.session,
+                 job.key.bridge_binding, job.key.proposal_id, job.key.expires_at,
+                 job.key.final_return), "risk_snapshot")
+        _risk_verify_tool(job.key.tool, cancel)
+        _risk_directory(job.directory)
+        with tempfile.TemporaryDirectory(prefix="analysis-", dir=job.directory) as directory:
+            for name in ("home", "tmp"):
+                Path(directory, name).mkdir(mode=0o700)
+            rules = str(Path(directory, "empty-rules"))
+            writer = os.open(rules, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.close(writer)
+            rules_fd = os.open(rules, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(rules_fd)
+                require(stat.S_ISREG(info.st_mode) and info.st_size == 0
+                        and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+                        "risk_rules")
+                os.unlink(rules)
+                environment = {"HOME": str(Path(directory, "home")),
+                               "TMPDIR": str(Path(directory, "tmp")), "PATH": "/usr/bin:/bin",
+                               "LANG": "C", "LC_ALL": "C", "TERM": "dumb", "NO_COLOR": "1"}
+                binary = job.key.tool.binary
+                version, code = _risk_process([binary, "--version"], directory, environment, rules_fd, cancel)
+                require(code == 0 and version == ("sh-guard " + job.key.tool.version + "\n").encode("ascii"),
+                        "risk_version")
+                _risk_verify_tool(job.key.tool, cancel)
+                raw, code = _risk_process([binary, "--json", "--shell", "bash", "--rules",
+                                           "/dev/fd/" + str(rules_fd), "--", job.review.text],
+                                          directory, environment, rules_fd, cancel)
+                data = validate_command_risk(raw, job.review.text, code)
+                require(not cancel.is_set(), "risk_cancelled")
+                state = "RESULT" if data["parse_confidence"] == "full" else "UNKNOWN"
+                return CommandRiskResult(job.key, state, data=data)
+            finally:
+                os.close(rules_fd)
+    except ProbeError as exc:
+        return CommandRiskResult(job.key, "UNAVAILABLE", str(exc))
+    except Exception:
+        return CommandRiskResult(job.key, "UNAVAILABLE", "risk_process_failure")
+
+
+class CommandRiskReviewer:
+    """One data-only worker; observation and publication belong to its owner thread."""
+    def __init__(self):
+        self.owner = threading.get_ident()
+        self.enabled = False
+        self.epoch = 0
+        self.tool = None
+        self.directory = None
+        self.state = "DISABLED"
+        self.result = None
+        self.current = None
+        self.events = queue.Queue(maxsize=4)
+        self.condition = threading.Condition()
+        self.pending = None
+        self.cancel = None
+        self.stopped = False
+        self.thread = None
+
+    def _owner(self):
+        require(threading.get_ident() == self.owner, "risk_wrong_thread")
+
+    def invalidate(self):
+        self._owner()
+        with self.condition:
+            self.pending = None
+            if self.cancel:
+                self.cancel.set()
+        self.current = self.result = None
+        self.state = "STALE" if self.enabled else "DISABLED"
+
+    def configure(self, tool=None, directory=None):
+        self._owner()
+        require(not self.stopped, "risk_closed")
+        require(tool is None or type(tool) is CommandRiskTool, "risk_tool")
+        require(tool is None or type(directory) is str and Path(directory).is_absolute(), "risk_directory")
+        self.invalidate()
+        self.epoch += 1
+        self.tool, self.directory = tool, directory
+        self.enabled = tool is not None
+        self.state = "IDLE" if self.enabled else "DISABLED"
+        if self.enabled and self.thread is None:
+            self.thread = threading.Thread(target=self._run, name="aitl-command-risk", daemon=True)
+            self.thread.start()
+
+    def poll(self, review, review_state, connection, session, bridge_binding):
+        self._owner()
+        eligible = (self.enabled and review is not None and review.direction == "TO_TERMINAL"
+                    and review_state in {"REVIEW", "OVERRIDE_REQUIRED"} and connection == "CONNECTED"
+                    and review.session == session
+                    and (review.bridge_binding is None or review.bridge_binding == bridge_binding)
+                    and (review.expires_at is None or time.time() < review.expires_at))
+        if not eligible:
+            self.invalidate()
+            if self.enabled and (review is None or review.direction != "TO_TERMINAL"):
+                self.state = "IDLE"
+        else:
+            if not _risk_review_valid(review):
+                self.invalidate()
+                self.state = "UNAVAILABLE"
+                return CommandRiskSnapshot(self.state, error="risk_snapshot")
+            key = CommandRiskKey(self.epoch, self.tool, review.id, review.revision, review.direction,
+                                 review.session, review.bridge_binding, review.proposal_id,
+                                 review.expires_at, review.final_return,
+                                 hashlib.sha256(review.payload).hexdigest())
+            if key != self.current:
+                self.invalidate()
+                self.current, self.state = key, "SCANNING"
+                with self.condition:
+                    self.pending = CommandRiskJob(key, review, self.directory)
+                    self.condition.notify()
+        for _ in range(4):
+            try:
+                result = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if result.key == self.current:
+                self.result, self.state = result, result.state
+        return CommandRiskSnapshot(self.state, self.result, self.result.error if self.result else None)
+
+    def _run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.stopped or self.pending is not None)
+                if self.stopped:
+                    return
+                job, self.pending = self.pending, None
+                cancel = self.cancel = threading.Event()
+            result = run_command_risk(job, cancel)
+            while True:
+                try:
+                    self.events.put_nowait(result)
+                    break
+                except queue.Full:
+                    try:
+                        self.events.get_nowait()
+                    except queue.Empty:
+                        pass
+            with self.condition:
+                if self.cancel is cancel:
+                    self.cancel = None
+            del job, result, cancel
+
+    def close(self):
+        self._owner()
+        if self.stopped:
+            return self.thread is None or not self.thread.is_alive()
+        self.configure()
+        with self.condition:
+            self.stopped = True
+            self.condition.notify()
+        if self.thread:
+            self.thread.join(timeout=3.0)
+        while not self.events.empty():
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                break
+        return self.thread is None or not self.thread.is_alive()
 
 
 @dataclass(frozen=True)
@@ -2461,13 +2960,23 @@ class AppCore:
         self.local_pending = None
         self.local_setup_deadline = 0
         self.local_check_at = 0
+        self._command_risk = CommandRiskReviewer()
+
+    def set_command_risk(self, tool=None, directory=None):
+        """Local headless setup only; callers own artifact admission. Default OFF."""
+        self._command_risk.configure(tool, directory)
+        return self.command_risk_snapshot()
+
+    def command_risk_snapshot(self):
+        return self._command_risk.poll(self.review, self.review_state, self.connection,
+                                       self.session, self._bridge_binding())
 
     def snapshot(self):
         return AppSnapshot(self.connection, self.session, tuple(self.inbox.items()),
                            self.review, self.review_state, self.paused, self.output.start,
                            self.output.end, self.preferences, tuple(self.approved_outputs), self.last_error,
                            self.final_return, self.output_mode, self.last_transfer_offset,
-                           self.bridge_snapshot())
+                           self.bridge_snapshot(), self.command_risk_snapshot())
 
     def bridge_snapshot(self):
         profile = self.bridge_profile
@@ -2484,6 +2993,7 @@ class AppCore:
 
     def _invalidate_bridge_review(self):
         if self.review and self.review.bridge_binding:
+            self._command_risk.invalidate()
             if self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}:
                 self.review_state = "STALE"
             elif self.review_state == "SENDING":
@@ -2859,6 +3369,7 @@ class AppCore:
     def _new_review(self, direction, text, payload, final_return=False, lost_prefix=False):
         require(self.review_state not in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN"}, "transfer_in_progress")
         require(self.session is not None and self.connection == "CONNECTED", "terminal_not_connected")
+        self._command_risk.invalidate()
         self.revision += 1
         self.review = LocalReview(uuid.uuid4().hex, self.revision, direction, self.session,
                                   text, payload, final_return, lost_prefix, self._bridge_binding())
@@ -3083,6 +3594,7 @@ class AppCore:
         except (ProbeError, OSError) as exc:
             self.last_error = str(exc) if isinstance(exc, ProbeError) else "ipc_failure"
             self._disconnect()
+        self.command_risk_snapshot()
 
     def _event(self, value):
         kind = value.get("type")
@@ -3134,6 +3646,7 @@ class AppCore:
             raise ProbeError("unknown_event")
 
     def _disconnect(self):
+        self._command_risk.invalidate()
         if self.channel:
             self.channel.close()
         self.channel = None
@@ -3145,6 +3658,7 @@ class AppCore:
             self.review_state = "STALE"
 
     def close(self):
+        self._command_risk.close()
         self.disconnect_bridge()
         self.pending_output = None
         if self.channel:
