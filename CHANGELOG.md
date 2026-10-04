@@ -17,6 +17,8 @@ Integrationsstand `6108390d927c9247fdf4627ef0bc2a1b345d901c`.
   MCP-Versionsmetadatenquelle.
 - Die zentrale Command-/Output-Review-Fläche verwendet eine maßvoll kleinere
   Monospace-Schrift für mehr Übersicht bei großen Blöcken.
+- Schwarzer Hintergrund und grüne Standardschrift im zentralen Review; Sonder-
+  und Risikomarkierungen bleiben mit der dunklen Kontrastpalette unterscheidbar.
 
 Operatorentscheidung vom 4. Oktober 2026, 23:06 Europe/Berlin: Der alleinige Tester
 nimmt diesen Stand für persönliche Tests an; externe Vorab-Abnahmen sind kein

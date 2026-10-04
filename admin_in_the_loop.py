@@ -5461,7 +5461,10 @@ class ReviewUI:
             self.review_font.configure(size=review_size - 1)
         elif review_size < -10:
             self.review_font.configure(size=review_size + 1)
-        self.editor.text.configure(font=self.review_font)
+        self.editor.text.configure(font=self.review_font, background="#000000",
+                                   foreground="#00ff00", insertbackground="#00ff00")
+        self.editor.text.tag_configure("control", foreground="#a8c2e0")
+        self.editor.text.tag_configure("warning", foreground="#edbd8d")
         self.editor.frame.grid(row=1, column=0, sticky="nsew")
         self.risk_row = ttk.Frame(middle, style="Review.TFrame")
         self.risk_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
