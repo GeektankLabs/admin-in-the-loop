@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import errno
 import hashlib
+import io
 import json
 import os
 import platform
@@ -29,6 +30,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unicodedata
@@ -1649,6 +1651,7 @@ class CommandRiskResult:
     state: str
     error: str | None = None
     data: object = field(default=None, repr=False)
+    analyzed_at: float = field(default_factory=time.time)
 
 
 @dataclass(frozen=True)
@@ -1801,6 +1804,354 @@ def run_command_risk(job, cancel):
         return CommandRiskResult(job.key, "UNAVAILABLE", str(exc))
     except Exception:
         return CommandRiskResult(job.key, "UNAVAILABLE", "risk_process_failure")
+
+
+def command_risk_spans(text, data):
+    """All-or-none exact CHARACTER intervals for a deliberately closed shell subset.
+
+    No execution, shell equivalence, substring searching or parser-confidence claim.
+    The UI separately projects these source characters to actual Tk indices.
+    """
+    if not data or data["parse_confidence"] != "full" or data["command"] != text:
+        return ()
+    intervals, start, end, quote, word, need_command = [], None, None, None, "", False
+    reserved = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+                "case", "esac", "in", "function", "select", "time", "coproc", "!", "[[", "]]"}
+
+    def finish_word():
+        return word not in reserved
+
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if quote:
+            if char == quote:
+                quote = None
+            elif quote == '"' and char in "$`":
+                return ()
+            elif quote == '"' and char == "\\":
+                if i + 1 == len(text) or text[i + 1] == "\n":
+                    return ()
+                i += 1
+            end = i + 1
+        elif char == "\\":
+            if i + 1 == len(text) or text[i + 1] == "\n":
+                return ()
+            start = i if start is None else start
+            word += text[i:i + 2]
+            i += 1
+            end, need_command = i + 1, False
+        elif char in "'\"":
+            start = i if start is None else start
+            quote, word, end, need_command = char, word + char, i + 1, False
+        elif char in "$`<>(){}" or char == "\t":
+            return ()
+        elif char == "#" and not word:
+            if start is not None:
+                intervals.append((start, end))
+                start = end = None
+            newline = text.find("\n", i)
+            i = len(text) if newline < 0 else newline
+            continue
+        elif char == " ":
+            if not finish_word():
+                return ()
+            word = ""
+        elif char in ";\n|&":
+            if not finish_word():
+                return ()
+            operator = char
+            if char in "|&" and i + 1 < len(text) and text[i:i + 2] in ("||", "&&", "|&"):
+                operator = text[i:i + 2]
+                i += 1
+            if operator == "&" or start is None and (operator != "\n" or need_command):
+                return ()
+            if start is not None:
+                intervals.append((start, end))
+            start = end = None
+            word = ""
+            need_command = operator in ("|", "|&", "&&", "||")
+        else:
+            start = i if start is None else start
+            word += char
+            end, need_command = i + 1, False
+        i += 1
+    if quote or need_command or not finish_word():
+        return ()
+    if start is not None:
+        intervals.append((start, end))
+    subs = data["sub_commands"]
+    if len(intervals) != len(subs) or not intervals:
+        return ()
+    if any(text[left:right] != sub["command"] for (left, right), sub in zip(intervals, subs)):
+        return ()
+    return tuple((left, right, sub["score"]) for (left, right), sub in zip(intervals, subs))
+
+
+@dataclass(frozen=True)
+class CommandRiskRelease:
+    version: str
+    target: str
+    archive_sha256: str
+    archive_size: int
+    binary_sha256: str
+    binary_size: int
+    approved: bool = False
+
+    @property
+    def url(self):
+        return ("https://github.com/aryanbhosale/sh-guard/releases/download/v" + self.version
+                + "/sh-guard-" + self.target + ".tar.gz")
+
+    def validate(self):
+        require(type(self.approved) is bool and self.approved, "risk_pin_not_approved")
+        require(self.target in RISK_RELEASES, "risk_platform")
+        CommandRiskTool("/sh-guard", self.binary_sha256, self.binary_size, self.version, 0)
+        require(re.fullmatch("[0-9a-f]{64}", self.archive_sha256), "risk_archive_hash")
+        _risk_number(self.archive_size, 1, 16 * 1024 * 1024)
+
+
+# Reviewed hashes are candidates, not artifact/SBOM/offline/legal/native admission.
+RISK_RELEASES = MappingProxyType({release.target: release for release in (
+    CommandRiskRelease("0.1.10", "x86_64-unknown-linux-gnu",
+        "7c1a34a26e5eb4ab58bfc4f879ba6bca366c1df8e3a568e2b77198a92fd83d9f", 2366483,
+        "755e6e865bf2501cbae618988aced28ea24376f992219c96072b0b5874c4b2ae", 5622640),
+    CommandRiskRelease("0.1.10", "aarch64-unknown-linux-gnu",
+        "772a53bb5f736462b21e1e643006fc2d6abbd31ef93f575a030e3d86b2daeee3", 2289546,
+        "295c0818ee4eaac24741e5ea392768c8807b1112b294305f611e5fecbd2494dd", 5493288),
+    CommandRiskRelease("0.1.10", "x86_64-apple-darwin",
+        "513dd61dd34d739b240011f9d620ec3fb6b7d11524d2c1fd7b9545ca795e15ad", 2237864,
+        "7a6e2903dc529bbf5b4b43b50ae761924a011002492f46176ee7195caa4c92a9", 4900876),
+    CommandRiskRelease("0.1.10", "aarch64-apple-darwin",
+        "56a4e91df78ac11eacb046885ca7266da965ca76e5be6c908127dd5333fd16c0", 2154488,
+        "3c74dfff45c4c4b892d9d31889d0c2f5ac30ef0c2f9061115d2cccc00ef42d16", 4744832))})
+
+
+def command_risk_release():
+    machine = platform.machine().lower()
+    arch = "x86_64" if machine in ("x86_64", "amd64") else "aarch64" if machine in ("arm64", "aarch64") else None
+    suffix = "apple-darwin" if sys.platform == "darwin" else "unknown-linux-gnu" if sys.platform.startswith("linux") else None
+    require(arch is not None and suffix is not None, "risk_platform")
+    return RISK_RELEASES[arch + "-" + suffix]
+
+
+def download_command_risk(release, cancel):
+    """Explicit installer path ONLY; all production entries are currently gated."""
+    from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+    release.validate()
+    hosts = {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
+
+    class Redirects(HTTPRedirectHandler):
+        count = 0
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            self.count += 1
+            parsed = urlsplit(newurl)
+            require(self.count <= 5 and parsed.scheme == "https" and parsed.hostname in hosts
+                    and parsed.port in (None, 443) and not parsed.username and not parsed.password,
+                    "risk_download_redirect")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    deadline, raw = time.monotonic() + 120, bytearray()
+    require(not cancel.is_set(), "risk_cancelled")
+    with build_opener(ProxyHandler({}), Redirects()).open(release.url, timeout=15) as response:
+        while True:
+            require(not cancel.is_set(), "risk_cancelled")
+            require(time.monotonic() < deadline, "risk_download_timeout")
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            require(len(raw) + len(chunk) <= release.archive_size, "risk_archive_size")
+            raw.extend(chunk)
+    return bytes(raw)
+
+
+def _risk_private_tree(base, parts):
+    """Create only private owned components, relative to a checked config root."""
+    require(Path(base).is_absolute() and Path(base).resolve() == Path(base), "risk_directory")
+    fd = PreferenceStore(base)._directory_fd()
+    current = Path(base)
+    try:
+        for name in parts:
+            require(re.fullmatch(r"[A-Za-z0-9_.-]+", name) and name not in (".", ".."), "risk_directory")
+            try:
+                os.mkdir(name, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            info = os.fstat(child)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                os.close(child)
+                raise ProbeError("risk_directory")
+            os.close(fd)
+            fd, current = child, current / name
+        _risk_directory(str(current))
+        return current
+    finally:
+        os.close(fd)
+
+
+def _risk_quarantine(path):
+    if sys.platform == "darwin":
+        value = ("0083;%x;Admin in the Loop;%s" % (int(time.time()), uuid.uuid4())).encode("ascii")
+        os.setxattr(path, "com.apple.quarantine", value, follow_symlinks=False)
+        require(os.getxattr(path, "com.apple.quarantine", follow_symlinks=False) == value, "risk_quarantine")
+
+
+def _risk_probe(tool, work, cancel):
+    text = ":\n"
+    review = LocalReview("risk-start-probe", 0, "TO_TERMINAL", "risk-start-probe", text, text.encode(), True)
+    key = CommandRiskKey(0, tool, review.id, 0, review.direction, review.session, None, None, None,
+                         True, hashlib.sha256(review.payload).hexdigest())
+    result = run_command_risk(CommandRiskJob(key, review, str(work)), cancel)
+    require(result.state == "RESULT", result.error or "risk_probe")
+
+
+class CommandRiskInstallation:
+    """An approved manifest is mandatory before filesystem, transport or execution."""
+    def __init__(self, base, release):
+        self.base, self.release = Path(base), release
+
+    @property
+    def destination(self):
+        return self.base / "tools" / "sh-guard" / self.release.version / self.release.target / "sh-guard"
+
+    def tool(self, path=None):
+        release = self.release
+        return CommandRiskTool(str(path or self.destination), release.binary_sha256,
+                               release.binary_size, release.version, 1)
+
+    def check(self, cancel):
+        self.release.validate()
+        require(self.base.is_absolute() and str(self.base.resolve()) == str(self.base), "risk_directory")
+        if not self.destination.exists() and not self.destination.is_symlink():
+            return None
+        for path in (self.base, *self.destination.parent.parents):
+            if path == self.base or path.is_relative_to(self.base):
+                _risk_directory(str(path))
+        tool = self.tool()
+        _risk_verify_tool(tool, cancel)
+        work = _risk_private_tree(self.base, ("tools", "sh-guard", ".work"))
+        _risk_probe(tool, work, cancel)
+        return tool
+
+    def install(self, cancel, progress, transport=download_command_risk):
+        self.release.validate()
+        release = self.release
+        root = _risk_private_tree(self.base, ("tools", "sh-guard"))
+        work = _risk_private_tree(self.base, ("tools", "sh-guard", ".work"))
+        lock = os.open(root / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(lock)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o600, "risk_install_lock")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            progress("DOWNLOADING")
+            require(not cancel.is_set(), "risk_cancelled")
+            raw = transport(release, cancel)
+            require(type(raw) is bytes and len(raw) == release.archive_size, "risk_archive_size")
+            require(hashlib.sha256(raw).hexdigest() == release.archive_sha256, "risk_archive_hash")
+            progress("VERIFYING")
+            with tempfile.TemporaryDirectory(prefix="install-", dir=work) as staging:
+                binary, seen, total = Path(staging, "sh-guard"), set(), 0
+                with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+                    for member in archive:
+                        require(not cancel.is_set(), "risk_cancelled")
+                        require(member.name in ("sh-guard", "sh-guard-mcp") and member.name not in seen
+                                and member.isfile() and not member.issparse() and not member.pax_headers,
+                                "risk_archive_members")
+                        _risk_number(member.size, 1, 16 * 1024 * 1024)
+                        seen.add(member.name)
+                        total += member.size
+                        require(total <= 32 * 1024 * 1024, "risk_archive_size")
+                        if member.name == "sh-guard":
+                            require(member.size == release.binary_size, "risk_binary_integrity")
+                            with archive.extractfile(member) as source:
+                                payload = source.read(release.binary_size + 1)
+                            require(len(payload) == release.binary_size
+                                    and hashlib.sha256(payload).hexdigest() == release.binary_sha256,
+                                    "risk_binary_integrity")
+                            fd = os.open(binary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                            with os.fdopen(fd, "wb") as target:
+                                target.write(payload)
+                                target.flush()
+                                os.fsync(target.fileno())
+                            _risk_quarantine(binary)
+                            binary.chmod(0o500)
+                require(seen == {"sh-guard", "sh-guard-mcp"}, "risk_archive_members")
+                require(not cancel.is_set(), "risk_cancelled")
+                progress("PROBING")
+                _risk_probe(self.tool(binary), work, cancel)
+                parent = _risk_private_tree(self.base, ("tools", "sh-guard", release.version))
+                target = parent / release.target
+                # An existing install is never overwritten; upgrade publishes a new version.
+                require(not target.exists() and not target.is_symlink(), "risk_install_target")
+                receipt = Path(staging, "receipt.json")
+                fd = os.open(receipt, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "w") as output:
+                    json.dump({"version": release.version, "target": release.target, "source": release.url,
+                               "archive_sha256": release.archive_sha256, "binary_sha256": release.binary_sha256,
+                               "installed_at": time.time()}, output)
+                    output.flush()
+                    os.fsync(output.fileno())
+                require(not cancel.is_set(), "risk_cancelled")
+                os.rename(staging, target)  # Binary + receipt become visible together.
+                return self.tool(), str(work)
+        finally:
+            os.close(lock)
+
+    def remove(self):
+        self.release.validate()
+        root = self.base / "tools" / "sh-guard"
+        _risk_directory(str(root))
+        lock = os.open(root / ".lock", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(lock)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o600, "risk_install_lock")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            tool = self.tool()
+            _risk_verify_tool(tool, threading.Event())
+            target = self.destination.parent
+            require(set(p.name for p in target.iterdir()) == {"sh-guard", "receipt.json"}, "risk_cleanup_incomplete")
+            receipt = target / "receipt.json"
+            info = receipt.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o600, "risk_cleanup_incomplete")
+            self.destination.unlink()
+            receipt.unlink()
+            target.rmdir()
+        finally:
+            os.close(lock)
+
+
+class CommandRiskSetup:
+    """One bounded setup operation; only the owner consumes its data event."""
+    def __init__(self, installation, install=False, transport=download_command_risk):
+        self.cancel = threading.Event()
+        self.events = queue.Queue(maxsize=1)
+        self.phase = "INSTALLING" if install else "CHECKING_TOOL"
+
+        def run():
+            try:
+                if install:
+                    value = installation.install(self.cancel, lambda phase: None, transport)
+                else:
+                    tool = installation.check(self.cancel)
+                    value = None if tool is None else (tool, str(tool_path_work(installation)))
+                self.events.put_nowait(("ready" if value else "missing", value))
+            except Exception as exc:
+                self.events.put_nowait(("error", str(exc) if isinstance(exc, ProbeError) else "risk_setup_failure"))
+
+        self.thread = threading.Thread(target=run, name="aitl-risk-setup", daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.cancel.set()
+
+
+def tool_path_work(installation):
+    return installation.base / "tools" / "sh-guard" / ".work"
 
 
 class CommandRiskReviewer:
@@ -2961,6 +3312,74 @@ class AppCore:
         self.local_setup_deadline = 0
         self.local_check_at = 0
         self._command_risk = CommandRiskReviewer()
+        self.risk_requested = False
+        self.risk_setup = None
+        self.risk_installation = None
+        self.risk_setup_state = "DISABLED"
+        self.risk_setup_error = None
+        self.risk_setup_epoch = 0
+
+    def request_command_risk(self, enabled):
+        self._command_risk._owner()
+        require(type(enabled) is bool, "risk_enable")
+        self.risk_setup_epoch += 1
+        self.risk_requested = enabled
+        self._command_risk.configure()
+        if self.risk_setup:
+            self.risk_setup.close()
+        self.risk_setup_state, self.risk_setup_error = "DISABLED", None
+        if not enabled:
+            return
+        self.risk_installation = None
+        if self.risk_setup and self.risk_setup.thread.is_alive():
+            self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", "risk_setup_busy"
+            return
+        self.risk_setup = None
+        try:
+            release = command_risk_release()
+            release.validate()  # BEFORE any filesystem, dialog, transport or execution.
+            base = self.preference_store.directory if self.preference_store else preference_directory()
+            self.risk_installation = CommandRiskInstallation(base, release)
+            self.risk_setup = CommandRiskSetup(self.risk_installation)
+            self.risk_setup_state = "CHECKING_TOOL"
+        except ProbeError as exc:
+            self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", str(exc)
+
+    def confirm_command_risk_install(self, confirmed):
+        self._command_risk._owner()
+        require(self.risk_requested and self.risk_setup_state == "INSTALL_CONFIRM", "risk_install_state")
+        if not confirmed:
+            self.request_command_risk(False)
+            return
+        self.risk_installation.release.validate()
+        self.risk_setup = CommandRiskSetup(self.risk_installation, install=True)
+        self.risk_setup_state = "INSTALLING"
+
+    def remove_command_risk(self):
+        self._command_risk._owner()
+        require(self.risk_installation is not None and not self.risk_requested
+                and (self.risk_setup is None or not self.risk_setup.thread.is_alive())
+                and (self._command_risk.cancel is None), "risk_cleanup_busy")
+        self.risk_installation.remove()
+
+    def _pump_command_risk_setup(self):
+        setup = self.risk_setup
+        if setup is None:
+            return
+        try:
+            kind, value = setup.events.get_nowait()
+        except queue.Empty:
+            return
+        self.risk_setup = None
+        if not self.risk_requested or setup.cancel.is_set():
+            return
+        if kind == "ready":
+            self._command_risk.configure(*value)
+            self.risk_setup_state, self.risk_setup_error = "READY", None
+        elif kind == "missing":
+            self.risk_setup_state = "INSTALL_CONFIRM"
+        else:
+            self.risk_setup_state, self.risk_setup_error = "UNAVAILABLE", value
 
     def set_command_risk(self, tool=None, directory=None):
         """Local headless setup only; callers own artifact admission. Default OFF."""
@@ -2968,6 +3387,10 @@ class AppCore:
         return self.command_risk_snapshot()
 
     def command_risk_snapshot(self):
+        self._command_risk._owner()
+        self._pump_command_risk_setup()
+        if self.risk_requested and self.risk_setup_state != "READY":
+            return CommandRiskSnapshot(self.risk_setup_state, error=self.risk_setup_error)
         return self._command_risk.poll(self.review, self.review_state, self.connection,
                                        self.session, self._bridge_binding())
 
@@ -3658,6 +4081,9 @@ class AppCore:
             self.review_state = "STALE"
 
     def close(self):
+        if self.risk_setup:
+            self.risk_setup.close()
+        self.risk_requested = False
         self._command_risk.close()
         self.disconnect_bridge()
         self.pending_output = None
@@ -3709,6 +4135,26 @@ class ScrollableText:
         self.text.delete("1.0", "end")
         for text, tag in fragments:
             self.text.insert("end", text, (tag,))
+        self.text.configure(state="disabled")
+
+    def show_review(self, source, spans=()):
+        """Project source characters to actual Tcl indices; never reconstruct payload."""
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        positions = []
+        for char in source:
+            positions.append(self.text.index("end-1c"))
+            for display, tag in review_fragments(char):
+                self.text.insert("end", display, (tag,))
+        positions.append(self.text.index("end-1c"))
+        light = sum(self.text.winfo_rgb(self.text.cget("background"))) > 3 * 32768
+        colors = (("#e8eef4", "#263645"), ("#fff1cf", "#4a3c1d"),
+                  ("#ffe1cf", "#4d2c1b"), ("#fbdadd", "#4b242c"))
+        for index, (left, right, score) in enumerate(spans):
+            tag = "risk-sub-" + str(index)
+            self.text.tag_configure(tag, background=colors[sum(score > b for b in (20, 50, 80))][not light])
+            self.text.tag_add(tag, positions[left], positions[right])
+        self.text.tag_raise("sel")
         self.text.configure(state="disabled")
 
 
@@ -4495,6 +4941,10 @@ class ReviewUI:
         self.binding_touched = False
         self.launcher = None
         self.connection_dialog = None
+        self.risk_dialog = None
+        self.risk_details_box = None
+        self.risk_render_key = None
+        self.risk_confirm_pending = False
         self.status_labels = []
         root.title("Admin in the Loop")
         width = min(1360, root.winfo_screenwidth())
@@ -4574,9 +5024,24 @@ class ReviewUI:
         ttk.Label(review_header, textvariable=self.direction, style="Review.TLabel").pack(anchor="w")
         self.editor = ScrollableText(middle, readonly=True, height=16)
         self.editor.frame.grid(row=1, column=0, sticky="nsew")
+        self.risk_row = ttk.Frame(middle, style="Review.TFrame")
+        self.risk_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.risk_enabled = tk.BooleanVar(value=False)
+        self.risk_checkbox = ttk.Checkbutton(self.risk_row, text="Mit sh-guard prüfen",
+            variable=self.risk_enabled, command=self.change_command_risk)
+        self.risk_checkbox.grid(row=0, column=0, sticky="w")
+        self.risk_details_button = ttk.Button(self.risk_row, text="Details…", command=self.command_risk_details)
+        self.risk_details_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self.risk_details_button.bind("<Return>", lambda _: self.risk_details_button.invoke())
+        self.risk_row.columnconfigure(0, weight=1)
+        self.risk_status = tk.StringVar(value="")
+        self.risk_status_label = ttk.Label(self.risk_row, textvariable=self.risk_status,
+            style="Review.TLabel", wraplength=360)
+        self.risk_status_label.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.editor.text.bind("<Button-1>", self.click_command_risk, add=True)
         self.final_return = tk.BooleanVar(value=core.final_return)
         self.return_row = ttk.Frame(middle, style="Review.TFrame")
-        self.return_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.return_row.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         self.return_checkbox = ttk.Checkbutton(self.return_row, text="Finales Return senden",
                                                variable=self.final_return, command=self.change_return)
         self.return_checkbox.pack(anchor="w")
@@ -4584,6 +5049,8 @@ class ReviewUI:
         self.binding_value = tk.StringVar(value="")
         self.binding_submission = {}
         self.binding_row = ttk.Frame(middle, style="Review.TFrame")
+        self.binding_row.grid(row=4, column=0, sticky="ew")
+        self.binding_row.grid_remove()
         self.binding_picker = ttk.Combobox(self.binding_row, textvariable=self.binding_value,
                                            state="readonly")
         ttk.Label(self.binding_row, text="Output gehört zu Submission:",
@@ -4592,7 +5059,7 @@ class ReviewUI:
         self.binding_picker.bind("<<ComboboxSelected>>", lambda _: setattr(self, "binding_touched", True))
         self.review_status_label = ttk.Label(middle, textvariable=self.review_status, wraplength=360,
                                              style="Review.TLabel")
-        self.review_status_label.grid(row=4, column=0, sticky="ew", pady=(8, 4))
+        self.review_status_label.grid(row=5, column=0, sticky="ew", pady=(8, 4))
 
         self.ai_status = tk.StringVar(value="Nicht verbunden\nLokaler Testmodus")
         self.header(right, "AI / MCP", self.ai_status,
@@ -4727,6 +5194,117 @@ class ReviewUI:
 
     def change_return(self):
         self.action(lambda: self.core.set_final_return(self.final_return.get()))
+
+    def change_command_risk(self):
+        self.action(lambda: self.core.request_command_risk(self.risk_enabled.get()))
+
+    def _confirm_command_risk(self):
+        self.risk_confirm_pending = False
+        if not self.core.risk_requested or self.core.risk_setup_state != "INSTALL_CONFIRM":
+            return
+        installation = self.core.risk_installation
+        release = installation.release
+        message = ("sh-guard " + release.version + " installieren?\nEin lokales Analyse-Binary wird von\n"
+                   + release.url + "\nnach\n" + str(installation.destination)
+                   + "\nheruntergeladen und per SHA-256 geprüft.\nDie Analyse arbeitet lokal/offline. Ihre Freigabe bleibt erforderlich.")
+        if sys.platform == "darwin":
+            message += "\nmacOS/Gatekeeper kann eine einmalige manuelle Bestätigung verlangen."
+        epoch = self.core.risk_setup_epoch
+        confirmed = self.messagebox.askyesno("Lokales Analyse-Binary", message, parent=self.root)
+        if self.core.risk_setup_epoch == epoch and self.core.risk_setup_state == "INSTALL_CONFIRM":
+            self.action(lambda: self.core.confirm_command_risk_install(confirmed))
+
+    def click_command_risk(self, event):
+        index = self.editor.text.index("@%d,%d" % (event.x, event.y))
+        if any(tag.startswith("risk-sub-") for tag in self.editor.text.tag_names(index)):
+            self.command_risk_details()
+
+    def command_risk_details(self):
+        if self.risk_dialog and self.risk_dialog.winfo_exists():
+            self.risk_dialog.lift()
+            return
+        window = self.risk_dialog = self.tk.Toplevel(self.root)
+        window.title("sh-guard · Analyse und Installation")
+        window.geometry("820x600")
+        self.risk_details_box = ScrollableText(window, readonly=True, height=18)
+        self.risk_details_box.frame.pack(fill="both", expand=True, padx=12, pady=12)
+        controls = self.ttk.Frame(window)
+        controls.pack(fill="x", padx=12, pady=(0, 12))
+        self.ttk.Button(controls, text="Erneut prüfen", command=lambda: self.action(
+            lambda: self.core.request_command_risk(True))).pack(side="left")
+        self.ttk.Button(controls, text="AITL-sh-guard entfernen…", command=self.remove_command_risk).pack(side="left", padx=8)
+        self.ttk.Button(controls, text="Schließen", command=window.destroy).pack(side="right")
+        self.risk_render_key = None
+        self.render()
+
+    def remove_command_risk(self):
+        installation = self.core.risk_installation
+        if installation and self.messagebox.askyesno("Lokales Tool entfernen",
+                "Nur das geprüfte AITL-Binary entfernen?\n" + str(installation.destination), parent=self.risk_dialog):
+            self.action(lambda: self.core.request_command_risk(False))
+            self.action(self.core.remove_command_risk)
+
+    def _render_command_risk(self, snapshot, command):
+        risk = snapshot.command_risk
+        self.risk_enabled.set(self.core.risk_requested or self.core._command_risk.enabled)
+        self.risk_checkbox.configure(state="normal" if command or snapshot.review is None else "disabled")
+        labels = {"DISABLED": "", "IDLE": "Bereit · kein Command-Review" if not snapshot.review else "Nur AI→Terminal",
+                  "CHECKING_TOOL": "sh-guard wird geprüft…", "INSTALL_CONFIRM": "Installation bestätigen…",
+                  "INSTALLING": "sh-guard wird installiert…", "SCANNING": "Prüfung läuft…",
+                  "STALE": "Analyse nicht mehr aktuell", "UNKNOWN": "Analyse unvollständig",
+                  "UNAVAILABLE": "Prüfung nicht verfügbar"}
+        error = risk.error
+        spans = command_risk_spans(snapshot.review.text, risk.result.data) if command and risk.result and risk.result.data else ()
+        if risk.state == "RESULT" and spans:
+            status = "Risk %d/100 – %s" % (risk.result.data["score"], risk.result.data["level"])
+        elif risk.state == "RESULT":
+            status, error = "Zuordnung unbekannt", "risk_mapping_unknown"
+        else:
+            status = labels.get(risk.state, risk.state)
+        reasons = {"risk_pin_not_approved": "Artefakt-/SBOM-/Offline-/Lizenz-/Plattformfreigabe fehlt",
+                   "risk_platform": "Plattform nicht unterstützt", "risk_setup_busy": "Vorherige Prüfung wird beendet",
+                   "risk_mapping_unknown": "keine verlässliche Subcommand-Markierung"}
+        if error:
+            status += " · " + reasons.get(error, error)
+        self.risk_status.set(status)
+        if risk.state != "RESULT":
+            spans = ()
+        key = (snapshot.review, risk, spans)
+        if key != self.risk_render_key:
+            for tag in self.editor.text.tag_names():
+                if tag.startswith("risk-sub-"):
+                    self.editor.text.tag_delete(tag)
+            self.editor.show_review(snapshot.review.text if snapshot.review else "", spans)
+            if self.risk_dialog and self.risk_dialog.winfo_exists():
+                def plain(value):
+                    if isinstance(value, (dict, MappingProxyType)):
+                        return {k: plain(v) for k, v in value.items()}
+                    if isinstance(value, tuple):
+                        return [plain(v) for v in value]
+                    return value
+                details = (status or "Reviewer deaktiviert") + "\nStatische Analyse · keine Freigabe oder Sicherheitsgarantie\n"
+                if risk.result and risk.result.data:
+                    details += ("\nSnapshot: %s · Revision %s · finales Return: %s\nTool: %s\nBinary-SHA-256: %s\nAnalysiert: %s\n"
+                        % (risk.result.key.review_id, risk.result.key.revision, risk.result.key.final_return,
+                           risk.result.key.tool.version, risk.result.key.tool.sha256, risk.result.analyzed_at))
+                    details += "Sitzung: %s\nToolpfad/Target: %s\n" % (risk.result.key.session, risk.result.key.tool.binary)
+                    details += "\nGesamtbefund / Parse Confidence / Risk Factors / Subcommands / Pipeline-Taint / MITRE\n"
+                    details += json.dumps(plain(risk.result.data), ensure_ascii=False, indent=2)
+                    details += "\nquick_decision ist nur ein Upstream-Label, keine AITL-Autorisierung.\n"
+                installation = self.core.risk_installation
+                if installation:
+                    release = installation.release
+                    details += ("\nInstallationsziel: " + str(installation.destination) + "\nQuelle: " + release.url
+                                + "\nArchiv-SHA-256: " + release.archive_sha256 + "\nBinary-SHA-256: " + release.binary_sha256)
+                details += "\nGPL-3.0-only: unabhängige Lizenz-/Distributionsfreigabe erforderlich.\n"
+                details += "Commandtext kann kurzzeitig in OS-Prozessargumenten sichtbar sein.\n"
+                if sys.platform == "darwin":
+                    details += "Gatekeeper: bei nicht eindeutigem Startfehler manuell prüfen; keine automatische Ausnahme/Quarantäneentfernung.\n"
+                self.risk_details_box.show(review_fragments(details))
+            self.risk_render_key = key
+        if risk.state == "INSTALL_CONFIRM" and not self.risk_confirm_pending:
+            self.risk_confirm_pending = True
+            self.root.after_idle(self._confirm_command_risk)
 
     def show_context(self, event):
         if self.core.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}:
@@ -4888,8 +5466,7 @@ class ReviewUI:
         if bridge.certificate_warning:
             message += " | Bridge-Zertifikat läuft in weniger als 30 Tagen ab"
         self.review_status.set(message)
-        if self.last_snapshot is None or review != self.last_snapshot.review:
-            self.editor.show(review_fragments(review.text) if review else ())
+        self._render_command_risk(snapshot, command)
         self.last_snapshot = snapshot
         self.fit_panels()
         if self.connection_dialog and self.connection_dialog.window.winfo_exists():
