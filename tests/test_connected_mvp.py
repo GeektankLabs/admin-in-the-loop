@@ -75,6 +75,78 @@ def mcp(process, name, args=None, modern=False):
     return data
 
 
+class ReviewByteDetailTests(unittest.TestCase):
+    def test_normalization_counts_and_final_bytes_follow_existing_rules(self):
+        core = a.AppCore()
+        self.addCleanup(core.close)
+        core.session, core.connection = "synthetic", "CONNECTED"
+        for text, counts in [("a\r\nb\r\r\n", (2, 1, 2)), ("a\n\n", (0, 0, 2)),
+                             ("a\nb", (0, 0, 0)), ("é😀", (0, 0, 0))]:
+            for final_return in (False, True):
+                with self.subTest(text=text, final_return=final_return):
+                    review = core.review_command(text, final_return)
+                    self.assertEqual(review.payload, a.normalize_command(text, final_return))
+                    self.assertEqual(review.normalization, counts)
+                    self.assertEqual(review.text.encode(), review.payload)
+                    self.assertIn("AN" if final_return else "AUS", a.normalization_summary(review))
+        previous = core.review_command("a\r\n\n", True)
+        edited = core.edit_review(previous.id, "é\nb", False)
+        self.assertEqual(edited.normalization, (0, 0, 0))
+        self.assertGreater(edited.revision, previous.revision)
+        output = core._output_review("é\n")
+        self.assertIsNone(output.normalization)
+        self.assertNotIn("CRLF", a.normalization_summary(output))
+
+    def test_final_payload_offsets_and_escaped_codepoints(self):
+        text = "Aé😀\n"
+        review = a.LocalReview("synthetic", 3, "TO_TERMINAL", "s", text, text.encode(), True)
+        details = a.review_byte_details(review)
+        self.assertIn('0 | 41 | U+0041 | "A"', details)
+        self.assertIn('1 | c3 a9 | U+00E9 | "\\u00e9"', details)
+        self.assertIn('3 | f0 9f 98 80 | U+1F600 | "\\ud83d\\ude00"', details)
+        self.assertIn('7 | 0a | U+000A | "\\n"', details)
+        self.assertTrue(details.endswith("Ende: 8 Bytes"))
+        self.assertEqual(review.payload, b"A\xc3\xa9\xf0\x9f\x98\x80\n")
+
+
+class CompactBindingPresentationTests(unittest.TestCase):
+    def setUp(self):
+        self.core = a.AppCore()
+        self.addCleanup(self.core.close)
+        self.binding = dict(code="A1B2C3D4", status="ACTIVE", generation=1,
+                            server_time=100.0, expires_at=200.0, retry_at=0.0,
+                            restriction_scope="PRINCIPAL")
+        self.bridge = replace(self.core.bridge_snapshot(), state="CONNECTED", mode="REMOTE",
+                              chat_binding=self.binding, chat_binding_received_at=10.0)
+
+    def test_active_display_is_compact_but_expiry_and_freshness_still_hide_code(self):
+        with mock.patch.object(a.time, "monotonic", return_value=11.0):
+            self.assertEqual(a.chat_binding_presentation(self.bridge), ("A1B2-C3D4", "", True))
+            for bridge in (replace(self.bridge, state="DISCONNECTED"),
+                           replace(self.bridge, chat_binding=None),
+                           replace(self.bridge, chat_binding=dict(self.binding, expires_at=100.0)),
+                           replace(self.bridge, chat_binding=dict(self.binding, status="EXPIRED"))):
+                code, status, allowed = a.chat_binding_presentation(bridge)
+                self.assertEqual(code, "")
+                self.assertTrue(status)
+                self.assertFalse(allowed)
+        with mock.patch.object(a.time, "monotonic", return_value=17.0):
+            code, status, allowed = a.chat_binding_presentation(self.bridge)
+            self.assertEqual(code, "")
+            self.assertIn("geprüft", status)
+            self.assertFalse(allowed)
+
+    def test_backoff_and_lock_preserve_specific_warning_and_block_copy(self):
+        with mock.patch.object(a.time, "monotonic", return_value=11.0):
+            for state in ("BACKOFF", "LOCKED"):
+                with self.subTest(state=state):
+                    bridge = replace(self.bridge, chat_binding=dict(self.binding, status=state, retry_at=130.0))
+                    code, status, allowed = a.chat_binding_presentation(bridge)
+                    self.assertEqual(code, "A1B2-C3D4")
+                    self.assertTrue(status)
+                    self.assertFalse(allowed)
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="aitl-store-test-")

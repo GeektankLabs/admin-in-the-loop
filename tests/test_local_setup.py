@@ -415,5 +415,34 @@ class LocalFlowTests(unittest.TestCase):
                     thread.join(2)
 
 
+class CompactConnectionPresentationTests(unittest.TestCase):
+    def test_local_ready_requires_actual_local_setup_and_tunnel_evidence(self):
+        core = a.AppCore()
+        self.addCleanup(core.close)
+        bridge = a.replace(core.bridge_snapshot(), state="CONNECTED", mode="LOCAL", tunnel_state="READY")
+        with mock.patch.object(core, "bridge_snapshot", return_value=bridge):
+            self.assertNotIn("Tunnel-Zugriff geprüft", a.local_setup_summary(core))
+            core.local_setup_state = "CONNECTED"
+            self.assertEqual(a.local_setup_summary(core), "Verbindung bereit · Tunnel-Zugriff geprüft")
+        for changed in (a.replace(bridge, tunnel_state="RUNNING_NOT_READY"),
+                        a.replace(bridge, state="DISCONNECTED")):
+            with mock.patch.object(core, "bridge_snapshot", return_value=changed):
+                self.assertNotIn("Tunnel-Zugriff geprüft", a.local_setup_summary(core))
+
+    def test_remote_summary_never_borrows_local_ready_evidence(self):
+        core = a.AppCore()
+        self.addCleanup(core.close)
+        core.local_setup_state = "CONNECTED"  # Even if a stale local state remains.
+        bridge = a.replace(core.bridge_snapshot(), state="CONNECTED", mode="REMOTE", tunnel_state="READY")
+        with mock.patch.object(core, "bridge_snapshot", return_value=bridge):
+            summary = a.local_setup_summary(core)
+            self.assertIn("authentifiziert", summary)
+            self.assertIn("Tunnelbetrieb am Gateway", summary)
+            self.assertNotIn("Tunnel-Zugriff geprüft", summary)
+            self.assertNotIn("Round", summary)
+        with mock.patch.object(core, "bridge_snapshot", return_value=a.replace(bridge, state="BLOCKED")):
+            self.assertIn("gesperrt", a.local_setup_summary(core))
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))

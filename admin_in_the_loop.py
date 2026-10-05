@@ -1288,6 +1288,7 @@ class LocalReview:
     proposal_id: str | None = None
     expires_at: float | None = None
     edited: bool = False
+    normalization: tuple | None = None  # Counts only; never retain original command text.
 
     @property
     def presentation(self):
@@ -1394,6 +1395,27 @@ def preference_directory():
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "Admin in the Loop"
     return Path.home() / ".config" / "admin-in-the-loop"
+
+
+def normalization_summary(review):
+    if review.normalization is None:
+        return "Finaler UTF-8-Snapshot · %d Bytes" % len(review.payload)
+    crlf, cr, trailing = review.normalization
+    return "CRLF→LF: %d · CR→LF: %d · Schluss-LF entfernt: %d · finales Return: %s · %d Bytes" % (
+        crlf, cr, trailing, "AN" if review.final_return else "AUS", len(review.payload))
+
+
+def review_byte_details(review):
+    """Passive, escaped notation of the final immutable UTF-8 payload."""
+    rows = ["Byteoffset | UTF-8 (Hex) | Codepoint | JSON-Zeichen"]
+    offset = 0
+    for char in review.payload.decode("utf-8"):
+        raw = char.encode("utf-8")
+        rows.append("%d | %s | U+%04X | %s" % (
+            offset, raw.hex(" "), ord(char), json.dumps(char, ensure_ascii=True)))
+        offset += len(raw)
+    rows.append("Ende: %d Bytes" % offset)
+    return "\n".join(rows)
 
 
 def review_fragments(text):
@@ -4173,13 +4195,14 @@ class AppCore:
         if self.bridge_worker:
             self.bridge_worker.post("poll")
 
-    def _new_review(self, direction, text, payload, final_return=False, lost_prefix=False):
+    def _new_review(self, direction, text, payload, final_return=False, lost_prefix=False, normalization=None):
         require(self.review_state not in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN"}, "transfer_in_progress")
         require(self.session is not None and self.connection == "CONNECTED", "terminal_not_connected")
         self._command_risk.invalidate()
         self.revision += 1
         self.review = LocalReview(uuid.uuid4().hex, self.revision, direction, self.session,
-                                  text, payload, final_return, lost_prefix, self._bridge_binding())
+                                  text, payload, final_return, lost_prefix, self._bridge_binding(),
+                                  normalization=normalization)
         self.review_state = "REVIEW"
         return self.review
 
@@ -4206,7 +4229,11 @@ class AppCore:
         if final_return is None:
             final_return = self.final_return
         payload = normalize_command(text, final_return)
-        return self._new_review("TO_TERMINAL", payload.decode("utf-8"), payload, final_return)
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        counts = (text.count("\r\n"), text.count("\r") - text.count("\r\n"),
+                  len(normalized) - len(normalized.rstrip("\n")))
+        return self._new_review("TO_TERMINAL", payload.decode("utf-8"), payload, final_return,
+                                normalization=counts)
 
     def edit_review(self, identifier, text, final_return=None):
         self._active(identifier)
@@ -4502,6 +4529,19 @@ class ScrollableText:
         self.frame.rowconfigure(0, weight=1)
         self.text = tk.Text(self.frame, wrap="word", height=height, width=1,
                             font="TkFixedFont", undo=not readonly, padx=12, pady=12)
+        self.copy_source = None
+        self.copy_positions = ()
+        self.copy_notice = lambda message: self.text.bell()
+        self.copy_menu = tk.Menu(self.text, tearoff=False)
+        self.copy_menu.add_command(label="Auswahl kopieren", command=self.copy_selection)
+        if not readonly:
+            self.copy_menu.add_command(label="Einfügen", command=lambda: self.text.event_generate("<<Paste>>"))
+        self.text.bind("<<Copy>>", self.copy_selection)
+        self.text.bind("<Control-c>", self.copy_selection)
+        if sys.platform == "darwin":
+            self.text.bind("<Command-c>", self.copy_selection)
+            self.text.bind("<Button-2>", lambda event: self.copy_menu.tk_popup(event.x_root, event.y_root))
+        self.text.bind("<Button-3>", lambda event: self.copy_menu.tk_popup(event.x_root, event.y_root))
         vertical = ttk.Scrollbar(self.frame, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=vertical.set)
         self.text.grid(row=0, column=0, sticky="nsew")
@@ -4516,6 +4556,7 @@ class ScrollableText:
             self.text.configure(state="disabled")
 
     def show(self, fragments):
+        self.copy_source, self.copy_positions = None, ()
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         for text, tag in fragments:
@@ -4526,6 +4567,7 @@ class ScrollableText:
         """Project source characters to actual Tcl indices; never reconstruct payload."""
         if not spans:
             self.show(review_fragments(source))
+            self.copy_source = source
             return
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
@@ -4535,6 +4577,7 @@ class ScrollableText:
             for display, tag in review_fragments(char):
                 self.text.insert("end", display, (tag,))
         positions.append(self.text.index("end-1c"))
+        self.copy_source, self.copy_positions = source, tuple(positions)
         light = sum(self.text.winfo_rgb(self.text.cget("background"))) > 3 * 32768
         colors = (("#e8eef4", "#263645"), ("#fff1cf", "#4a3c1d"),
                   ("#ffe1cf", "#4d2c1b"), ("#fbdadd", "#4b242c"))
@@ -4544,6 +4587,38 @@ class ScrollableText:
             self.text.tag_add(tag, positions[left], positions[right])
         self.text.tag_raise("sel")
         self.text.configure(state="disabled")
+
+    def copy_selection(self, event=None):
+        if not self.text.tag_ranges("sel"):
+            return "break"
+        left, right = self.text.index("sel.first"), self.text.index("sel.last")
+        if self.copy_source is not None:
+            if not self.copy_positions:
+                # Bulk rendering stays cheap even for maximal output. Only a
+                # deliberate copy computes the source-to-display boundary map.
+                positions, line, column = ["1.0"], 1, 0
+                for char in self.copy_source:
+                    display = "".join(value for value, _ in review_fragments(char))
+                    parts = display.split("\n")
+                    if len(parts) > 1:
+                        line += len(parts) - 1
+                        column = 0
+                    column += int(self.text.tk.call("string", "length", parts[-1]))
+                    positions.append("%d.%d" % (line, column))
+                self.copy_positions = tuple(positions)
+            # Tcl indices account for non-BMP characters. A partial notation is
+            # ambiguous: preserve the clipboard and offer deliberate snapshot copy.
+            try:
+                first, last = self.copy_positions.index(left), self.copy_positions.index(right)
+            except ValueError:
+                self.copy_notice("Auswahl teilt eine Zeichennotation · ganzes Zeichen wählen oder Snapshot in Bytes / Codepoints kopieren")
+                return "break"
+            value = self.copy_source[first:last]
+        else:
+            value = self.text.get(left, right)
+        self.text.clipboard_clear()
+        self.text.clipboard_append(value)
+        return "break"
 
 
 def connection_summary(bridge):
@@ -4558,7 +4633,7 @@ def connection_summary(bridge):
         tunnel = {"STOPPED": "Tunnel gestoppt", "STARTING": "Tunnel startet",
                   "RUNNING_NOT_READY": "Client läuft · noch nicht bereit", "READY": "Tunnel-Client bereit"}
         transport = "Lokale Bridge verbunden\n" + tunnel.get(bridge.tunnel_state, "Tunnel nicht verfügbar")
-    return transport + "\nChatGPT-Verbindung noch nicht verifiziert"
+    return transport
 
 
 def chat_binding_presentation(bridge):
@@ -4584,8 +4659,7 @@ def chat_binding_presentation(bridge):
     if binding["status"] == "BACKOFF":
         seconds = max(1, int(binding["retry_at"] - now + .999))
         return visible_code, "Wartezeit nach Fehlversuchen · noch %ds" % seconds, False
-    expiry = datetime.fromtimestamp(binding["expires_at"], timezone.utc).astimezone().strftime("%d.%m. %H:%M")
-    return visible_code, "Gültig bis %s · Code nur dem gewählten Chat geben" % expiry, True
+    return visible_code, "", True
 
 
 def local_setup_summary(core):
@@ -4594,8 +4668,11 @@ def local_setup_summary(core):
               "VALIDATING": "Client läuft · Runtime API key und Tunnel-Zugriff werden geprüft…",
               "FAILED": "Einrichtung fehlgeschlagen"}
     bridge = core.bridge_snapshot()
-    if core.local_setup_state == "CONNECTED" and bridge.state == "CONNECTED" and bridge.tunnel_state == "READY":
-        return "Verbindung bereit · Tunnel-Zugriff geprüft\nChatGPT-Round-Trip noch manuell prüfen"
+    if bridge.mode == "REMOTE":
+        return connection_summary(bridge)
+    if (core.local_setup_state == "CONNECTED" and bridge.mode == "LOCAL"
+            and bridge.state == "CONNECTED" and bridge.tunnel_state == "READY"):
+        return "Verbindung bereit · Tunnel-Zugriff geprüft"
     return stages.get(core.local_setup_state, connection_summary(bridge))
 
 
@@ -5377,6 +5454,7 @@ class ReviewUI:
         self.risk_details_box = None
         self.risk_render_key = None
         self.risk_confirm_pending = False
+        self.payload_details = None
         self.status_labels = []
         root.title("Admin in the Loop · v" + BRIDGE_SERVER_INFO["version"])
         width = min(1360, root.winfo_screenwidth())
@@ -5454,7 +5532,17 @@ class ReviewUI:
                   style="Review.TLabel").pack(anchor="w", pady=(0, 8))
         self.direction = tk.StringVar()
         ttk.Label(review_header, textvariable=self.direction, style="Review.TLabel").pack(anchor="w")
+        self.normalization = tk.StringVar(value="")
+        ttk.Label(review_header, textvariable=self.normalization, style="Review.TLabel",
+                  wraplength=420).pack(anchor="w")
+        self.payload_details_button = ttk.Button(review_header, text="Bytes / Codepoints…",
+                                                command=self.show_payload_details)
+        self.payload_details_button.pack(anchor="w", pady=(4, 0))
+        self.copy_notice = tk.StringVar(value="")
+        ttk.Label(review_header, textvariable=self.copy_notice, style="Review.TLabel",
+                  wraplength=420).pack(anchor="w")
         self.editor = ScrollableText(middle, readonly=True, height=16)
+        self.editor.copy_notice = self.copy_notice.set
         self.review_font = font.nametofont("TkFixedFont", root=root).copy()
         review_size = self.review_font.cget("size")
         if review_size > 8:
@@ -5523,8 +5611,9 @@ class ReviewUI:
                                         anchor="center", padx=4, pady=5)
         self.chat_code_label.pack(fill="x")
         self.chat_code_status = tk.StringVar(value="Noch nicht verbunden")
-        ttk.Label(right_space, textvariable=self.chat_code_status, anchor="center", justify="center",
-                  wraplength=230).pack(fill="x", pady=(0, 4))
+        self.chat_code_status_label = ttk.Label(right_space, textvariable=self.chat_code_status,
+                                               anchor="center", justify="center", wraplength=230)
+        self.chat_code_status_label.pack(fill="x", pady=(0, 4))
         self.chat_code_copy = ttk.Button(right_space, text="Chat-Code kopieren", command=self.copy_chat_binding)
         self.chat_code_copy.pack(fill="x")
         self.readiness = tk.Label(right, text="", wraplength=170, justify="center", padx=8, pady=10)
@@ -5557,6 +5646,9 @@ class ReviewUI:
             panel.bind("<Configure>", self.fit_panels)
 
         self.context = tk.Menu(root, tearoff=False)
+        self.context.add_command(label="Auswahl kopieren", command=self.editor.copy_selection)
+        self.context.add_command(label="Bytes / Codepoints…", command=self.show_payload_details)
+        self.context.add_separator()
         self.context.add_command(label="Text bearbeiten…", command=self.edit_dialog)
         self.editor.text.bind("<Button-3>", self.show_context)
         if sys.platform == "darwin":
@@ -5733,6 +5825,7 @@ class ReviewUI:
             spans = ()
         key = (snapshot.review, risk, spans)
         if key != self.risk_render_key:
+            self.copy_notice.set("")
             for tag in self.editor.text.tag_names():
                 if tag.startswith("risk-sub-"):
                     self.editor.text.tag_delete(tag)
@@ -5768,9 +5861,54 @@ class ReviewUI:
             self.risk_confirm_pending = True
             self.root.after_idle(self._confirm_command_risk)
 
+    def show_payload_details(self):
+        review = self.core.snapshot().review
+        if review is None:
+            return
+        if self.payload_details and self.payload_details[0].winfo_exists():
+            self.payload_details[0].destroy()
+        window = self.tk.Toplevel(self.root)
+        window.title("Finale Review-Bytes / Codepoints")
+        window.geometry("820x560")
+        status = self.tk.StringVar(master=window)
+        self.ttk.Label(window, textvariable=status, wraplength=780).pack(fill="x", padx=12, pady=12)
+        box = ScrollableText(window, readonly=True, height=18)
+        box.frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        box.show(((review_byte_details(review), "plain"),))
+        self.payload_copy_button = self.ttk.Button(window, text="Finalen Snapshot exakt kopieren",
+                                                  command=lambda: self.copy_payload_snapshot(review))
+        self.payload_copy_button.pack(anchor="w", padx=12, pady=(0, 12))
+        self.payload_details = (window, review, status)
+        self._render_payload_details(self.core.snapshot())
+
+    def _payload_snapshot_current(self, snapshot, review):
+        return (snapshot.review == review and snapshot.session == review.session
+                and snapshot.connection == "CONNECTED" and snapshot.review_state != "STALE"
+                and (not review.bridge_binding or review.bridge_binding == self.core._bridge_binding())
+                and (review.expires_at is None or review.expires_at > time.time()))
+
+    def copy_payload_snapshot(self, review):
+        if not self._payload_snapshot_current(self.core.snapshot(), review):
+            self._render_payload_details(self.core.snapshot())
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(review.payload.decode("utf-8"))
+
+    def _render_payload_details(self, snapshot):
+        self.payload_details_button.configure(state="normal" if snapshot.review else "disabled")
+        if self.payload_details and self.payload_details[0].winfo_exists():
+            _, review, status = self.payload_details
+            current = self._payload_snapshot_current(snapshot, review)
+            self.payload_copy_button.configure(state="normal" if current else "disabled")
+            status.set("%s · Snapshot %s · Revision %d · %s · finales Return %s" % (
+                "Aktueller Snapshot" if current else "Nicht mehr aktuell · alter Snapshot",
+                review.id, review.revision, review.direction, "AN" if review.final_return else "AUS"))
+            status.set(status.get() + "\n" + normalization_summary(review))
+
     def show_context(self, event):
-        if self.core.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}:
-            self.context.tk_popup(event.x_root, event.y_root)
+        self.context.entryconfigure("Text bearbeiten…", state=(
+            "normal" if self.core.review_state in {"REVIEW", "OVERRIDE_REQUIRED"} else "disabled"))
+        self.context.tk_popup(event.x_root, event.y_root)
 
     def edit_dialog(self):
         snapshot = self.core.snapshot()
@@ -5887,6 +6025,10 @@ class ReviewUI:
         elif bridge.chat_binding_error == "chat_binding_generation_conflict":
             chat_status = "Code wurde bereits geändert · Status wird aktualisiert"
         self.chat_code_status.set(chat_status)
+        if chat_status:
+            self.chat_code_status_label.pack(fill="x", pady=(0, 4), before=self.chat_code_copy)
+        else:
+            self.chat_code_status_label.pack_forget()
         self.chat_code_copy.configure(state="normal" if can_copy else "disabled")
         self.from_terminal_button.configure(state="normal" if connected and not busy else "disabled")
         self.from_ai_button.configure(state="normal" if connected and snapshot.inbox and not busy else "disabled")
@@ -5900,6 +6042,7 @@ class ReviewUI:
         self.preference.set(snapshot.preferences)
         self.final_return.set(snapshot.final_return)
         review = snapshot.review
+        self.normalization.set(normalization_summary(review) if review else "")
         command = review is not None and review.direction == "TO_TERMINAL"
         if command:
             self.return_row.grid()
@@ -5937,6 +6080,7 @@ class ReviewUI:
             message += " | Bridge-Zertifikat läuft in weniger als 30 Tagen ab"
         self.review_status.set(message)
         self._render_command_risk(snapshot, command)
+        self._render_payload_details(snapshot)
         self.last_snapshot = snapshot
         self.fit_panels()
         if self.connection_dialog and self.connection_dialog.window.winfo_exists():

@@ -349,7 +349,8 @@ class ConnectionDialogTests(unittest.TestCase):
             self.root.update()
             self.assertIn("Remote-Bridge verbunden · authentifiziert", dialog.summary.get())
             self.assertIn("Tunnelbetrieb am Gateway", self.ui.ai_status.get())
-            self.assertIn("noch nicht verifiziert", dialog.summary.get())
+            self.assertNotIn("noch nicht verifiziert", dialog.summary.get())
+            self.assertNotIn("Tunnel-Zugriff geprüft", dialog.summary.get())
             self.assertNotIn("Tunnel gestoppt", self.ui.ai_status.get())
             self.assertIsNone(self.core.bridge_process)
             self.assertIsNone(self.core.tunnel)
@@ -433,7 +434,7 @@ class ConnectionDialogTests(unittest.TestCase):
             self.root.update()
             self.assertEqual(self.core.connection_store.load_connection()["tunnel"], config)
             self.assertIn("Verbindung bereit", dialog.summary.get())
-            self.assertIn("manuell prüfen", dialog.summary.get())
+            self.assertEqual(dialog.summary.get(), "Verbindung bereit · Tunnel-Zugriff geprüft")
             self.assertFalse(dialog.local_inputs.winfo_ismapped())
             self.assertFalse(dialog.buttons["local_start"].winfo_ismapped())
             self.assertTrue(dialog.buttons["local_stop"].winfo_ismapped())
@@ -692,6 +693,162 @@ print(json.dumps(results))
             root.destroy()
             del ui, core, root
             gc.collect()
+
+
+class WorkPackageReviewUITests(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.core = a.AppCore()
+        self.ui = a.ReviewUI(self.root, self.core)
+        self.core.session = "SYNTHETIC_REVIEW_SESSION"
+        self.core.connection = "CONNECTED"
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        self.core.close()
+        for callback in self.root.tk.call("after", "info"):
+            self.root.after_cancel(callback)
+        self.root.destroy()
+        del self.ui, self.core, self.root
+        gc.collect()
+
+    def test_byte_details_are_passive_and_new_revision_marks_them_stale(self):
+        review = self.core.review_command("printf 'é😀'", True)
+        self.ui.render()
+        with mock.patch.object(self.core, "approve") as approve:
+            self.ui.payload_details_button.invoke()
+            window, captured, status = self.ui.payload_details
+            self.assertEqual(captured, review)
+            self.assertIn("Aktueller Snapshot", status.get())
+            box = next(child for child in window.winfo_children() if child.winfo_class() == "TFrame")
+            text = next(child for child in box.winfo_children() if child.winfo_class() == "Text")
+            self.assertEqual(text.cget("state"), "disabled")
+            self.assertIn("U+1F600", text.get("1.0", "end"))
+            changed = self.core.edit_review(review.id, "printf 'new'", False)
+            self.ui.render()
+            self.assertNotEqual(changed.id, review.id)
+            self.assertIn("Nicht mehr aktuell", status.get())
+            self.assertEqual(self.core.review_state, "REVIEW")
+            approve.assert_not_called()
+
+    def test_normalization_hint_is_bound_to_the_current_revision_and_direction(self):
+        review = self.core.review_command("a\r\nb\r\n\n", True)
+        self.ui.render()
+        self.assertIn("CRLF→LF: 2", self.ui.normalization.get())
+        self.assertIn("Schluss-LF entfernt: 2", self.ui.normalization.get())
+        self.assertEqual(review.payload, b"a\nb\n")
+        self.core.edit_review(review.id, "new", False)
+        self.ui.render()
+        self.assertIn("CRLF→LF: 0", self.ui.normalization.get())
+        self.assertIn("Return: AUS", self.ui.normalization.get())
+        self.core._output_review("output\n")
+        self.ui.render()
+        self.assertNotIn("CRLF", self.ui.normalization.get())
+
+    def test_source_selection_copy_unicode_lf_wrap_and_partial_notation_reject(self):
+        source = "TOKEN_" + "a" * 180 + " é😀\nsecond ↵ line\n"
+        review = self.core._output_review(source)
+        self.ui.render()
+        box = self.ui.editor
+        text = box.text
+        with mock.patch.object(self.core, "approve") as approve:
+            text.tag_add("sel", "1.0", "end-1c")
+            text.event_generate("<<Copy>>")
+            self.assertEqual(self.root.clipboard_get(), source)
+            text.tag_remove("sel", "1.0", "end")
+            start = source.index("é")
+            text.tag_add("sel", box.copy_positions[start], box.copy_positions[start + 2])
+            box.copy_selection()
+            self.assertEqual(self.root.clipboard_get(), "é😀")
+            self.root.clipboard_clear()
+            self.root.clipboard_append("CLIPBOARD_CANARY")
+            text.tag_remove("sel", "1.0", "end")
+            text.tag_add("sel", text.index(box.copy_positions[start] + "+1c"), box.copy_positions[start + 1])
+            box.copy_selection()
+            self.assertEqual(self.root.clipboard_get(), "CLIPBOARD_CANARY")
+            self.assertIn("Zeichennotation", self.ui.copy_notice.get())
+            before = text.get("1.0", "end-1c")
+            text.event_generate("<<Paste>>")
+            self.assertEqual(text.get("1.0", "end-1c"), before)
+            self.assertEqual(text.cget("state"), "disabled")
+            self.assertEqual(self.core.review, review)
+            self.assertEqual(self.core.review_state, "REVIEW")
+            approve.assert_not_called()
+
+    def test_exact_snapshot_copy_rechecks_identity_even_before_render(self):
+        review = self.core.review_command("echo 'é😀'\r\n", True)
+        self.ui.show_payload_details()
+        self.ui.payload_copy_button.invoke()
+        self.assertEqual(self.root.clipboard_get().encode(), review.payload)
+        self.core.edit_review(review.id, "new", False)
+        self.root.clipboard_clear()
+        self.root.clipboard_append("STALE_CANARY")
+        self.ui.copy_payload_snapshot(review)
+        self.assertEqual(self.root.clipboard_get(), "STALE_CANARY")
+        self.assertTrue(self.ui.payload_copy_button.instate(["disabled"]))
+
+    def test_native_editable_text_and_entry_paste_without_review_mutation(self):
+        review = self.core.review_command("echo safe", False)
+        window = tk.Toplevel(self.root)
+        editor = a.ScrollableText(window)
+        editor.frame.pack()
+        entry = ttk.Entry(window)
+        entry.pack()
+        window.update()
+        self.root.clipboard_clear()
+        self.root.clipboard_append("SYNTHETIC_TOKEN_" + "z" * 200 + "\né")
+        editor.text.event_generate("<<Paste>>")
+        self.assertEqual(editor.text.get("1.0", "end-1c"), self.root.clipboard_get())
+        entry.event_generate("<<Paste>>")
+        self.assertIn("SYNTHETIC_TOKEN_", entry.get())
+        self.assertEqual(self.core.review, review)
+        self.assertEqual(self.core.review_state, "REVIEW")
+        window.destroy()
+
+    def test_keyboard_and_context_copy_keep_review_colors_font_and_risk_tags(self):
+        review = self.core.review_command("echo é😀", False)
+        self.ui.render()
+        box = self.ui.editor
+        box.show_review(review.text, ((0, 4, 90),))
+        self.root.update()
+        box.text.focus_force()
+        self.root.update()
+        box.text.tag_add("sel", "1.0", box.copy_positions[-1])
+        box.text.event_generate("<Control-c>")
+        self.assertEqual(self.root.clipboard_get(), review.text)
+        self.ui.context.invoke(0)
+        self.assertEqual(self.root.clipboard_get(), review.text)
+        self.assertEqual(box.text.cget("background"), "#000000")
+        self.assertEqual(box.text.cget("foreground"), "#00ff00")
+        self.assertEqual(box.text.cget("font"), str(self.ui.review_font))
+        self.assertEqual(box.text.tag_cget("control", "foreground"), "#a8c2e0")
+        self.assertEqual(box.text.tag_cget("warning", "foreground"), "#edbd8d")
+        self.assertTrue(box.text.tag_ranges("risk-sub-0"))
+        self.assertFalse(self.core.risk_requested)
+
+    def test_normal_code_has_no_permanent_hint_but_expiry_restores_warning(self):
+        binding = dict(code="A1B2C3D4", status="ACTIVE", generation=1,
+                       server_time=100.0, expires_at=200.0, retry_at=0.0,
+                       restriction_scope="PRINCIPAL")
+        bridge = a.replace(self.core.bridge_snapshot(), state="CONNECTED", mode="REMOTE",
+                           chat_binding=binding, chat_binding_received_at=10.0)
+        with mock.patch.object(a.time, "monotonic", return_value=11.0), \
+                mock.patch.object(self.core, "bridge_snapshot", return_value=bridge):
+            self.ui.render()
+            self.root.update_idletasks()
+            self.assertEqual(self.ui.chat_code.get(), "A1B2-C3D4")
+            self.assertEqual(self.ui.chat_code_status.get(), "")
+            self.assertFalse(self.ui.chat_code_status_label.winfo_ismapped())
+            self.assertTrue(self.ui.chat_code_copy.instate(["!disabled"]))
+        expired = a.replace(bridge, chat_binding=dict(binding, expires_at=100.0))
+        with mock.patch.object(a.time, "monotonic", return_value=11.0), \
+                mock.patch.object(self.core, "bridge_snapshot", return_value=expired):
+            self.ui.render()
+            self.root.update_idletasks()
+            self.assertEqual(self.ui.chat_code.get(), "")
+            self.assertIn("Abgelaufen", self.ui.chat_code_status.get())
+            self.assertTrue(self.ui.chat_code_status_label.winfo_ismapped())
+            self.assertTrue(self.ui.chat_code_copy.instate(["disabled"]))
 
 
 class TerminalAttachmentUITests(unittest.TestCase):
