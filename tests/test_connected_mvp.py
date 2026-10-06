@@ -1165,11 +1165,82 @@ class ProposalLifecycleStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(a.BridgeError, "submission_expired"):
             self.store.take(self.controller, other, uuid.uuid4().hex, self.store.instance)
 
-    def test_legacy_migration_marks_delivered_unknown_and_keeps_undelivered_waiting(self):
+    def test_bridge_restart_starts_new_cycle_without_reanimating_old_states(self):
+        store = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now,
+                              new_cycle=True)
+        controller, cid = store.issue("CONTROLLER")
+        ai, aid = store.issue("AI")
+        waiting = store.submit({"request_id": uuid.uuid4().hex, "text": "true"})["submission_id"]
+        taken = store.submit({"request_id": uuid.uuid4().hex, "text": "printf x"})["submission_id"]
+        store.take(controller, taken, uuid.uuid4().hex, store.instance)
+        withdrawn = store.submit({"request_id": uuid.uuid4().hex, "text": "printf y"})["submission_id"]
+        store.withdraw(withdrawn)
+        delivered_cursor = store.inbox(controller, "")["cursor"]
+        store.approved_output({"version": 1, "conversation": self.conversation,
+                               "idempotency_key": uuid.uuid4().hex, "text": "KEPT OUTPUT",
+                               "submission_id": taken, "approved_at": self.now})
+        code_before, instance_before = store.chat_binding["code"], store.instance
+        store.close()
+        restarted = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now,
+                                  new_cycle=True)
+        self.addCleanup(restarted.close)
+        self.assertNotEqual(restarted.instance, instance_before)
+        # Old actionable cycle states are terminally unknown, never re-delivered or takeable.
+        self.assertEqual(restarted.submission_status(waiting)["state"], "UNKNOWN")
+        self.assertEqual(restarted.submission_status(taken)["state"], "UNKNOWN")
+        with self.assertRaisesRegex(a.BridgeError, "proposal_unknown"):
+            restarted.take(controller, waiting, uuid.uuid4().hex, restarted.instance)
+        with self.assertRaisesRegex(a.BridgeError, "invalid_cursor"):
+            restarted.inbox(controller, delivered_cursor)
+        # Terminal facts and durable data survive the cycle boundary.
+        row = restarted.execute("SELECT state, withdrawn_at FROM proposals WHERE id=?",
+                                (withdrawn,)).fetchone()
+        self.assertEqual(row[0], "WITHDRAWN")
+        self.assertIsNotNone(row[1])
+        self.assertEqual(restarted.chat_binding["code"], code_before)
+        self.assertEqual(restarted.authenticate(controller, "CONTROLLER")["id"], cid)
+        named = restarted.ai_output(restarted.authenticate(ai, "AI"),
+                                    {"submission_id": taken})["outputs"]
+        self.assertEqual(len(named), 1)
+        # A fresh cycle proposal is fully actionable; utility reopen never wipes.
+        fresh = restarted.submit({"request_id": uuid.uuid4().hex, "text": "true"})["submission_id"]
+        utility = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now)
+        utility.close()
+        self.assertEqual(restarted.submission_status(fresh)["state"], "ACCEPTED")
+        batch = restarted.inbox(controller, "")
+        self.assertEqual([m["id"] for m in batch["messages"]], [fresh])
+        self.assertEqual(restarted.take(controller, fresh, uuid.uuid4().hex,
+                                        restarted.instance)["state"], "TAKEN")
+
+    def test_cycle_init_is_atomic_and_crash_safe(self):
+        store = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now,
+                              new_cycle=True)
+        waiting = store.submit({"request_id": uuid.uuid4().hex, "text": "true"})["submission_id"]
+        conversation = store.conversation
+        store.close()
+        calls = {"n": 0}
+        def bad_clock():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated crash inside the init transaction")
+            return self.now
+        with self.assertRaises(RuntimeError):
+            a.BridgeStore(self.temp.name, conversation, clock=bad_clock, new_cycle=True)
+        probe = sqlite3.connect(Path(self.temp.name, "bridge.sqlite3"))
+        state = probe.execute("SELECT state FROM proposals WHERE id=?", (waiting,)).fetchone()[0]
+        probe.close()
+        self.assertEqual(state, "WAITING")  # rollback, no partially applied cycle state
+        reopened = a.BridgeStore(self.temp.name, conversation, clock=lambda: self.now,
+                                 new_cycle=True)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.submission_status(waiting)["state"], "UNKNOWN")
+
+    def test_legacy_database_gains_schema_and_cycle_boundary_on_serving_start(self):
         first, second = self.submit("true"), self.submit("printf x")
-        delivered = self.store.inbox(self.controller, "")  # cursor observes first only
+        delivered = self.store.inbox(self.controller, "")
         self.assertEqual(delivered["messages"][0]["id"], first)
         path = Path(self.temp.name, "bridge.sqlite3")
+        conversation = self.store.conversation
         self.store.close()
         legacy = sqlite3.connect(path, isolation_level=None)
         legacy.execute("DROP INDEX IF EXISTS proposals_take_idem")
@@ -1177,13 +1248,18 @@ class ProposalLifecycleStoreTests(unittest.TestCase):
                        "output_reviewed_at", "withdraw_requested_at", "withdrawn_at",
                        "lifecycle_updated_at"):
             legacy.execute("ALTER TABLE proposals DROP COLUMN " + column)
+        legacy.execute("DELETE FROM meta WHERE key='bridge_cycle'")
         legacy.close()
-        self.store = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now)
-        self.assertEqual(self.status(first)["state"], "UNKNOWN")     # delivered: no provenance
-        self.assertEqual(self.status(second)["state"], "ACCEPTED")   # undelivered: clean WAITING
+        reopened = a.BridgeStore(self.temp.name, conversation, clock=lambda: self.now,
+                                 new_cycle=True)
+        self.addCleanup(reopened.close)
+        # Serving start on a pre-lifecycle database: schema healed AND no old state
+        # stays actionable (the abandoned delivered-cursor backfill is not needed).
+        self.assertEqual(reopened.submission_status(first)["state"], "UNKNOWN")
+        self.assertEqual(reopened.submission_status(second)["state"], "UNKNOWN")
         with self.assertRaisesRegex(a.BridgeError, "proposal_unknown"):
-            self.take(first)
-        self.assertEqual(self.take(second)["state"], "TAKEN")
+            reopened.take(self.controller, second, uuid.uuid4().hex, reopened.instance)
+        self.assertEqual(reopened.inbox(self.controller, "")["messages"], [])
 
     def test_observation_guard_first_write_wins_and_server_time_authority(self):
         submission = self.submit()
@@ -1496,47 +1572,77 @@ class ControllerTakeFlowTests(unittest.TestCase):
             self.core.approve(self.core.review.id, override=True)
         self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
                           and b"CAPTURE_IDENTITY" in self.core.output.data)
-        second = self.submit("printf 'STAGED_SECOND\\n'")
-        self.assertIsNone(self.core.review_pending_proposal())
-        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
-        review_b = self.core.review
-        # Direction 1: return review requested while B occupies the stage.
-        self.assertEqual(self.core.stage_conflict_info()["direction"], "proposal_in_stage")
-        capture = self.core.resolve_stage_conflict("DISCARD_PROPOSAL_TAKE_RETURN")
-        self.assertEqual(capture.direction, "TO_OUTPUT_SINK")
+        # The return review enters the free stage directly (no conflict yet).
+        capture = self.core.take_return_review()
         self.assertEqual(self.core.review_state, "REVIEW")
         self.assertEqual(self.core.open_return["return_state"], "in_stage")
         self.assertIn(b"CAPTURE_IDENTITY", capture.payload)
-        # Leaving the return review never waives it.
-        self.core.reject(capture.id)
-        self.assertEqual(self.core.open_return["return_state"], "reviewbereit")
-        # Direction 2: proposal takeover from an active return review needs the leave decision.
-        self.core.take_return_review()
-        self.assertEqual(self.core.review_state, "REVIEW")
-        third = self.submit("printf 'THIRD_PROPOSAL\\n'")
+        # Direction 2: proposal takeover from the active return review keeps it open.
+        second = self.submit("printf 'STAGED_SECOND\\n'")
         with self.assertRaisesRegex(a.ProbeError, "stage_conflict"):
             self.core.review_pending_proposal()
         self.assertEqual(self.core.stage_conflict_info()["direction"], "return_in_stage")
         self.core.resolve_stage_conflict("LEAVE_RETURN_TAKE_PROPOSAL")
         self.assertEqual(self.core.review_state, "TAKE_PENDING")
         self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
-        self.assertEqual(self.core.review.proposal_id, third)
+        self.assertEqual(self.core.review.proposal_id, second)
         self.assertIsNotNone(self.core.open_return)  # A stays open and attributable
-        self.assertEqual(self.core.open_return["submission_id"], first)
-        # Returning A's capture later closes the return via ACK.
+        self.assertEqual(self.core.open_return["return_state"], "reviewbereit")
+        # Direction 1: return review requested while the proposal occupies the stage.
+        self.assertEqual(self.core.stage_conflict_info()["direction"], "proposal_in_stage")
+        capture2 = self.core.resolve_stage_conflict("DISCARD_PROPOSAL_TAKE_RETURN")
+        self.assertEqual(capture2.direction, "TO_OUTPUT_SINK")
+        self.assertEqual(self.core.open_return["return_state"], "in_stage")
+        self.assertIsNotNone(self.core.staged_handoff)
+        # Decision #58: rejecting the staged return is the SAME completion as the waiver.
         self.core.reject(self.core.review.id)
-        capture2 = self.core.take_return_review()
-        self.core.note_output_binding(capture2.id, first)
-        self.core.approve(capture2.id, submission_id=first, explicit_binding=True)
-        self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
         self.assertIsNone(self.core.open_return)
-        returned = mcp(self.process, "get_approved_output", {"submission_id": first})["outputs"]
-        self.assertEqual(len(returned), 1)
+        self.assertEqual(self.core.review_state, "REJECTED")
+        # The parked proposal is resumable without a second bridge take.
+        resumed = self.core.resume_staged_proposal()
+        self.assertEqual(resumed.proposal_id, second)
+        self.assertEqual(self.core.review_state, "REVIEW")
+
+    def test_uncertain_transfer_blocks_new_send_until_explicit_confirmation(self):
+        first = self.submit("printf 'UNCERTAIN_A\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        review_a = self.core.review
+        with mock.patch.object(self.core.channel, "send", side_effect=OSError("link down")):
+            with self.assertRaises(a.ProbeError):
+                self.core.approve(review_a.id)
+        self.assertEqual(self.core.review_state, "TRANSFER_UNCERTAIN")
+        fact = self.core.uncertain_transfer
+        self.assertIsNotNone(fact)
+        self.assertEqual(fact["command_review_id"], review_a.id)
+        self.assertEqual(fact["submission_id"], first)
+        self.assertFalse(fact["operator_acknowledged"])
+        # Stage change is allowed; the fact survives it (B1: never forgotten).
+        self.submit("printf 'UNCERTAIN_B\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        review_b = self.core.review
+        self.assertIs(self.core.uncertain_transfer, fact)
+        sends = []
+        with mock.patch.object(self.core.channel, "send", side_effect=lambda value: sends.append(value)):
+            with self.assertRaisesRegex(a.ProbeError, "transfer_uncertain_conflict"):
+                self.core.approve(review_b.id)
+            self.assertEqual(sends, [])  # nothing reached the terminal
+        self.assertFalse(self.core.uncertain_transfer["operator_acknowledged"])  # neutral
+        self.core.confirm_uncertain_send()
+        self.assertTrue(self.core.uncertain_transfer["operator_acknowledged"])
+        self.core.approve(review_b.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(review_b.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+        # A stays uncertain forever: never relabeled, no terminal-sent fact on the bridge.
+        self.assertEqual(self.core.uncertain_transfer["command_review_id"], review_a.id)
+        self.assertEqual(self.core.uncertain_transfer["uncertain_at"], fact["uncertain_at"])
+        self.assertTrue(self.core.uncertain_transfer["operator_acknowledged"])
         status = mcp(self.process, "get_submission_status", {"submission_id": first})
-        self.assertTrue(status["output_shared_ever"])
-        self.assertIsNotNone(status["output_reviewed_at"])  # deliberate binding observed
-        self.assertEqual(self.core.review_state, "ACKNOWLEDGED")
-        self.assertEqual(review_b.proposal_id, second)
+        self.assertEqual(status["state"], "TAKEN")
+        self.assertIsNone(status["terminal_sent_at"])
 
     def test_note_output_binding_is_deliberate_only(self):
         first = self.submit("printf 'OBSERVE_BIND\\n'")

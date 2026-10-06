@@ -1073,15 +1073,47 @@ class StageConflictDialogTests(unittest.TestCase):
         self.assertEqual(self.core.review.direction, "TO_OUTPUT_SINK")  # A's capture staged
         self.assertIsNotNone(self.core.staged_handoff)  # D parked losslessly
         self.assertEqual(self.core.open_return["return_state"], "in_stage")
-        # The parked D proposal is resumable without a second bridge take.
+        # Rejecting the staged return completes it (§14.2: same closure as the waiver).
         self.core.reject(self.core.review.id)
-        self.assertEqual(self.core.open_return["return_state"], "reviewbereit")
+        self.assertIsNone(self.core.open_return)
         self.ui.from_ai_button.invoke()  # staged_handoff present -> resume path
         self.root.update()
         self.assertIsNone(self.core.staged_handoff)
         self.assertEqual(self.core.review_state, "REVIEW")
         self.assertEqual(self.core.review.text, "printf 'GUI_STAGE_D\\n'\n")
 
+
+    def test_uncertain_send_dialog_blocks_until_conscious_confirmation(self):
+        self.submit("printf 'GUI_UNC_A\\n'", "GUI_UNCERTAIN_A_001")
+        self.take()
+        with mock.patch.object(self.core.channel, "send", side_effect=OSError("link down")):
+            with self.assertRaises(a.ProbeError):
+                self.core.approve(self.core.review.id)
+        self.assertEqual(self.core.review_state, "TRANSFER_UNCERTAIN")
+        self.submit(": > gui-unc-b-marker; printf 'GUI_UNC_B\\n'", "GUI_UNCERTAIN_B_001")
+        self.take()  # stage change allowed while the fact stands
+        self.root.update()
+        self.assertIn("Übertragung des vorherigen Befehls ungewiss", self.ui.review_status.get())
+        self.ui.approve_button.invoke()
+        self.assert_dialog("Die Übertragung des vorherigen Befehls ist ungewiss. "
+                           "Trotzdem den neuen Befehl senden und auf die vorherige Rückgabe verzichten?",
+                           ["Trotzdem senden und verzichten", "Abbrechen"])
+        self.ui.conflict_buttons["CANCEL"].invoke()
+        self.root.update()
+        self.assertFalse(self.core.uncertain_transfer["operator_acknowledged"])
+        self.assertFalse(Path(self.tmp.name, "gui-unc-b-marker").exists())
+        self.ui.approve_button.invoke()
+        self.until(lambda: self.ui.conflict_dialog is not None and self.ui.conflict_dialog.winfo_exists())
+        self.ui.conflict_buttons["PROCEED_UNCERTAIN_SEND"].invoke()
+        self.until(lambda: self.core.review_state in {"CHECKING", "TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.until(lambda: self.core.review_state == "TRANSFERRED")
+        self.assertTrue(Path(self.tmp.name, "gui-unc-b-marker").exists())
+        self.assertTrue(self.core.uncertain_transfer["operator_acknowledged"])
+        self.assertNotEqual(self.core.uncertain_transfer["command_review_id"], self.core.review.id)
+        self.root.update()
+        self.assertNotIn("Übertragung des vorherigen Befehls ungewiss", self.ui.review_status.get())
 
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))

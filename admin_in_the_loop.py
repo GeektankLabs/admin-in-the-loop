@@ -3713,6 +3713,8 @@ class AppCore:
         self.discarded_takes = {}
         self.open_return = None
         self.staged_handoff = None
+        # §14.3: stage-independent volatile fact for an unresolved terminal transfer.
+        self.uncertain_transfer = None
         self.tunnel = None
         self.tunnel_check_at = 0
         self.pair_events = queue.Queue(maxsize=1)
@@ -3855,6 +3857,24 @@ class AppCore:
     def _mark_return_uncertain(self):
         if self.open_return is not None and self.open_return["return_state"] == "sende_pending":
             self.open_return["return_state"] = "sende_uncertain"
+
+    def _record_uncertain_transfer(self, offset):
+        """§14.3: stage-independent uncertainty fact; never relabeled, never auto-cleared."""
+        self.uncertain_transfer = {"command_review_id": self.review.id,
+                                   "submission_id": self.review.proposal_id,
+                                   "session": self.review.session,
+                                   "offset": offset,
+                                   "uncertain_at": time.time(),
+                                   "operator_acknowledged": False}
+
+    def confirm_uncertain_send(self):
+        """Conscious operator clarification: acknowledge the fact (it stays uncertain)
+        and close an open return via the SAME completion as rejecting it (§14.2)."""
+        require(self.uncertain_transfer is not None
+                and not self.uncertain_transfer["operator_acknowledged"], "no_uncertain_conflict")
+        self.uncertain_transfer["operator_acknowledged"] = True
+        if self.open_return is not None:
+            self.close_open_return()
 
     def connect_profile(self, profile):
         check_profile(profile)
@@ -4578,6 +4598,11 @@ class AppCore:
         require(not self.paused, "paused")
         require(self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}, "approval_already_consumed")
         require(not override or self.review_state == "OVERRIDE_REQUIRED", "override_not_requested")
+        if self.review.direction == "TO_TERMINAL" and self.uncertain_transfer is not None \
+                and not self.uncertain_transfer["operator_acknowledged"]:
+            # §14.3: an unresolved previous transfer blocks every new terminal send until
+            # the explicit operator confirmation; stage changes never clear or hide it.
+            raise ProbeError("transfer_uncertain_conflict")
         if self.review.direction == "TO_TERMINAL" and self.open_return is not None:
             # §13.3 send barrier: an open return must be closed (returned or explicitly
             # waived) BEFORE a new terminal transfer; UI/headless resolve via conflict flow.
@@ -4622,6 +4647,8 @@ class AppCore:
                                "return": self.review.final_return, "override": override})
         except (ProbeError, OSError):
             self.review_state = "TRANSFER_UNCERTAIN"
+            if self.review.direction == "TO_TERMINAL":
+                self._record_uncertain_transfer(self.output.end)
             raise ProbeError("transfer_uncertain") from None
 
     def verify_draft(self, identifier, text, final_return=False):
@@ -4645,7 +4672,9 @@ class AppCore:
         self.review_state = "REJECTED"
         if self.review.direction == "TO_OUTPUT_SINK" and self.open_return is not None \
                 and self.open_return["return_state"] == "in_stage":
-            self.open_return["return_state"] = "reviewbereit"  # return stays open, capture unstaged
+            # §14.2/#58: rejecting the staged return IS the deliberate completion –
+            # exactly the same closure as the explicit waiver, no separate state.
+            self.open_return = None
 
     def set_paused(self, value):
         require(type(value) is bool, "invalid_pause")
@@ -4719,6 +4748,8 @@ class AppCore:
             require(type(value["offset"]) is int and value["offset"] >= 0, "invalid_offset")
             self.review_state = value["state"]
             self.offsets[value["id"]] = value["offset"]
+            if value["state"] == "TRANSFER_UNCERTAIN" and self.review.direction == "TO_TERMINAL":
+                self._record_uncertain_transfer(value["offset"])
             if value["state"] == "TRANSFERRED":
                 if self.review.proposal_id and self.review.bridge_binding:
                     self.last_proposal_id = self.review.proposal_id
@@ -4756,6 +4787,8 @@ class AppCore:
         self.session = None
         if self.review_state == "CHECKING":
             self.review_state = "TRANSFER_UNCERTAIN"
+            if self.review is not None and self.review.direction == "TO_TERMINAL":
+                self._record_uncertain_transfer(self.output.end)
         elif self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}:
             self.review_state = "STALE"
 
@@ -6269,6 +6302,9 @@ class ReviewUI:
                 self.core.approve(snapshot.review.id, override=override, submission_id=submission,
                                   explicit_binding=bool(self.binding_submission))
             except ProbeError as exc:
+                if str(exc) == "transfer_uncertain_conflict":
+                    self._stage_conflict_dialog("uncertain_send")  # §14.3: no transfer triggered
+                    return
                 if str(exc) == "stage_conflict" and snapshot.review.direction == "TO_TERMINAL":
                     self._stage_conflict_dialog("send")  # #34: no transfer triggered yet
                     return
@@ -6338,6 +6374,10 @@ class ReviewUI:
                               "Die Ausgabe bleibt für eine spätere Rückgabe erhalten.",
                               (("Neuen Vorschlag prüfen", "LEAVE_RETURN_TAKE_PROPOSAL"),
                                ("Abbrechen", "CANCEL"))),
+            "uncertain_send": ("Die Übertragung des vorherigen Befehls ist ungewiss. "
+                               "Trotzdem den neuen Befehl senden und auf die vorherige Rückgabe verzichten?",
+                               (("Trotzdem senden und verzichten", "PROCEED_UNCERTAIN_SEND"),
+                                ("Abbrechen", "CANCEL"))),
         }
         message, buttons = texts[kind]
         window = self.conflict_dialog = self.tk.Toplevel(self.root)
@@ -6355,8 +6395,12 @@ class ReviewUI:
             if not window.winfo_exists():
                 return  # stale dialog answer after close: never applied
             window.destroy()
-            if decision != "CANCEL":
-                self.action(lambda: self.core.resolve_stage_conflict(decision))
+            if decision == "CANCEL":
+                return
+            if decision == "PROCEED_UNCERTAIN_SEND":
+                self.action(self._proceed_after_uncertain_confirm)
+                return
+            self.action(lambda: self.core.resolve_stage_conflict(decision))
         for label, decision in buttons:
             button = self.ttk.Button(window, text=label, command=lambda d=decision: decide(d))
             button.pack(fill="x", padx=16, pady=4)
@@ -6365,6 +6409,13 @@ class ReviewUI:
                 button.focus_set()  # neutral default; Escape/close == Abbrechen
         window.protocol("WM_DELETE_WINDOW", lambda: decide("CANCEL"))
         window.bind("<Escape>", lambda _event: decide("CANCEL"))
+
+    def _proceed_after_uncertain_confirm(self):
+        # Commit order (§14.3): the conscious acknowledgement (plus any return waiver)
+        # is committed first; a failing send afterwards never reverts it and is never
+        # presented as its success. All other gates are revalidated by approve().
+        self.core.confirm_uncertain_send()
+        self.approve()
 
     def render(self):
         snapshot = self.core.snapshot()
@@ -6450,6 +6501,10 @@ class ReviewUI:
             message += " | " + snapshot.last_error
         if bridge.last_error:
             message += " | " + bridge.last_error
+        if self.core.uncertain_transfer is not None \
+                and not self.core.uncertain_transfer["operator_acknowledged"]:
+            # §14.3/#57: the unresolved fact stays visible across stage changes.
+            message += " | Übertragung des vorherigen Befehls ungewiss"
         if bridge.certificate_warning:
             message += " | Bridge-Zertifikat läuft in weniger als 30 Tagen ab"
         self.review_status.set(message)
@@ -7176,7 +7231,7 @@ def private_write(path, raw):
 
 class BridgeStore:
     """Bounded SQLite transport state. No human approval or terminal state here."""
-    def __init__(self, directory, conversation, clock=time.time):
+    def __init__(self, directory, conversation, clock=time.time, new_cycle=False):
         opaque(conversation)
         self.directory = protected_directory(directory)
         self.clock, self.conversation = clock, conversation
@@ -7229,7 +7284,7 @@ class BridgeStore:
             self.execute("ALTER TABLE subscriptions ADD COLUMN binding_generation INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
-        self._migrate_proposal_lifecycle()
+        self._init_lifecycle_and_cycle(new_cycle)
         row = self.execute("SELECT value FROM meta WHERE key='conversation'").fetchone()
         check(row is None or row[0] == conversation, "conversation_state_mismatch")
         self.execute("INSERT OR IGNORE INTO meta VALUES('conversation',?)", (conversation,))
@@ -7295,36 +7350,46 @@ class BridgeStore:
         self.pair = None
         self.cleanup()
 
-    def _migrate_proposal_lifecycle(self):
-        """Additive W2 lifecycle columns plus one-shot legacy backfill in one transaction.
+    def _init_lifecycle_and_cycle(self, new_cycle):
+        """Idempotent lifecycle schema plus the #57 cycle boundary in ONE transaction.
 
-        Legacy rows already delivered over an INBOX cursor lack take/withdraw provenance
-        and become terminally UNKNOWN (conservative, §12.3); undelivered rows stay WAITING.
+        A real bridge service (re)start begins a new work cycle: open proposal/take
+        states of the previous run are never migrated or reanimated (actionable rows
+        become terminally UNKNOWN, delivery cursors are dropped) while durable data
+        (tokens, chat binding, outputs, subscriptions, settings/meta) is retained.
+        Utility opens and same-cycle schema reopens (new_cycle=False) never wipe.
+        Any failure inside the transaction rolls back completely; the next start
+        applies it exactly once (crash-safe init instead of shutdown cleanup).
         """
         columns = (("state", "TEXT NOT NULL DEFAULT 'WAITING'"), ("taken_at", "REAL"),
                    ("take_request_id", "TEXT"), ("terminal_sent_at", "REAL"),
                    ("output_reviewed_at", "REAL"), ("withdraw_requested_at", "REAL"),
                    ("withdrawn_at", "REAL"), ("lifecycle_updated_at", "REAL"))
         with self.lock:
-            added = False
-            for column, definition in columns:
-                try:
-                    self.execute("ALTER TABLE proposals ADD COLUMN " + column + " " + definition)
-                    added = True
-                except sqlite3.OperationalError:
-                    pass  # Column already exists on an upgraded state directory.
             self.execute("BEGIN IMMEDIATE")
             try:
-                if added:
-                    now = float(self.clock())
-                    delivered = self.execute(
-                        "SELECT coalesce(max(seq),0) FROM cursors WHERE kind='INBOX'").fetchone()[0]
-                    self.execute("UPDATE proposals SET lifecycle_updated_at=? WHERE lifecycle_updated_at IS NULL",
-                                 (now,))
-                    self.execute("UPDATE proposals SET state='UNKNOWN' WHERE seq<=? AND state='WAITING'",
-                                 (delivered,))
+                for column, definition in columns:
+                    try:
+                        self.execute("ALTER TABLE proposals ADD COLUMN " + column + " " + definition)
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists; SQLite DDL is transactional.
                 self.execute("CREATE UNIQUE INDEX IF NOT EXISTS proposals_take_idem"
                              " ON proposals(take_request_id) WHERE take_request_id IS NOT NULL")
+                if new_cycle:
+                    previous = self.execute("SELECT value FROM meta WHERE key='bridge_cycle'").fetchone()
+                    if previous is None or previous[0] != self.instance:
+                        # Also covers first-open of a pre-lifecycle (legacy) database:
+                        # without a recorded cycle no old state may stay actionable.
+                        now = float(self.clock())
+                        # Terminal WITHDRAWN facts and all timestamps stay as history;
+                        # only actionable cycle states are closed off, rows are never
+                        # bulk-deleted, and nothing is claimed executed or rolled back.
+                        self.execute("UPDATE proposals SET state='UNKNOWN', lifecycle_updated_at=?"
+                                     " WHERE state IN ('WAITING','TAKEN')", (now,))
+                        self.execute("DELETE FROM cursors")
+                    self.execute("INSERT INTO meta(key,value) VALUES('bridge_cycle',?)"
+                                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                 (self.instance,))
                 self.execute("COMMIT")
             except BaseException:
                 if self.db.in_transaction:
@@ -9045,7 +9110,9 @@ def bridge_main(argv=None):
         conversation = args.conversation or secrets.token_hex(32)
         opaque(conversation)
         private_write(conversation_path, conversation.encode("ascii"))
-    store = BridgeStore(directory, conversation)
+    # Only an actual service start begins a new work cycle (#57); utility opens
+    # (--revoke/--renew-cert) and same-cycle reopens never invalidate proposals.
+    store = BridgeStore(directory, conversation, new_cycle=not (args.revoke or args.renew_cert))
     try:
         if args.renew_cert:
             check(bool(args.tls_name) and args.bootstrap_fd is None, "tls_names_required")
