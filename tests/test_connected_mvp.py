@@ -391,13 +391,14 @@ class HTTPTests(unittest.TestCase):
     def tearDown(self):
         self.process.close()
 
-    def test_four_tools_legacy_and_modern_discovery(self):
+    def test_five_tools_legacy_and_modern_discovery(self):
         value = {"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}}
         headers = {"X-AITL-AI-Key": self.process.ai_token}
         status, raw = request(self.process.mcp_url, "POST", body=value, headers=headers)
         self.assertEqual(status, 200)
         names = {item["name"] for item in json.loads(raw)["result"]["tools"]}
-        self.assertEqual(names, {"submit_proposal", "get_submission_status", "get_approved_output", "get_preferences"})
+        self.assertEqual(names, {"submit_proposal", "get_submission_status", "get_approved_output",
+                                 "get_preferences", "withdraw_proposal"})
         self.assertEqual(mcp(self.process, "get_preferences", modern=True)["block_size"], "SMALL")
         meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
         value = {"jsonrpc": "2.0", "id": 2, "method": "server/discover", "params": {"_meta": meta}}
@@ -687,7 +688,7 @@ class ChatBindingTests(unittest.TestCase):
 class ConnectedRoundTripTests(unittest.TestCase):
     def test_stopped_network_worker_blocks_existing_approval(self):
         self.submit(": > stopped-worker-marker")
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         self.core.bridge_worker.stop.set()
         self.core.pump()
         self.assertEqual(self.core.bridge_state, "BLOCKED")
@@ -712,13 +713,22 @@ class ConnectedRoundTripTests(unittest.TestCase):
         self.fixture.wait(lambda: bool(self.core.inbox), timeout=6)
         return item["submission_id"]
 
+    def take_review(self):
+        """W2: bridge-bound takeover is asynchronous (TAKE_PENDING -> bridge ACK)."""
+        self.assertEqual(self.core.review_state in a.AppCore.STAGE_FREE, True)
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.assertEqual(self.core.review_state, "TAKE_PENDING")
+        self.fixture.wait(lambda: self.core.review is not None and self.core.review_state == "REVIEW",
+                          timeout=6)
+        return self.core.review
+
     def test_complete_mcp_review_pty_output_review_mcp_round_trip(self):
         identifier = self.submit("printf 'CONNECTED_ROUNDTRIP\\n'; : > human-approved-marker")
         marker = Path(self.temp.name, "human-approved-marker")
         self.assertFalse(marker.exists())
         self.assertIsNone(self.core.review)
         self.assertEqual(mcp(self.process, "get_approved_output", {"submission_id": identifier})["outputs"], [])
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         self.assertFalse(marker.exists())
         self.core.approve(review.id)
         self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
@@ -726,7 +736,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
             self.core.approve(review.id, override=True)
             self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
         self.fixture.wait(lambda: marker.exists() and b"CONNECTED_ROUNDTRIP\r\n" in self.core.output.data)
-        self.assertEqual(mcp(self.process, "get_submission_status", {"submission_id": identifier})["state"], "ACCEPTED")
+        self.assertEqual(mcp(self.process, "get_submission_status", {"submission_id": identifier})["state"], "TAKEN")
         output = self.core.select_current_output()
         self.assertEqual(mcp(self.process, "get_approved_output", {"submission_id": identifier})["outputs"], [])
         output = self.core.edit_review(output.id, "CONNECTED_ROUNDTRIP\nOnly this chosen text is shared.", False)
@@ -780,7 +790,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
         self.assertEqual(mcp(process, "get_approved_output", {"submission_id": submission_id})["outputs"], [])
         self.assertEqual(harness.deliveries, {})
 
-        command_review = self.core.review_pending_proposal()
+        command_review = self.take_review()
         self.assertEqual(command_review.proposal_id, submission_id)
         self.assertFalse(command_runs.exists())
         self.core.approve(command_review.id)
@@ -874,13 +884,17 @@ class ConnectedRoundTripTests(unittest.TestCase):
         second = self.submit("printf 'MULTI_FLIGHT_TWO\\n'")
         for proposal in (first, second):
             self.fixture.wait(lambda: bool(self.core.inbox), timeout=6)
-            review = self.core.review_pending_proposal()
+            review = self.take_review()
             self.assertEqual(review.proposal_id, proposal)
             self.core.approve(review.id)
             self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
             if self.core.review_state == "OVERRIDE_REQUIRED":
                 self.core.approve(review.id, override=True)
             self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+            # R4 (rev3 send barrier): a second real terminal send requires the previous
+            # return to be closed first; the explicit waiver variant keeps :891-898 intact.
+            if self.core.open_return is not None:
+                self.core.close_open_return()
         candidates = self.core.output_candidates()
         self.assertEqual({item["submission_id"] for item in candidates}, {first, second})
         output = self.core.select_current_output()
@@ -899,7 +913,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
     def test_explicit_unbound_binding_ignores_last_submission(self):
         first = self.submit("printf 'EXPBIND_A\\n'")
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         self.core.approve(review.id)
         self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
         if self.core.review_state == "OVERRIDE_REQUIRED":
@@ -918,7 +932,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
     def test_pending_second_proposal_never_changes_review(self):
         first = self.submit("printf 'FIRST\\n'")
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         mcp(self.process, "submit_proposal", {"request_id": uuid.uuid4().hex, "text": "printf 'SECOND\\n'"})
         self.fixture.wait(lambda: bool(self.core.inbox), timeout=6)
         self.assertEqual(self.core.review, review)
@@ -928,7 +942,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
     def test_bridge_disconnect_stales_review_manual_shell_survives(self):
         self.submit(": > forbidden-after-disconnect")
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         self.core.disconnect_bridge()
         with self.assertRaises(a.ProbeError):
             self.core.approve(review.id)
@@ -968,7 +982,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
     def test_reconnect_generation_and_expired_proposal_block_approval(self):
         self.submit(": > generation-marker")
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         self.core.bridge_worker.emit("disconnected", ("network_unavailable", True))
         self.core.pump()
         self.assertEqual(self.core.review_state, "STALE")
@@ -993,7 +1007,7 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
     def test_reconnect_does_not_represent_consumed_proposal(self):
         self.submit("true")
-        review = self.core.review_pending_proposal()
+        review = self.take_review()
         self.core.reject(review.id)
         self.core.reconnect_bridge()
         self.fixture.wait(lambda: self.core.bridge_state == "CONNECTED", timeout=6)
@@ -1013,6 +1027,538 @@ class ConnectedRoundTripTests(unittest.TestCase):
         before removing this pending marker; local fixtures cannot satisfy this checkpoint.
         """
         self.fail("External host E2E must be evidenced in the real ChatGPT-Work workspace")
+
+
+class ProposalLifecycleStoreTests(unittest.TestCase):
+    """W2 bridge dimension: atomic take<->withdraw, RECORDED readback, matrix, legacy, restart."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-w2-store-")
+        self.addCleanup(self.temp.cleanup)
+        self.now = 1800000000.0
+        self.conversation = uuid.uuid4().hex
+        self.store = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now)
+        self.controller, self.cid = self.store.issue("CONTROLLER")
+        self.ai, self.aid = self.store.issue("AI")
+
+    def tearDown(self):
+        self.store.close()
+
+    def reopen(self):
+        self.store.close()
+        self.store = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now)
+
+    def submit(self, text="true"):
+        return self.store.submit({"request_id": uuid.uuid4().hex, "text": text})["submission_id"]
+
+    def take(self, submission, nonce=None, instance=None):
+        return self.store.take(self.controller, submission, nonce or uuid.uuid4().hex,
+                               self.store.instance if instance is None else instance)
+
+    def status(self, submission):
+        return self.store.submission_status(submission)
+
+    def test_take_withdraw_race_has_exactly_one_winner_in_both_orders(self):
+        for order in ("take_first", "withdraw_first", "concurrent"):
+            for _ in range(3):
+                submission = self.submit()
+                nonce = uuid.uuid4().hex
+                results = {}
+                barrier = threading.Barrier(2)
+
+                def run_take():
+                    if order == "withdraw_first":
+                        self.store.withdraw(submission)
+                    elif order == "concurrent":
+                        barrier.wait(timeout=5)
+                    try:
+                        results["take"] = self.take(submission, nonce)["state"]
+                    except a.BridgeError as exc:
+                        results["take"] = "error:" + exc.code
+
+                def run_withdraw():
+                    if order == "take_first":
+                        try:
+                            self.take(submission, nonce)
+                        except a.BridgeError:
+                            pass
+                    elif order == "concurrent":
+                        barrier.wait(timeout=5)
+                    results["withdraw"] = self.store.withdraw(submission)["state"]
+
+                threads = [threading.Thread(target=run_take), threading.Thread(target=run_withdraw)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=8)
+                    self.assertFalse(thread.is_alive())
+                state = self.status(submission)["state"]
+                with self.subTest(order=order):
+                    self.assertEqual(results["withdraw"], "RECORDED")  # never a success claim
+                    self.assertIn(state, {"TAKEN", "WITHDRAWN"})
+                    row = self.store.execute("SELECT * FROM proposals WHERE id=?", (submission,)).fetchone()
+                    if state == "TAKEN":
+                        self.assertIsNone(row["withdrawn_at"])
+                        self.assertEqual(results["take"], "TAKEN")
+                    else:
+                        self.assertIsNone(row["taken_at"])
+                        self.assertEqual(results["take"], "error:proposal_withdrawn")
+
+    def test_recorded_readback_matrix_and_requested_without_withdrawn(self):
+        submission = self.submit()
+        self.assertEqual(self.store.withdraw(submission), {"submission_id": submission, "state": "RECORDED"})
+        first = self.status(submission)
+        self.assertEqual(first["state"], "WITHDRAWN")
+        self.assertIsNotNone(first["withdraw_requested_at"])
+        self.assertIsNotNone(first["withdrawn_at"])
+        self.assertEqual(self.store.withdraw(submission)["state"], "RECORDED")  # idempotent
+        self.assertEqual(self.status(submission)["withdrawn_at"], first["withdrawn_at"])
+        with self.assertRaises(a.BridgeError):
+            self.take(submission)
+        other = self.submit()
+        taken = self.take(other)
+        self.assertEqual(taken["state"], "TAKEN")
+        self.assertEqual(self.store.withdraw(other)["state"], "RECORDED")
+        after = self.status(other)
+        self.assertEqual(after["state"], "TAKEN")
+        self.assertIsNotNone(after["withdraw_requested_at"])
+        self.assertIsNone(after["withdrawn_at"])  # recorded, not-withdrawable
+
+    def test_take_replay_constant_facts_conflicts_and_restart_instance(self):
+        submission = self.submit()
+        nonce = uuid.uuid4().hex
+        first = self.take(submission, nonce)
+        old_instance = self.store.instance
+        replay = self.store.take(self.controller, submission, nonce, old_instance)
+        self.assertEqual(replay["taken_at"], first["taken_at"])
+        self.assertEqual(replay["expires_at"], first["expires_at"])
+        self.assertEqual(replay["instance"], old_instance)
+        with self.assertRaisesRegex(a.BridgeError, "proposal_taken"):
+            self.take(submission)  # different nonce
+        self.reopen()
+        self.assertNotEqual(self.store.instance, old_instance)
+        after = self.store.take(self.controller, submission, nonce, self.store.instance)
+        self.assertEqual(after["taken_at"], first["taken_at"])  # stored facts survive restart
+        self.assertEqual(after["instance"], self.store.instance)  # current instance, no contradiction
+        with self.assertRaisesRegex(a.BridgeError, "instance_changed"):
+            self.store.take(self.controller, submission, uuid.uuid4().hex, old_instance)
+        fresh = self.submit()
+        with self.assertRaisesRegex(a.BridgeError, "instance_changed"):
+            self.store.take(self.controller, fresh, uuid.uuid4().hex, "f" * 32)
+        self.assertEqual(self.status(fresh)["state"], "ACCEPTED")  # fail-closed, no side effect
+
+    def test_unknown_and_expired_are_not_actionable_but_recordable(self):
+        submission = self.submit()
+        self.store.execute("UPDATE proposals SET state='UNKNOWN' WHERE id=?", (submission,))
+        with self.assertRaisesRegex(a.BridgeError, "proposal_unknown"):
+            self.take(submission)
+        self.assertEqual(self.store.withdraw(submission)["state"], "RECORDED")
+        row = self.status(submission)
+        self.assertEqual(row["state"], "UNKNOWN")
+        self.assertIsNotNone(row["withdraw_requested_at"])
+        self.assertIsNone(row["withdrawn_at"])
+        other = self.submit()
+        self.now += a.BRIDGE_RETENTION + 1
+        self.assertEqual(self.store.withdraw(other)["state"], "RECORDED")  # answer never leaks
+        with self.assertRaisesRegex(a.BridgeError, "submission_unavailable"):
+            self.status(other)
+        with self.assertRaisesRegex(a.BridgeError, "submission_expired"):
+            self.store.take(self.controller, other, uuid.uuid4().hex, self.store.instance)
+
+    def test_legacy_migration_marks_delivered_unknown_and_keeps_undelivered_waiting(self):
+        first, second = self.submit("true"), self.submit("printf x")
+        delivered = self.store.inbox(self.controller, "")  # cursor observes first only
+        self.assertEqual(delivered["messages"][0]["id"], first)
+        path = Path(self.temp.name, "bridge.sqlite3")
+        self.store.close()
+        legacy = sqlite3.connect(path, isolation_level=None)
+        legacy.execute("DROP INDEX IF EXISTS proposals_take_idem")
+        for column in ("state", "taken_at", "take_request_id", "terminal_sent_at",
+                       "output_reviewed_at", "withdraw_requested_at", "withdrawn_at",
+                       "lifecycle_updated_at"):
+            legacy.execute("ALTER TABLE proposals DROP COLUMN " + column)
+        legacy.close()
+        self.store = a.BridgeStore(self.temp.name, self.conversation, clock=lambda: self.now)
+        self.assertEqual(self.status(first)["state"], "UNKNOWN")     # delivered: no provenance
+        self.assertEqual(self.status(second)["state"], "ACCEPTED")   # undelivered: clean WAITING
+        with self.assertRaisesRegex(a.BridgeError, "proposal_unknown"):
+            self.take(first)
+        self.assertEqual(self.take(second)["state"], "TAKEN")
+
+    def test_observation_guard_first_write_wins_and_server_time_authority(self):
+        submission = self.submit()
+        body = {"version": 1, "submission_id": submission, "kind": "TERMINAL_SENT",
+                "observed_at": self.now, "observation_request_id": uuid.uuid4().hex}
+        with self.assertRaisesRegex(a.BridgeError, "proposal_not_taken"):
+            self.store.observe(self.controller, body)  # WAITING never accepts observations
+        self.take(submission)
+        self.now += 5
+        stored = self.store.observe(self.controller, dict(body, observed_at=self.now - 2))
+        self.assertEqual(stored["state"], "TAKEN")
+        row = self.status(submission)
+        self.assertEqual(row["terminal_sent_at"], self.now)  # server clock, not the client hint
+        for _ in range(2):
+            self.store.observe(self.controller, dict(body, observation_request_id=uuid.uuid4().hex))
+        self.assertEqual(self.status(submission)["terminal_sent_at"], self.now)  # first-write-wins
+        for bad in (self.now - a.BRIDGE_RETENTION - 10, self.now + 400):
+            with self.assertRaisesRegex(a.BridgeError, "invalid_schema"):
+                self.store.observe(self.controller, dict(body, observed_at=bad))
+        columns = {c[1] for c in self.store.execute("PRAGMA table_info(proposals)")}
+        self.assertNotIn("observation_request_id", columns)  # N5: nonce deliberately not persisted
+        reviewed = dict(body, kind="OUTPUT_REVIEWED", observed_at=self.now)
+        self.store.observe(self.controller, reviewed)
+        self.assertIsNotNone(self.status(submission)["output_reviewed_at"])
+
+    def test_inbox_filter_and_waiting_only_quota(self):
+        first, second = self.submit("true"), self.submit("printf x")
+        self.store.withdraw(first)
+        batch = self.store.inbox(self.controller, "")
+        self.assertEqual([m["id"] for m in batch["messages"]], [second])  # withdrawn never delivered
+        self.take(second)
+        self.assertEqual(self.store.inbox(self.controller, batch["cursor"])["messages"], [])
+        ids = [self.submit() for _ in range(20)]
+        with self.assertRaisesRegex(a.BridgeError, "inbox_full"):
+            self.submit()
+        self.store.withdraw(ids[0])
+        self.submit()  # withdrawn frees waiting quota
+
+    def test_shared_ever_survives_completion_ack_and_retention_is_honest(self):
+        submission = self.submit()
+        self.take(submission)
+        value = {"version": 1, "conversation": self.conversation, "idempotency_key": uuid.uuid4().hex,
+                 "text": "HUMAN APPROVED", "submission_id": submission, "approved_at": self.now}
+        self.store.approved_output(value)
+        before = self.status(submission)
+        self.assertTrue(before["approved_output_available"])
+        self.assertTrue(before["output_shared_ever"])
+        self.store.execute("UPDATE outputs SET delivered=1, delivered_at=? WHERE submission=?",
+                           (self.now, submission))  # completion ACK flip
+        after = self.status(submission)
+        self.assertFalse(after["approved_output_available"])
+        self.assertTrue(after["output_shared_ever"])  # permanent fact, read-side only
+        self.store.execute("DELETE FROM outputs")     # retention expiry
+        self.assertFalse(self.status(submission)["output_shared_ever"])
+        unbound = {"version": 1, "conversation": self.conversation, "idempotency_key": uuid.uuid4().hex,
+                   "text": "UNBOUND", "submission_id": None, "approved_at": self.now}
+        self.store.approved_output(unbound)
+        self.assertFalse(self.status(submission)["output_shared_ever"])  # unbound never attributed
+        allowed = {"state", "approved_output_available", "output_shared_ever", "expires_at",
+                   "server_time", "lifecycle_changed_at", "taken_at", "terminal_sent_at",
+                   "output_reviewed_at", "withdraw_requested_at", "withdrawn_at", "generation"}
+        self.assertEqual(set(self.status(submission)), allowed)
+        self.assertNotIn("instance", self.status(submission))
+
+    def test_take_rejection_uses_fixed_error_envelope(self):
+        submission = self.submit()
+        self.store.withdraw(submission)
+        service = a.BridgeService(self.store)
+        handler = type("_HTake", (a.BridgeRequestHandler,), {"service": service, "kind": "CONTROLLER"})
+        server = a.BridgeHTTPServer(("127.0.0.1", 0), handler)
+        service.controller_hosts.add("127.0.0.1:%d" % server.socket.getsockname()[1])
+        service.start()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (service.stop(), server.shutdown(), server.server_close()))
+        profile = a.ConnectionProfile("http://127.0.0.1:%d" % server.socket.getsockname()[1], None,
+                                      self.conversation, self.cid, self.controller, "LOCAL")
+        status, raw = request(profile.url, "POST", "/v1/proposal/take",
+                              {"version": 1, "submission_id": submission,
+                               "take_request_id": uuid.uuid4().hex,
+                               "expected_instance": self.store.instance},
+                              {"Authorization": "Bearer " + self.controller})
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(raw), {"error": "proposal_withdrawn"})
+
+
+class MCPWithdrawTests(unittest.TestCase):
+    def setUp(self):
+        self.process = a.LocalBridgeProcess()
+
+    def tearDown(self):
+        self.process.close()
+
+    def raw_call(self, name, args, token=None):
+        value = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": name, "arguments": dict(args, conversation=self.process.chat_code)}}
+        status, raw = request(self.process.mcp_url, "POST", body=value,
+                              headers={"X-AITL-AI-Key": token or self.process.ai_token})
+        self.assertEqual(status, 200)
+        return json.loads(raw)["result"]
+
+    def test_withdraw_is_recorded_only_and_status_is_authoritative(self):
+        created = mcp(self.process, "submit_proposal", {"request_id": uuid.uuid4().hex, "text": "true"})
+        submission = created["submission_id"]
+        result = self.raw_call("withdraw_proposal", {"submission_id": submission})
+        self.assertFalse(result["isError"])
+        self.assertEqual(result["structuredContent"], {"submission_id": submission, "state": "RECORDED"})
+        status = mcp(self.process, "get_submission_status", {"submission_id": submission})
+        self.assertEqual(status["state"], "WITHDRAWN")
+        self.assertIsNotNone(status["withdrawn_at"])
+        self.assertEqual(self.raw_call("withdraw_proposal", {"submission_id": submission})[
+            "structuredContent"]["state"], "RECORDED")  # replay identical, still no success claim
+        unknown = self.raw_call("withdraw_proposal", {"submission_id": "u" * 32})
+        self.assertEqual(unknown["structuredContent"]["state"], "RECORDED")  # no enumeration oracle
+        missing = self.raw_call("get_submission_status", {"submission_id": "u" * 32})
+        self.assertTrue(missing["isError"])
+        self.assertEqual(missing["structuredContent"]["error"], "submission_unavailable")
+        bad_binding = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "withdraw_proposal",
+                                  "arguments": {"submission_id": submission, "conversation": "WRONG0000"}}}
+        status_code, raw = request(self.process.mcp_url, "POST", body=bad_binding,
+                                   headers={"X-AITL-AI-Key": self.process.ai_token})
+        self.assertEqual(status_code, 200)
+        self.assertTrue(json.loads(raw)["result"]["isError"])
+
+    def test_status_leaks_no_payload_and_lists_no_ids(self):
+        created = mcp(self.process, "submit_proposal",
+                      {"request_id": uuid.uuid4().hex, "text": "printf 'SECRET_CANARY'"})
+        status = mcp(self.process, "get_submission_status",
+                     {"submission_id": created["submission_id"]})
+        blob = json.dumps(status)
+        self.assertNotIn("SECRET_CANARY", blob)
+        self.assertNotIn("instance", status)
+        self.assertNotIn(self.process.profile.conversation, blob)
+        self.assertEqual(status["state"], "ACCEPTED")
+
+
+class ControllerTakeFlowTests(unittest.TestCase):
+    """Async take handshake, discard/invalidation, cache-pause mandatory case, §13 stage machine."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-w2-flow-")
+        self.fixture = a.IntegrationFixture(self.temp.name)
+        self.core = self.fixture.core
+        self.core.connect_local_bridge()
+        self.fixture.wait(lambda: self.core.bridge_state == "CONNECTED", timeout=6)
+        self.process = self.core.bridge_process
+
+    def tearDown(self):
+        self.fixture.close()
+        self.temp.cleanup()
+
+    def submit(self, content):
+        item = mcp(self.process, "submit_proposal", {"request_id": uuid.uuid4().hex, "text": content})
+        self.fixture.wait(lambda: bool(self.core.inbox), timeout=6)
+        return item["submission_id"]
+
+    def inject(self, kind, value):
+        self.core.bridge_worker.events.put((self.core.worker_id, kind, value))
+        self.core.pump()
+
+    def test_take_pending_then_ack_builds_review_and_resumes_poll(self):
+        submission = self.submit("printf 'ASYNC_TAKE\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.assertEqual(self.core.review_state, "TAKE_PENDING")
+        self.assertIsNone(self.core.review)
+        self.assertEqual(self.core.pending_take["submission_id"], submission)
+        with self.assertRaisesRegex(a.ProbeError, "stage_conflict"):
+            self.core.review_pending_proposal()  # second take guarded before any network send
+        self.fixture.wait(lambda: self.core.review is not None and self.core.review_state == "REVIEW",
+                          timeout=6)
+        review = self.core.review
+        self.assertEqual(review.proposal_id, submission)
+        self.assertIsNone(self.core.pending_take)
+        self.assertFalse(self.core.inbox)
+        self.fixture.wait(lambda: self.core.bridge_worker.poll_enabled, timeout=6)
+        self.assertEqual(mcp(self.process, "get_submission_status", {"submission_id": submission})[
+            "state"], "TAKEN")
+        self.core.reject(review.id)
+
+    def test_pending_discard_restores_prior_state_and_late_ack_is_ignored(self):
+        submission = self.submit("true")
+        self.core.review_proposal(submission)
+        nonce = self.core.pending_take["take_request_id"]
+        self.core.discard_pending_take()
+        self.assertEqual(self.core.review_state, "EMPTY")
+        self.assertIsNone(self.core.pending_take)
+        with self.assertRaisesRegex(a.ProbeError, "review_not_active"):
+            self.core.discard_pending_take()
+        self.inject("take_result", {"status": "taken", "submission_id": submission,
+                                    "take_request_id": nonce, "instance": self.core.bridge_instance,
+                                    "taken_at": time.time(), "expires_at": time.time() + 60})
+        self.assertIsNone(self.core.review)  # no phantom review from a discarded nonce
+        self.assertEqual(self.core.review_state, "EMPTY")
+        # The bridge fact stands (no untake): orphan documented, per-ID status honest.
+        self.fixture.wait(lambda: mcp(self.process, "get_submission_status",
+                                      {"submission_id": submission})["state"] == "TAKEN", timeout=6)
+
+    def test_benign_withdrawn_rejection_is_nonfatal_and_invalidates_cache(self):
+        submission = self.submit(": > w2-benign-marker")
+        self.assertEqual(mcp(self.process, "withdraw_proposal", {"submission_id": submission})[
+            "state"], "RECORDED")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "EMPTY"
+                          and self.core.pending_take is None, timeout=6)
+        self.assertEqual(self.core.bridge_state, "CONNECTED")  # never BLOCKED by a benign 409
+        self.assertFalse(self.core.inbox)                      # withdrawn cache entry dropped
+        self.assertIsNone(self.core.review)
+        self.assertFalse(Path(self.temp.name, "w2-benign-marker").exists())
+        later = self.submit("true")  # poll continued
+        self.assertEqual(mcp(self.process, "get_submission_status", {"submission_id": later})[
+            "state"], "ACCEPTED")
+        self.core.remove_proposal(later)
+
+    def test_cache_poll_pause_mandatory_case_keeps_review_b_untouched(self):
+        first = self.submit("printf 'B_FIRST\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        review_b = self.core.review
+        item = mcp(self.process, "submit_proposal", {"request_id": uuid.uuid4().hex,
+                                                     "text": "printf 'A_CACHED\\n'"})
+        second = item["submission_id"]
+        self.fixture.wait(lambda: second in self.core.inbox, timeout=6)
+        self.assertFalse(self.core.bridge_worker.poll_enabled)  # poll paused while cached
+        self.assertEqual(mcp(self.process, "withdraw_proposal", {"submission_id": second})[
+            "state"], "RECORDED")
+        with self.assertRaisesRegex(a.ProbeError, "stage_conflict"):
+            self.core.review_pending_proposal()  # initiation barred while B is in review
+        self.assertEqual(self.core.review, review_b)
+        self.assertEqual(self.core.review_state, "REVIEW")
+        self.core.reject(review_b.id)  # human frees the stage explicitly
+        self.assertEqual(self.core.review_state, "REJECTED")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REJECTED"
+                          and self.core.pending_take is None, timeout=6)
+        self.assertEqual(self.core.review, review_b)  # prior state and object restored exactly
+        self.assertNotIn(second, self.core.inbox)     # bound rejection invalidated the cache
+        self.assertEqual(self.core.bridge_state, "CONNECTED")
+        self.assertEqual(mcp(self.process, "get_submission_status", {"submission_id": second})[
+            "state"], "WITHDRAWN")
+
+    def test_disconnect_during_pending_discards_without_restore(self):
+        submission = self.submit("true")
+        self.core.review_proposal(submission)
+        self.core.bridge_worker.emit("disconnected", ("network_unavailable", True))
+        self.core.pump()
+        self.assertIsNone(self.core.pending_take)
+        self.assertEqual(self.core.review_state, "EMPTY")
+        self.assertIn(self.core.bridge_state, {"RETRYING", "CONNECTED", "BLOCKED"})
+
+    def test_open_return_blocks_send_until_waiver_and_park_resume_keeps_identity(self):
+        first = self.submit("printf 'RETURN_FIRST\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        review_a = self.core.review
+        self.core.approve(review_a.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(review_a.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+        self.assertIsNotNone(self.core.open_return)
+        self.assertEqual(self.core.open_return["submission_id"], first)
+        self.assertEqual(self.core.open_return["return_state"], "offen_sammelnd")
+        second = self.submit("printf 'SEND_BLOCKED\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())  # takeover allowed, stage free
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        review_b = self.core.review
+        with self.assertRaisesRegex(a.ProbeError, "stage_conflict"):
+            self.core.approve(review_b.id)  # send barrier while the return is open
+        with self.assertRaisesRegex(a.ProbeError, "invalid_conflict_decision"):
+            self.core.resolve_stage_conflict("SEND_ANYWAY")
+        info = self.core.stage_conflict_info()
+        self.assertEqual(info["direction"], "proposal_in_stage")
+        # Park B (dialog option 2): lossless holding, bridge row stays TAKEN.
+        self.core.resolve_stage_conflict("DISCARD_PROPOSAL_KEEP_RETURN")
+        self.assertIsNotNone(self.core.staged_handoff)
+        self.assertEqual(self.core.review_state, "EMPTY")
+        self.assertIsNotNone(self.core.open_return)
+        taken_before = mcp(self.process, "get_submission_status", {"submission_id": second})
+        resumed = self.core.resume_staged_proposal()
+        self.assertEqual(resumed.id, review_b.id)  # identical review, no second take
+        self.assertEqual(self.core.review_state, "REVIEW")
+        taken_after = mcp(self.process, "get_submission_status", {"submission_id": second})
+        self.assertEqual(taken_after["taken_at"], taken_before["taken_at"])
+        # Cancel is a no-op.
+        before = (self.core.review_state, self.core.open_return and self.core.open_return["return_state"])
+        self.core.resolve_stage_conflict("CANCEL")
+        self.assertEqual(before, (self.core.review_state,
+                                  self.core.open_return and self.core.open_return["return_state"]))
+        # Waiver via the conflict decision closes ONLY the return, then sends B.
+        self.core.resolve_stage_conflict("CLOSE_WITHOUT_RETURN_AND_SEND")
+        self.assertIsNone(self.core.open_return)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+        first_status = mcp(self.process, "get_submission_status", {"submission_id": first})
+        self.assertEqual(first_status["state"], "TAKEN")
+        self.assertIsNotNone(first_status["terminal_sent_at"])
+        self.assertFalse(first_status["output_shared_ever"])  # waived: never shared
+        self.assertFalse(Path(self.temp.name, "SEND_BLOCKED").exists())
+
+    def test_return_review_bidirectional_and_capture_identity(self):
+        first = self.submit("printf 'CAPTURE_IDENTITY\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        self.core.approve(self.core.review.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
+                          and b"CAPTURE_IDENTITY" in self.core.output.data)
+        second = self.submit("printf 'STAGED_SECOND\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        review_b = self.core.review
+        # Direction 1: return review requested while B occupies the stage.
+        self.assertEqual(self.core.stage_conflict_info()["direction"], "proposal_in_stage")
+        capture = self.core.resolve_stage_conflict("DISCARD_PROPOSAL_TAKE_RETURN")
+        self.assertEqual(capture.direction, "TO_OUTPUT_SINK")
+        self.assertEqual(self.core.review_state, "REVIEW")
+        self.assertEqual(self.core.open_return["return_state"], "in_stage")
+        self.assertIn(b"CAPTURE_IDENTITY", capture.payload)
+        # Leaving the return review never waives it.
+        self.core.reject(capture.id)
+        self.assertEqual(self.core.open_return["return_state"], "reviewbereit")
+        # Direction 2: proposal takeover from an active return review needs the leave decision.
+        self.core.take_return_review()
+        self.assertEqual(self.core.review_state, "REVIEW")
+        third = self.submit("printf 'THIRD_PROPOSAL\\n'")
+        with self.assertRaisesRegex(a.ProbeError, "stage_conflict"):
+            self.core.review_pending_proposal()
+        self.assertEqual(self.core.stage_conflict_info()["direction"], "return_in_stage")
+        self.core.resolve_stage_conflict("LEAVE_RETURN_TAKE_PROPOSAL")
+        self.assertEqual(self.core.review_state, "TAKE_PENDING")
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        self.assertEqual(self.core.review.proposal_id, third)
+        self.assertIsNotNone(self.core.open_return)  # A stays open and attributable
+        self.assertEqual(self.core.open_return["submission_id"], first)
+        # Returning A's capture later closes the return via ACK.
+        self.core.reject(self.core.review.id)
+        capture2 = self.core.take_return_review()
+        self.core.note_output_binding(capture2.id, first)
+        self.core.approve(capture2.id, submission_id=first, explicit_binding=True)
+        self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
+        self.assertIsNone(self.core.open_return)
+        returned = mcp(self.process, "get_approved_output", {"submission_id": first})["outputs"]
+        self.assertEqual(len(returned), 1)
+        status = mcp(self.process, "get_submission_status", {"submission_id": first})
+        self.assertTrue(status["output_shared_ever"])
+        self.assertIsNotNone(status["output_reviewed_at"])  # deliberate binding observed
+        self.assertEqual(self.core.review_state, "ACKNOWLEDGED")
+        self.assertEqual(review_b.proposal_id, second)
+
+    def test_note_output_binding_is_deliberate_only(self):
+        first = self.submit("printf 'OBSERVE_BIND\\n'")
+        self.assertIsNone(self.core.review_pending_proposal())
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        self.core.approve(self.core.review.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
+                          and b"OBSERVE_BIND" in self.core.output.data)
+        output = self.core.select_current_output()
+        with self.assertRaisesRegex(a.ProbeError, "unknown_output_binding"):
+            self.core.note_output_binding(output.id, "e" * 32)
+        self.core.note_output_binding(output.id, first)
+        self.fixture.wait(lambda: mcp(self.process, "get_submission_status",
+                                      {"submission_id": first})["output_reviewed_at"] is not None,
+                          timeout=6)
+        self.core.approve(output.id, submission_id=first, explicit_binding=True)
+        self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
+        status = mcp(self.process, "get_submission_status", {"submission_id": first})
+        self.assertTrue(status["output_shared_ever"])
 
 
 class RemoteFixture:
@@ -1263,7 +1809,9 @@ class TunnelTests(unittest.TestCase):
                 self.assertFalse(Path(directory, "tunnel-approved-marker").exists())
                 self.assertIsNone(core.review)
                 self.assertEqual(call("get_approved_output", {"submission_id": submission})["structuredContent"]["outputs"], [])
-                review = core.review_pending_proposal()
+                self.assertIsNone(core.review_pending_proposal())
+                fixture.wait(lambda: core.review is not None and core.review_state == "REVIEW", timeout=6)
+                review = core.review
                 core.approve(review.id)
                 fixture.wait(lambda: core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
                 if core.review_state == "OVERRIDE_REQUIRED":

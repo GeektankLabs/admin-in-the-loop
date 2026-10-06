@@ -105,8 +105,12 @@ class GUISmokeTests(unittest.TestCase):
                 mcp(core.bridge_process, "submit_proposal", {"request_id": "GUI_SMOKE_REQUEST_0001", "text": "printf 'GUI_MCP\\n'"})
                 until(lambda: bool(core.inbox))
                 ui.from_ai_button.invoke()
+                until(lambda: core.review_state == "TAKE_PENDING")
                 root.update()
-                self.assertEqual(core.review_state, "REVIEW")
+                self.assertIn("Übernahme wird bestätigt", ui.review_status.get())
+                self.assertTrue(ui.approve_button.instate(["disabled"]))
+                until(lambda: core.review_state == "REVIEW")
+                root.update()
                 self.assertTrue(core.review.proposal_id)
                 self.assertEqual(ui.editor.text.cget("state"), "disabled")
                 # An output OSC 52 must not silently replace this isolated X clipboard.
@@ -913,6 +917,170 @@ class TerminalAttachmentUITests(unittest.TestCase):
         self.ui.render()
         self.assertFalse(button.winfo_ismapped())
         self.assertIn("Terminal verbunden", self.ui.terminal_status.get())
+
+
+class StageConflictDialogTests(unittest.TestCase):
+    """§13.4/§13.7(10): exact #36 dialog texts, buttons, neutral cancel, core parity."""
+
+    SEND_TEXT = ("Die Ausgabe des vorherigen Kommandos wurde noch nicht an die KI zurückgegeben. "
+                 "Möchtest du darauf verzichten und das neue Kommando senden?")
+    TAKE_RETURN_TEXT = ("Im Review-Bereich liegt bereits ein neuer Kommandovorschlag. "
+                        "Möchtest du ihn verwerfen, um die Ausgabe des vorherigen Kommandos zu prüfen?")
+    TAKE_PROPOSAL_TEXT = ("Im Review-Bereich liegt die Ausgabe des vorherigen Kommandos. "
+                          "Möchtest du die Rückgabeprüfung verlassen und den neuen Kommandovorschlag prüfen? "
+                          "Die Ausgabe bleibt für eine spätere Rückgabe erhalten.")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aitl-stage-ui-")
+        self.core = a.AppCore()
+        self.core.start_local(self.tmp.name)
+        self.root = tk.Tk()
+        self.ui = a.ReviewUI(self.root, self.core)
+        self.addCleanup(self.cleanup)
+        self.root.update()
+        self.ui.open_terminal()
+        self.until(lambda: self.core.connection == "CONNECTED")
+        self.core.connect_local_bridge()
+        self.until(lambda: self.core.bridge_state == "CONNECTED")
+
+    def until(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.root.update()
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("stage_dialog_timeout")
+
+    def cleanup(self):
+        try:
+            if self.core.open_return is not None:
+                self.core.close_open_return()
+            if self.core.connection == "CONNECTED" and self.core.channel:
+                review = self.core.review_command("exit", True)
+                self.core.approve(review.id)
+                self.until(lambda: self.core.connection == "DISCONNECTED", 3)
+        except Exception:
+            pass
+        self.core.close()
+        if self.ui.launcher and self.ui.launcher.poll() is None:
+            try:
+                self.ui.launcher.wait(timeout=2)
+            except Exception:
+                self.ui.launcher.terminate()
+        for callback in self.root.tk.call("after", "info"):
+            self.root.after_cancel(callback)
+        self.root.destroy()
+        self.tmp.cleanup()
+
+    def submit(self, text, request):
+        mcp(self.core.bridge_process, "submit_proposal", {"request_id": request, "text": text})
+        self.until(lambda: bool(self.core.inbox))
+
+    def take(self):
+        self.ui.from_ai_button.invoke()
+        self.until(lambda: self.core.review_state == "TAKE_PENDING")
+        self.root.update()
+        self.assertIn("Übernahme wird bestätigt", self.ui.review_status.get())
+        self.assertTrue(self.ui.approve_button.instate(["disabled"]))
+        self.until(lambda: self.core.review_state == "REVIEW")
+
+    def transfer(self):
+        review = self.core.review
+        self.core.approve(review.id)
+        self.until(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(review.id, override=True)
+        self.until(lambda: self.core.review_state == "TRANSFERRED")
+
+    def assert_dialog(self, message, ordered_labels):
+        self.root.update()
+        dialog = self.ui.conflict_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(self.ui.conflict_message_label.cget("text"), message)
+        self.assertEqual([button.cget("text") for button in self.ui.conflict_buttons.values()],
+                         ordered_labels)
+
+    def test_send_conflict_dialog_cancel_escape_and_waiver_send(self):
+        self.submit("printf 'GUI_STAGE_A\\n'", "GUI_STAGE_A_REQ_0001")
+        self.take()
+        self.transfer()  # open return for A exists now
+        self.submit(": > gui-b-marker; printf 'GUI_STAGE_B\\n'", "GUI_STAGE_B_REQ_0001")
+        self.take()
+        self.root.update()
+        self.assertTrue(self.ui.from_ai_button.instate(["disabled"]))  # initiation barrier visible
+        self.ui.approve_button.invoke()  # send click with an open return -> dialog, no transfer
+        self.assert_dialog(self.SEND_TEXT,
+                           ["Ohne Rückgabe fortfahren und senden", "Neuen Vorschlag verwerfen", "Abbrechen"])
+        self.assertFalse(Path(self.tmp.name, "gui-b-marker").exists())
+        self.ui.conflict_buttons["CANCEL"].invoke()
+        self.root.update()
+        self.assertEqual(self.core.review_state, "REVIEW")  # cancel is state-neutral
+        self.assertIsNotNone(self.core.open_return)
+        self.assertFalse(Path(self.tmp.name, "gui-b-marker").exists())
+        self.ui.approve_button.invoke()
+        self.assert_dialog(self.SEND_TEXT,
+                           ["Ohne Rückgabe fortfahren und senden", "Neuen Vorschlag verwerfen", "Abbrechen"])
+        self.ui.conflict_dialog.event_generate("<Escape>")
+        self.root.update()
+        self.assertEqual(self.core.review_state, "REVIEW")  # Escape == Abbrechen (default)
+        self.assertIsNotNone(self.core.open_return)
+        self.ui.approve_button.invoke()
+        self.until(lambda: self.ui.conflict_dialog is not None and self.ui.conflict_dialog.winfo_exists())
+        self.ui.conflict_buttons["CLOSE_WITHOUT_RETURN_AND_SEND"].invoke()
+        self.until(lambda: self.core.review_state in {"CHECKING", "TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.until(lambda: self.core.review_state == "TRANSFERRED")
+        self.assertTrue(Path(self.tmp.name, "gui-b-marker").exists())
+        self.assertEqual(self.core.open_return["return_state"], "offen_sammelnd")  # B's own return now
+
+    def test_bidirectional_dialogs_park_and_resume_via_ui(self):
+        self.submit("printf 'GUI_STAGE_A\\n'", "GUI_BIDI_A_00001")
+        self.take()
+        self.transfer()
+        # Return review from a free stage needs no dialog.
+        self.ui.from_terminal_button.invoke()
+        self.until(lambda: self.core.review_state == "REVIEW"
+                   and self.core.review.direction == "TO_OUTPUT_SINK")
+        self.assertEqual(self.core.open_return["return_state"], "in_stage")
+        # Direction 2: proposal takeover while the return review occupies the stage.
+        self.submit("printf 'GUI_STAGE_D\\n'", "GUI_BIDI_D_00001")
+        self.ui.from_ai_button.invoke()
+        self.assert_dialog(self.TAKE_PROPOSAL_TEXT, ["Neuen Vorschlag prüfen", "Abbrechen"])
+        self.ui.conflict_buttons["CANCEL"].invoke()
+        self.root.update()
+        self.assertEqual(self.core.review.direction, "TO_OUTPUT_SINK")  # return review kept
+        self.ui.from_ai_button.invoke()
+        self.until(lambda: self.ui.conflict_dialog is not None and self.ui.conflict_dialog.winfo_exists())
+        self.ui.conflict_buttons["LEAVE_RETURN_TAKE_PROPOSAL"].invoke()
+        self.until(lambda: self.core.review_state == "TAKE_PENDING")
+        self.until(lambda: self.core.review_state == "REVIEW")
+        self.assertEqual(self.core.review.direction, "TO_TERMINAL")
+        self.assertIsNotNone(self.core.open_return)  # leaving is not waiving
+        self.assertEqual(self.core.open_return["return_state"], "reviewbereit")
+        # Direction 1: return review requested while proposal D occupies the stage.
+        self.ui.from_terminal_button.invoke()
+        self.assert_dialog(self.TAKE_RETURN_TEXT, ["Vorschlag verwerfen und Ausgabe prüfen", "Abbrechen"])
+        self.ui.conflict_buttons["CANCEL"].invoke()
+        self.root.update()
+        self.assertEqual(self.core.review.direction, "TO_TERMINAL")  # D untouched
+        self.ui.from_terminal_button.invoke()
+        self.until(lambda: self.ui.conflict_dialog is not None and self.ui.conflict_dialog.winfo_exists())
+        self.ui.conflict_buttons["DISCARD_PROPOSAL_TAKE_RETURN"].invoke()
+        self.root.update()
+        self.assertEqual(self.core.review.direction, "TO_OUTPUT_SINK")  # A's capture staged
+        self.assertIsNotNone(self.core.staged_handoff)  # D parked losslessly
+        self.assertEqual(self.core.open_return["return_state"], "in_stage")
+        # The parked D proposal is resumable without a second bridge take.
+        self.core.reject(self.core.review.id)
+        self.assertEqual(self.core.open_return["return_state"], "reviewbereit")
+        self.ui.from_ai_button.invoke()  # staged_handoff present -> resume path
+        self.root.update()
+        self.assertIsNone(self.core.staged_handoff)
+        self.assertEqual(self.core.review_state, "REVIEW")
+        self.assertEqual(self.core.review.text, "printf 'GUI_STAGE_D\\n'\n")
 
 
 if __name__ == "__main__":

@@ -2576,9 +2576,10 @@ class BridgeSnapshot:
 
 
 class TransportError(ProbeError):
-    def __init__(self, code, retryable=False):
+    def __init__(self, code, retryable=False, detail=None):
         super().__init__(code)
         self.retryable = retryable
+        self.detail = detail  # Fixed bridge error code from the JSON envelope, never payload text.
 
 
 def net_json(value):
@@ -2731,7 +2732,9 @@ class BridgeHTTP:
             if response.status != 200:
                 if response.status == 400 and value == {"error": "invalid_cursor"} and path.startswith("/v1/inbox?"):
                     raise TransportError("network_cursor_expired", True)
-                raise TransportError("network_http_" + str(response.status), response.status in {429, 502, 503, 504})
+                detail = value.get("error") if type(value) is dict and type(value.get("error")) is str else None
+                raise TransportError("network_http_" + str(response.status), response.status in {429, 502, 503, 504},
+                                     detail)
             return value
         except TransportError:
             raise
@@ -3551,6 +3554,60 @@ class BridgeWorker:
                             except ProbeError:
                                 self.emit("output_uncertain", identifier)
                                 raise
+                        elif name == "take":
+                            submission_id, take_request_id = value
+                            body = {"version": 1, "submission_id": submission_id,
+                                    "take_request_id": take_request_id, "expected_instance": instance}
+                            try:
+                                try:
+                                    result = self.client.request("POST", "/v1/proposal/take", body)
+                                except TransportError as exc:
+                                    if not exc.retryable or exc.detail is not None:
+                                        raise
+                                    # Lost response: one idempotent retry with the SAME nonce
+                                    # (rotate_chat_binding precedent), never a new submission.
+                                    result = self.client.request("POST", "/v1/proposal/take", body)
+                                fields(result, {"version", "instance", "submission_id", "state",
+                                                "taken_at", "expires_at"})
+                                require(type(result["version"]) is int and result["version"] == 1
+                                        and result["state"] == "TAKEN" and result["submission_id"] == submission_id
+                                        and re.fullmatch("[0-9a-f]{32}", result["instance"])
+                                        and type(result["taken_at"]) in {int, float}
+                                        and type(result["expires_at"]) in {int, float}, "network_schema")
+                                self.emit("take_result", {"status": "taken", "submission_id": submission_id,
+                                                          "take_request_id": take_request_id,
+                                                          "instance": result["instance"],
+                                                          "taken_at": result["taken_at"],
+                                                          "expires_at": result["expires_at"]})
+                            except TransportError as exc:
+                                if exc.detail == "instance_changed":
+                                    raise TransportError("network_instance_changed")  # fail-closed
+                                if exc.detail in ("proposal_withdrawn", "proposal_taken", "proposal_unknown",
+                                                  "submission_expired", "submission_unavailable"):
+                                    # Benign race: never fatal, bridge stays connected, poll continues.
+                                    self.emit("take_result", {"status": "rejected", "reason": exc.detail,
+                                                              "submission_id": submission_id,
+                                                              "take_request_id": take_request_id})
+                                else:
+                                    raise
+                        elif name == "observe":
+                            kind, submission_id, observed_at, observation_request_id = value
+                            body = {"version": 1, "submission_id": submission_id, "kind": kind,
+                                    "observed_at": observed_at, "observation_request_id": observation_request_id}
+                            try:
+                                result = self.client.request("POST", "/v1/proposal/observation", body)
+                                fields(result, {"version", "instance", "submission_id", "kind", "state"})
+                                require(result["state"] == "TAKEN" and result["kind"] == kind
+                                        and result["submission_id"] == submission_id, "network_schema")
+                                self.emit("observe_result", {"status": "stored", "kind": kind,
+                                                             "submission_id": submission_id})
+                            except TransportError as exc:
+                                if exc.detail in ("proposal_not_taken", "proposal_withdrawn", "proposal_taken",
+                                                  "proposal_unknown", "submission_expired", "submission_unavailable"):
+                                    self.emit("observe_result", {"status": "rejected", "reason": exc.detail,
+                                                                 "kind": kind, "submission_id": submission_id})
+                                else:
+                                    raise
                         else:
                             raise TransportError("network_action_unknown")
                     if self.poll_enabled:
@@ -3650,6 +3707,12 @@ class AppCore:
         self.last_proposal_expiry = None
         self.transferred = []  # Stable submission records for explicit output binding.
         self.pending_output = None
+        # W2/§13: single-slot bridge take handshake, discarded-nonce blacklist,
+        # the one open return anchor, and the lossless staged-proposal holding.
+        self.pending_take = None
+        self.discarded_takes = {}
+        self.open_return = None
+        self.staged_handoff = None
         self.tunnel = None
         self.tunnel_check_at = 0
         self.pair_events = queue.Queue(maxsize=1)
@@ -3776,12 +3839,22 @@ class AppCore:
         return self.bridge_profile.recipient + (self.bridge_instance, self.bridge_generation)
 
     def _invalidate_bridge_review(self):
+        if self.review_state == "TAKE_PENDING" and self.pending_take is not None:
+            # Bridge loss during a pending take: discard locally (restore prior state,
+            # devalue the nonce); a bridge-committed TAKEN is never rolled back and a
+            # late ACK never constructs a phantom review.
+            self._drop_pending_take()
         if self.review and self.review.bridge_binding:
             self._command_risk.invalidate()
             if self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}:
                 self.review_state = "STALE"
             elif self.review_state == "SENDING":
                 self.review_state = "DELIVERY_UNCERTAIN"
+                self._mark_return_uncertain()
+
+    def _mark_return_uncertain(self):
+        if self.open_return is not None and self.open_return["return_state"] == "sende_pending":
+            self.open_return["return_state"] = "sende_uncertain"
 
     def connect_profile(self, profile):
         check_profile(profile)
@@ -4033,6 +4106,8 @@ class AppCore:
         # No new selection and no payload reconstruction during retry.
         self.bridge_worker.post("output", (identifier, pending["body"]))
         self.review_state = "SENDING"
+        if self.open_return is not None and self.open_return["return_state"] == "sende_uncertain":
+            self.open_return["return_state"] = "sende_pending"
 
     def _pump_bridge(self):
         if not self.pair_events.empty():
@@ -4086,6 +4161,37 @@ class AppCore:
                     self.received_messages[item["id"]] = (item["text"], item["expires_at"])
                     self.bridge_cursor = cursor
                     worker.post("advance", cursor)
+                elif kind == "take_result":
+                    pending = self.pending_take
+                    if (pending is None
+                            or value.get("take_request_id") != pending["take_request_id"]
+                            or value.get("submission_id") != pending["submission_id"]
+                            or pending["take_request_id"] in self.discarded_takes):
+                        continue  # Late/duplicate ACK for a discarded pending: ignored, bridge facts stand.
+                    text = self.inbox.get(value["submission_id"])
+                    nonce, expires = pending["take_request_id"], pending["expires_at"]
+                    self.pending_take = None
+                    self.review_state = pending["prior_state"]
+                    if value["status"] != "taken" or text is None \
+                            or self.session is None or self.connection != "CONNECTED":
+                        # Benign rejection or unconstructable ACK: devalue the nonce, drop the
+                        # cache entry, never build a phantom review; a bridge-committed TAKEN
+                        # is not rolled back (documented orphan until retention expiry).
+                        self.discarded_takes[nonce] = expires
+                        self.discarded_takes = {key: expiry for key, expiry in self.discarded_takes.items()
+                                                if expiry > time.time()}
+                        self.inbox.pop(value["submission_id"], None)
+                        self.proposal_metadata.pop(value["submission_id"], None)
+                        worker.post("poll")
+                        continue
+                    review = self.review_command(text, pending["final_return"])
+                    self.review = replace(review, proposal_id=value["submission_id"],
+                                          expires_at=value["expires_at"])
+                    self.inbox.pop(value["submission_id"], None)
+                    self.proposal_metadata.pop(value["submission_id"], None)
+                    worker.post("poll")
+                elif kind == "observe_result":
+                    pass  # Facts live bridge-side; benign rejections need no local state change.
                 elif kind == "output_ack":
                     require(self.review is not None and value == self.review.id and self.pending_output is not None,
                             "network_output_binding")
@@ -4093,9 +4199,12 @@ class AppCore:
                     self.review_state = "ACKNOWLEDGED"
                     self.approved_outputs.append(self.review)
                     self.pending_output = None
+                    if self.open_return is not None and self.open_return["return_state"] == "sende_pending":
+                        self.open_return = None  # abgeschlossen_zurückgegeben (bound upload ACKed)
                 elif kind == "output_uncertain":
                     if self.review and self.review.id == value:
                         self.review_state = "DELIVERY_UNCERTAIN"
+                        self._mark_return_uncertain()
                 elif kind == "certificate_warning":
                     require(type(value) is bool, "network_schema")
                     self.certificate_warning = value
@@ -4195,8 +4304,135 @@ class AppCore:
         if self.bridge_worker:
             self.bridge_worker.post("poll")
 
+    # --- §13 stage/return machinery (single shared review stage) ---
+
+    STAGE_FREE = {"EMPTY", "REJECTED", "ACKNOWLEDGED", "ACKNOWLEDGED_LOCAL", "STALE",
+                  "TRANSFERRED", "TRANSFER_UNCERTAIN"}
+
+    def _require_free_stage(self):
+        """Core-side initiation barrier: checked BEFORE any network send."""
+        if self.pending_take is not None or self.review_state not in self.STAGE_FREE:
+            raise ProbeError("stage_conflict")
+
+    def stage_conflict_info(self):
+        if self.pending_take is not None or self.review_state == "TAKE_PENDING":
+            return {"direction": "take_pending"}
+        if self.review is None or self.review_state not in {"REVIEW", "OVERRIDE_REQUIRED"}:
+            return None
+        return {"direction": "return_in_stage" if self.review.direction == "TO_OUTPUT_SINK"
+                else "proposal_in_stage",
+                "review_id": self.review.id, "submission_id": self.review.proposal_id}
+
+    def discard_pending_take(self):
+        require(self.pending_take is not None and self.review_state == "TAKE_PENDING",
+                "review_not_active")
+        self._drop_pending_take()
+
+    def _drop_pending_take(self):
+        pending, self.pending_take = self.pending_take, None
+        if pending is not None:
+            self.discarded_takes[pending["take_request_id"]] = pending["expires_at"]
+            self.review_state = pending["prior_state"]
+        self.discarded_takes = {key: expiry for key, expiry in self.discarded_takes.items()
+                                if expiry > time.time()}
+
+    def _post_observation(self, kind, submission_id):
+        # Single attempt; failures are never auto-resent (§12.2/N5).
+        if self.bridge_worker is not None and self.bridge_state == "CONNECTED":
+            self.bridge_worker.post("observe", (kind, submission_id, time.time(), uuid.uuid4().hex))
+
+    def close_open_return(self):
+        """Explicit human 'complete without returning the output' – closes ONLY the return."""
+        require(self.open_return is not None, "no_open_return")
+        state = self.open_return["return_state"]
+        require(state in {"offen_sammelnd", "reviewbereit", "in_stage"}, "return_not_closable")
+        if self.review is not None and self.review.direction == "TO_OUTPUT_SINK" \
+                and self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}:
+            self.review_state = "REJECTED"  # a staged return capture never survives the waiver
+        self.open_return = None
+
+    def note_output_binding(self, review_id, submission_id):
+        """Additive metadata observation from a DELIBERATE binding choice; never from
+        the auto default, never from approve(); payload/approval bytes untouched."""
+        require(self.review is not None and self.review.id == review_id
+                and self.review.direction == "TO_OUTPUT_SINK", "stale_review")
+        require(self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}, "review_not_active")
+        require(type(submission_id) is str and self.output_binding_record(submission_id) is not None,
+                "unknown_output_binding")
+        self._post_observation("OUTPUT_REVIEWED", submission_id)
+
+    def take_return_review(self):
+        """Load the identity-bound output capture of the open return into the free stage."""
+        require(self.open_return is not None, "no_open_return")
+        require(self.open_return["return_state"] in {"offen_sammelnd", "reviewbereit"},
+                "return_not_ready")
+        self._require_free_stage()
+        offset = self.open_return["transfer_offset"]  # capture identity, not last_transfer_offset
+        review = self.select_output(None, since=offset)
+        self.open_return["return_state"] = "in_stage"
+        return review
+
+    def _park_staged_proposal(self):
+        """Dialog 'discard' = lossless local holding; bridge row stays TAKEN, no untake."""
+        require(self.review is not None and self.review.direction == "TO_TERMINAL"
+                and self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}, "stage_conflict")
+        require(self.staged_handoff is None, "handoff_slot_occupied")
+        self.staged_handoff = {"review": self.review, "submission_id": self.review.proposal_id,
+                               "binding": self.review.bridge_binding}
+        self.review = None
+        self.review_state = "EMPTY"
+
+    def resume_staged_proposal(self):
+        require(self.staged_handoff is not None, "no_staged_proposal")
+        self._require_free_stage()
+        review = self.staged_handoff["review"]
+        self.staged_handoff = None
+        if review.expires_at is not None and time.time() >= review.expires_at:
+            raise ProbeError("review_expired")
+        self.review = review
+        if review.bridge_binding and review.bridge_binding != self._bridge_binding():
+            self.review_state = "STALE"
+        else:
+            self.review_state = "REVIEW"
+        return review
+
+    def resolve_stage_conflict(self, decision):
+        """Headless/UI-identical explicit conflict resolution; the core validates first."""
+        require(decision in {"CLOSE_WITHOUT_RETURN_AND_SEND", "DISCARD_PROPOSAL_KEEP_RETURN",
+                             "DISCARD_PROPOSAL_TAKE_RETURN", "LEAVE_RETURN_TAKE_PROPOSAL",
+                             "CANCEL"}, "invalid_conflict_decision")
+        if decision == "CANCEL":
+            return
+        info = self.stage_conflict_info()
+        require(info is not None, "no_stage_conflict")
+        if decision == "CLOSE_WITHOUT_RETURN_AND_SEND":
+            require(info["direction"] == "proposal_in_stage", "stage_conflict")
+            require(self.open_return is not None, "no_open_return")
+            review = self.review
+            self.close_open_return()
+            # Commit order (#34): the waiver is committed first; a failing send afterwards
+            # never reverts it and is never presented as the waiver's success.
+            self.approve(review.id, override=self.review_state == "OVERRIDE_REQUIRED")
+            return
+        if decision == "DISCARD_PROPOSAL_KEEP_RETURN":
+            require(info["direction"] == "proposal_in_stage", "stage_conflict")
+            self._park_staged_proposal()
+            return
+        if decision == "DISCARD_PROPOSAL_TAKE_RETURN":
+            require(info["direction"] == "proposal_in_stage", "stage_conflict")
+            self._park_staged_proposal()
+            return self.take_return_review()
+        require(info["direction"] == "return_in_stage", "stage_conflict")
+        # LEAVE_RETURN_TAKE_PROPOSAL: leaving never waives; the return stays open.
+        if self.open_return is not None and self.open_return["return_state"] == "in_stage":
+            self.open_return["return_state"] = "reviewbereit"
+        self.review = None
+        self.review_state = "EMPTY"
+        return self.review_pending_proposal()
+
     def _new_review(self, direction, text, payload, final_return=False, lost_prefix=False, normalization=None):
-        require(self.review_state not in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN"}, "transfer_in_progress")
+        require(self.review_state not in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN",
+                                          "TAKE_PENDING"}, "transfer_in_progress")
         require(self.session is not None and self.connection == "CONNECTED", "terminal_not_connected")
         self._command_risk.invalidate()
         self.revision += 1
@@ -4209,17 +4445,25 @@ class AppCore:
     def review_proposal(self, identifier, final_return=None):
         require(identifier in self.inbox, "unknown_proposal")
         metadata = self.proposal_metadata.get(identifier)
-        if metadata:
-            require(self.bridge_state == "CONNECTED" and metadata[0] == self.bridge_profile.recipient
-                    and metadata[1] > time.time(), "proposal_binding_expired")
-        review = self.review_command(self.inbox[identifier], final_return)
-        if metadata:
-            self.review = review = replace(review, proposal_id=identifier, expires_at=metadata[1])
-        del self.inbox[identifier]  # Consume only after successful review construction.
-        self.proposal_metadata.pop(identifier, None)
-        if self.bridge_worker:
-            self.bridge_worker.post("poll")
-        return review
+        if metadata is None:
+            # Local offline import (bridge disconnected): immediate review as before.
+            review = self.review_command(self.inbox[identifier], final_return)
+            del self.inbox[identifier]  # Consume only after successful review construction.
+            return review
+        require(self.bridge_state == "CONNECTED" and metadata[0] == self.bridge_profile.recipient
+                and metadata[1] > time.time(), "proposal_binding_expired")
+        require(self.bridge_worker is not None, "bridge_disconnected")
+        # Bridge-bound: the local review is constructed ONLY after the bridge take ACK;
+        # initiation is barred while the single stage holds active content (§13.3).
+        self._require_free_stage()
+        self.pending_take = {"submission_id": identifier, "take_request_id": uuid.uuid4().hex,
+                             "recipient": metadata[0], "bridge_instance": self.bridge_instance,
+                             "bridge_generation": self.bridge_generation, "expires_at": metadata[1],
+                             "created_at": time.time(), "prior_state": self.review_state,
+                             "final_return": final_return}
+        self.review_state = "TAKE_PENDING"
+        self.bridge_worker.post("take", (identifier, self.pending_take["take_request_id"]))
+        return None
 
     def review_pending_proposal(self):
         require(bool(self.inbox), "no_pending_proposal")
@@ -4285,7 +4529,11 @@ class AppCore:
         # No active or invisible text; LF stays as text, never terminal input.
         require(all(c == "\n" or c == " " or not unicodedata.category(c).startswith(("C", "Z"))
                     for c in text), "output_invisible_character")
-        return self._new_review("TO_OUTPUT_SINK", text, payload, lost_prefix=lost_prefix)
+        review = self._new_review("TO_OUTPUT_SINK", text, payload, lost_prefix=lost_prefix)
+        if self.open_return is not None and self.open_return["return_state"] in {"offen_sammelnd",
+                                                                                 "reviewbereit"}:
+            self.open_return["return_state"] = "in_stage"  # capture content staged for review
+        return review
 
     def _active(self, identifier):
         require(self.review is not None and self.review.id == identifier, "stale_review")
@@ -4330,6 +4578,10 @@ class AppCore:
         require(not self.paused, "paused")
         require(self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}, "approval_already_consumed")
         require(not override or self.review_state == "OVERRIDE_REQUIRED", "override_not_requested")
+        if self.review.direction == "TO_TERMINAL" and self.open_return is not None:
+            # §13.3 send barrier: an open return must be closed (returned or explicitly
+            # waived) BEFORE a new terminal transfer; UI/headless resolve via conflict flow.
+            raise ProbeError("stage_conflict")
         if self.review.direction == "TO_OUTPUT_SINK":
             require(not override, "override_not_requested")
             if self.bridge_profile is not None:
@@ -4357,6 +4609,8 @@ class AppCore:
                 self.pending_output = {"recipient": self.bridge_profile.recipient, "body": body,
                                        "expires": approved_at + 86400}
                 self.review_state = "SENDING"
+                if self.open_return is not None and proposal == self.open_return["submission_id"]:
+                    self.open_return["return_state"] = "sende_pending"
                 return
             self.approved_outputs.append(self.review)
             self.review_state = "ACKNOWLEDGED_LOCAL"
@@ -4382,10 +4636,16 @@ class AppCore:
         if self.review and self.review.id == identifier and self.review_state == "DELIVERY_UNCERTAIN":
             self.pending_output = None
             self.review_state = "REJECTED"
+            if self.open_return is not None and self.open_return["return_state"] == "sende_uncertain":
+                # Dieser explizite lokale Discard IST der Abschluss „ohne Rückgabe“ (§13.2).
+                self.open_return = None
             return
         self._active(identifier)
         require(self.review_state in {"REVIEW", "OVERRIDE_REQUIRED"}, "review_not_active")
         self.review_state = "REJECTED"
+        if self.review.direction == "TO_OUTPUT_SINK" and self.open_return is not None \
+                and self.open_return["return_state"] == "in_stage":
+            self.open_return["return_state"] = "reviewbereit"  # return stays open, capture unstaged
 
     def set_paused(self, value):
         require(type(value) is bool, "invalid_pause")
@@ -4401,7 +4661,7 @@ class AppCore:
 
     def set_final_return(self, value):
         require(type(value) is bool, "invalid_return_preference")
-        require(self.review_state not in {"CHECKING", "TRANSFERRING"}, "transfer_in_progress")
+        require(self.review_state not in {"CHECKING", "TRANSFERRING", "TAKE_PENDING"}, "transfer_in_progress")
         if self.preference_store:
             self.preference_store.save(value, self.preferences)
         self.final_return = value
@@ -4465,6 +4725,14 @@ class AppCore:
                     self.last_proposal_binding = self.review.bridge_binding[:4]
                     self.last_proposal_expiry = self.review.expires_at
                     self._record_transferred_submission(self.review)
+                    if self.open_return is None:
+                        # §13.2/R2: the single volatile anchor for "one open return".
+                        self.open_return = {"command_review_id": self.review.id,
+                                            "submission_id": self.review.proposal_id,
+                                            "transfer_offset": value["offset"],
+                                            "transferred_at": time.time(),
+                                            "return_state": "offen_sammelnd"}
+                    self._post_observation("TERMINAL_SENT", self.review.proposal_id)
                 else:
                     self.last_proposal_id = None
                     self.last_proposal_binding = None
@@ -5578,6 +5846,8 @@ class ReviewUI:
         self.review_status = tk.StringVar()
         self.binding_value = tk.StringVar(value="")
         self.binding_submission = {}
+        self.conflict_dialog = None
+        self.conflict_buttons = {}
         self.binding_row = ttk.Frame(middle, style="Review.TFrame")
         self.binding_row.grid(row=4, column=0, sticky="ew")
         self.binding_row.grid_remove()
@@ -5586,7 +5856,7 @@ class ReviewUI:
         ttk.Label(self.binding_row, text="Output gehört zu Submission:",
                   style="Review.TLabel").pack(anchor="w")
         self.binding_picker.pack(fill="x")
-        self.binding_picker.bind("<<ComboboxSelected>>", lambda _: setattr(self, "binding_touched", True))
+        self.binding_picker.bind("<<ComboboxSelected>>", self._binding_selected)
         self.review_status_label = ttk.Label(middle, textvariable=self.review_status, wraplength=360,
                                              style="Review.TLabel")
         self.review_status_label.grid(row=5, column=0, sticky="ew", pady=(8, 4))
@@ -5627,7 +5897,7 @@ class ReviewUI:
             except tk.TclError:
                 self.button_hand_images[name] = None  # Button text and action remain usable.
         self.from_terminal_button = ttk.Button(action_frames[0], text="Prüfen →",
-                                                command=lambda: self.action(core.select_current_output))
+                                                command=self.from_terminal)
         self.from_terminal_button.grid(row=0, column=0, sticky="nsew")
         self.approve_button = ttk.Button(action_frames[1], text="Freigeben", command=self.approve,
                                          image=self.button_hand_images["ok"] or "", compound="left")
@@ -5636,7 +5906,7 @@ class ReviewUI:
                                         image=self.button_hand_images["stop"] or "", compound="left")
         self.reject_button.grid(row=0, column=1, sticky="nsew")
         self.from_ai_button = ttk.Button(action_frames[2], text="← Prüfen",
-                                          command=lambda: self.action(core.review_pending_proposal))
+                                          command=self.from_ai)
         self.from_ai_button.grid(row=0, column=0, sticky="nsew")
         footer_height = max(button.winfo_reqheight() for button in
                             (self.from_terminal_button, self.approve_button, self.reject_button, self.from_ai_button))
@@ -5995,12 +6265,106 @@ class ReviewUI:
             require(label in self.binding_submission if self.binding_submission else label == "",
                     "unknown_output_binding")
             submission = self.binding_submission[label] if self.binding_submission else None
-            self.core.approve(snapshot.review.id, override=override, submission_id=submission,
-                              explicit_binding=bool(self.binding_submission))
+            try:
+                self.core.approve(snapshot.review.id, override=override, submission_id=submission,
+                                  explicit_binding=bool(self.binding_submission))
+            except ProbeError as exc:
+                if str(exc) == "stage_conflict" and snapshot.review.direction == "TO_TERMINAL":
+                    self._stage_conflict_dialog("send")  # #34: no transfer triggered yet
+                    return
+                raise
         self.action(run)
 
     def reject(self):
+        if self.core.review_state == "TAKE_PENDING":
+            # Pending take has no LocalReview; route to the dedicated discard action.
+            self.action(self.core.discard_pending_take)
+            return
         self.action(lambda: self.core.reject(self.core.review.id) if self.core.review else None)
+
+    def from_terminal(self):
+        core = self.core
+        if core.open_return is not None:
+            info = core.stage_conflict_info()
+            if info is not None and info["direction"] == "proposal_in_stage":
+                self._stage_conflict_dialog("take_return")  # #35 direction 1
+                return
+            if info is not None and info["direction"] == "return_in_stage":
+                return  # already reviewing the return; nothing to do
+            self.action(core.take_return_review)
+            return
+        self.action(core.select_current_output)
+
+    def from_ai(self):
+        core = self.core
+        def run():
+            if core.staged_handoff is not None:
+                return core.resume_staged_proposal()
+            try:
+                return core.review_pending_proposal()
+            except ProbeError as exc:
+                if str(exc) == "stage_conflict":
+                    info = core.stage_conflict_info()
+                    if info is not None and info["direction"] == "return_in_stage":
+                        self._stage_conflict_dialog("take_proposal")  # #35 direction 2
+                        return None
+                raise
+        self.action(run)
+
+    def _binding_selected(self, _event=None):
+        self.binding_touched = True
+        label = self.binding_value.get()
+        submission = self.binding_submission.get(label)
+        review = self.core.review
+        # Deliberate concrete choice only: never the auto default, never "unbound".
+        if submission is not None and review is not None and review.direction == "TO_OUTPUT_SINK":
+            self.action(lambda: self.core.note_output_binding(review.id, submission))
+
+    def _stage_conflict_dialog(self, kind):
+        if self.conflict_dialog is not None and self.conflict_dialog.winfo_exists():
+            self.conflict_dialog.destroy()
+        texts = {
+            "send": ("Die Ausgabe des vorherigen Kommandos wurde noch nicht an die KI zurückgegeben. "
+                     "Möchtest du darauf verzichten und das neue Kommando senden?",
+                     (("Ohne Rückgabe fortfahren und senden", "CLOSE_WITHOUT_RETURN_AND_SEND"),
+                      ("Neuen Vorschlag verwerfen", "DISCARD_PROPOSAL_KEEP_RETURN"),
+                      ("Abbrechen", "CANCEL"))),
+            "take_return": ("Im Review-Bereich liegt bereits ein neuer Kommandovorschlag. "
+                            "Möchtest du ihn verwerfen, um die Ausgabe des vorherigen Kommandos zu prüfen?",
+                            (("Vorschlag verwerfen und Ausgabe prüfen", "DISCARD_PROPOSAL_TAKE_RETURN"),
+                             ("Abbrechen", "CANCEL"))),
+            "take_proposal": ("Im Review-Bereich liegt die Ausgabe des vorherigen Kommandos. "
+                              "Möchtest du die Rückgabeprüfung verlassen und den neuen Kommandovorschlag prüfen? "
+                              "Die Ausgabe bleibt für eine spätere Rückgabe erhalten.",
+                              (("Neuen Vorschlag prüfen", "LEAVE_RETURN_TAKE_PROPOSAL"),
+                               ("Abbrechen", "CANCEL"))),
+        }
+        message, buttons = texts[kind]
+        window = self.conflict_dialog = self.tk.Toplevel(self.root)
+        window.title("Review-Bereich")
+        window.transient(self.root)
+        self.conflict_message_label = self.ttk.Label(window, text=message, wraplength=420,
+                                                     justify="left")
+        self.conflict_message_label.pack(padx=16, pady=(16, 4))
+        review = self.core.review
+        if review is not None and review.text.strip():
+            preview = review.text.strip().splitlines()[0][:60]
+            self.ttk.Label(window, text="› " + preview, wraplength=420).pack(padx=16, pady=(0, 8))
+        self.conflict_buttons = {}
+        def decide(decision):
+            if not window.winfo_exists():
+                return  # stale dialog answer after close: never applied
+            window.destroy()
+            if decision != "CANCEL":
+                self.action(lambda: self.core.resolve_stage_conflict(decision))
+        for label, decision in buttons:
+            button = self.ttk.Button(window, text=label, command=lambda d=decision: decide(d))
+            button.pack(fill="x", padx=16, pady=4)
+            self.conflict_buttons[decision] = button
+            if decision == "CANCEL":
+                button.focus_set()  # neutral default; Escape/close == Abbrechen
+        window.protocol("WM_DELETE_WINDOW", lambda: decide("CANCEL"))
+        window.bind("<Escape>", lambda _event: decide("CANCEL"))
 
     def render(self):
         snapshot = self.core.snapshot()
@@ -6015,7 +6379,8 @@ class ReviewUI:
             self.terminal_button.grid()
         self.terminal_button.configure(state="disabled" if snapshot.connection == "STARTING_SHELL" else "normal")
         active = snapshot.review_state in {"REVIEW", "OVERRIDE_REQUIRED", "DELIVERY_UNCERTAIN"}
-        busy = snapshot.review_state in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN"}
+        busy = snapshot.review_state in {"CHECKING", "TRANSFERRING", "SENDING", "DELIVERY_UNCERTAIN",
+                                         "TAKE_PENDING"}
         bridge = snapshot.bridge
         self.ai_status.set(local_setup_summary(self.core) if self.core.local_setup_state != "IDLE" else connection_summary(bridge))
         chat_code, chat_status, can_copy = chat_binding_presentation(bridge)
@@ -6031,7 +6396,15 @@ class ReviewUI:
             self.chat_code_status_label.pack_forget()
         self.chat_code_copy.configure(state="normal" if can_copy else "disabled")
         self.from_terminal_button.configure(state="normal" if connected and not busy else "disabled")
-        self.from_ai_button.configure(state="normal" if connected and snapshot.inbox and not busy else "disabled")
+        # #35: a deliberately requested takeover must open the directional dialog instead of
+        # being silently deactivated – only an active PROPOSAL review bars the button outright.
+        proposal_review_active = (snapshot.review is not None
+                                  and snapshot.review.direction == "TO_TERMINAL"
+                                  and snapshot.review_state in {"REVIEW", "OVERRIDE_REQUIRED"})
+        self.from_ai_button.configure(state="normal" if connected and not busy
+                                      and (snapshot.inbox or self.core.staged_handoff is not None)
+                                      and not proposal_review_active
+                                      else "disabled")
         ready = bool(snapshot.inbox)
         self.readiness.configure(text="Command-Vorschlag vorhanden" if ready else "Kein Command-Vorschlag",
                                  background="#dcefe1" if ready else "#f6e4d0",
@@ -6061,6 +6434,7 @@ class ReviewUI:
                                           state="normal" if bridge.state == "CONNECTED" and not snapshot.paused else "disabled")
         self.reject_button.configure(state="normal" if active else "disabled")
         messages = {"EMPTY": "", "REVIEW": "", "CHECKING": "Übertragung wird geprüft…",
+                    "TAKE_PENDING": "Übernahme wird bestätigt…",
                     "OVERRIDE_REQUIRED": "Prompt nicht erkannt · zusätzliche Bestätigung erforderlich",
                     "TRANSFERRED": "Text übertragen", "TRANSFER_UNCERTAIN": "Übertragung ungewiss · keine Wiederholung",
                     "ACKNOWLEDGED_LOCAL": "Output lokal freigegeben · keine AI-Verbindung",
@@ -6855,6 +7229,7 @@ class BridgeStore:
             self.execute("ALTER TABLE subscriptions ADD COLUMN binding_generation INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+        self._migrate_proposal_lifecycle()
         row = self.execute("SELECT value FROM meta WHERE key='conversation'").fetchone()
         check(row is None or row[0] == conversation, "conversation_state_mismatch")
         self.execute("INSERT OR IGNORE INTO meta VALUES('conversation',?)", (conversation,))
@@ -6919,6 +7294,42 @@ class BridgeStore:
         self.preference = "SMALL"
         self.pair = None
         self.cleanup()
+
+    def _migrate_proposal_lifecycle(self):
+        """Additive W2 lifecycle columns plus one-shot legacy backfill in one transaction.
+
+        Legacy rows already delivered over an INBOX cursor lack take/withdraw provenance
+        and become terminally UNKNOWN (conservative, §12.3); undelivered rows stay WAITING.
+        """
+        columns = (("state", "TEXT NOT NULL DEFAULT 'WAITING'"), ("taken_at", "REAL"),
+                   ("take_request_id", "TEXT"), ("terminal_sent_at", "REAL"),
+                   ("output_reviewed_at", "REAL"), ("withdraw_requested_at", "REAL"),
+                   ("withdrawn_at", "REAL"), ("lifecycle_updated_at", "REAL"))
+        with self.lock:
+            added = False
+            for column, definition in columns:
+                try:
+                    self.execute("ALTER TABLE proposals ADD COLUMN " + column + " " + definition)
+                    added = True
+                except sqlite3.OperationalError:
+                    pass  # Column already exists on an upgraded state directory.
+            self.execute("BEGIN IMMEDIATE")
+            try:
+                if added:
+                    now = float(self.clock())
+                    delivered = self.execute(
+                        "SELECT coalesce(max(seq),0) FROM cursors WHERE kind='INBOX'").fetchone()[0]
+                    self.execute("UPDATE proposals SET lifecycle_updated_at=? WHERE lifecycle_updated_at IS NULL",
+                                 (now,))
+                    self.execute("UPDATE proposals SET state='UNKNOWN' WHERE seq<=? AND state='WAITING'",
+                                 (delivered,))
+                self.execute("CREATE UNIQUE INDEX IF NOT EXISTS proposals_take_idem"
+                             " ON proposals(take_request_id) WHERE take_request_id IS NOT NULL")
+                self.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.execute("ROLLBACK")
+                raise
 
     def close(self):
         with self.lock:
@@ -7261,13 +7672,13 @@ class BridgeStore:
                 return {"submission_id": previous["id"], "state": "ACCEPTED", "expires_at": previous["expires"]}
             # Queued = not yet observed over any controller cursor. No review state is published.
             observed = self.execute("SELECT coalesce(max(seq),0) FROM cursors WHERE kind='INBOX'").fetchone()[0]
-            check(self.execute("SELECT count(*) FROM proposals WHERE seq>?", (observed,)).fetchone()[0] < 20,
-                  "inbox_full", 429)
+            check(self.execute("SELECT count(*) FROM proposals WHERE seq>? AND state='WAITING'",
+                               (observed,)).fetchone()[0] < 20, "inbox_full", 429)
             check(self.execute("SELECT count(*) FROM proposals").fetchone()[0] < 1024, "message_limit", 429)
             identifier, deadline = uuid.uuid4().hex, self.clock() + BRIDGE_RETENTION
             try:
-                self.execute("INSERT INTO proposals(id,request,text,expires) VALUES(?,?,?,?)",
-                             (identifier, request_id, command, deadline))
+                self.execute("INSERT INTO proposals(id,request,text,expires,lifecycle_updated_at) VALUES(?,?,?,?,?)",
+                             (identifier, request_id, command, deadline, self.clock()))
             except sqlite3.IntegrityError:
                 previous = self.execute("SELECT * FROM proposals WHERE request=?", (request_id,)).fetchone()
                 check(previous is not None and previous["text"] == command, "idempotency_conflict", 409)
@@ -7277,8 +7688,9 @@ class BridgeStore:
     def inbox(self, token, cursor):
         row = self.authenticate(token, "CONTROLLER")
         position = self.cursor_position(cursor, row["id"], "INBOX")
-        proposal = self.execute("SELECT * FROM proposals WHERE seq>? AND expires>? ORDER BY seq LIMIT 1",
-                                (position, self.clock())).fetchone()
+        # Only still-waiting proposals are ever (re)delivered; TAKEN/WITHDRAWN/UNKNOWN never.
+        proposal = self.execute("SELECT * FROM proposals WHERE seq>? AND expires>? AND state='WAITING'"
+                                " ORDER BY seq LIMIT 1", (position, self.clock())).fetchone()
         if not proposal:
             return {"version": 1, "instance": self.instance, "conversation": self.conversation,
                     "cursor": cursor or self.cursor(row["id"], "INBOX", position), "messages": []}
@@ -7328,12 +7740,131 @@ class BridgeStore:
     def submission_status(self, submission_id):
         now = self.clock()
         with self.lock:
-            row = self.execute("SELECT expires FROM proposals WHERE id=? AND expires>?",
+            row = self.execute("SELECT * FROM proposals WHERE id=? AND expires>?",
                                (submission_id, now)).fetchone()
             check(row is not None, "submission_unavailable", 404)
             shared = self.execute("SELECT id FROM outputs WHERE submission=? AND expires>? AND delivered=0 LIMIT 1",
                                   (submission_id, now)).fetchone()
-            return {"state": "ACCEPTED", "approved_output_available": bool(shared)}
+            # Permanent release fact, read-side from the existing outputs row (delivered
+            # ignored): stays provable after the completion ACK flipped delivery state.
+            ever = self.execute("SELECT id FROM outputs WHERE submission=? AND expires>? LIMIT 1",
+                                (submission_id, now)).fetchone()
+            return {"state": {"WAITING": "ACCEPTED"}.get(row["state"], row["state"]),
+                    "approved_output_available": bool(shared),
+                    "output_shared_ever": bool(ever),
+                    "expires_at": row["expires"], "server_time": now,
+                    "lifecycle_changed_at": row["lifecycle_updated_at"],
+                    "taken_at": row["taken_at"], "terminal_sent_at": row["terminal_sent_at"],
+                    "output_reviewed_at": row["output_reviewed_at"],
+                    "withdraw_requested_at": row["withdraw_requested_at"],
+                    "withdrawn_at": row["withdrawn_at"],
+                    "generation": self.chat_binding["generation"]}
+
+    def take(self, token, submission_id, take_request_id, expected_instance):
+        """Atomic controller take; linearized against withdraw under one IMMEDIATE txn."""
+        opaque(submission_id)
+        opaque(take_request_id)
+        check(type(expected_instance) is str and re.fullmatch("[0-9a-f]{32}", expected_instance),
+              "invalid_schema")
+        self.authenticate(token, "CONTROLLER")
+        with self.lock:
+            if expected_instance != self.instance:
+                raise BridgeError("instance_changed", 409)
+            now = self.clock()
+            self.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.execute("SELECT * FROM proposals WHERE id=?", (submission_id,)).fetchone()
+                if row is None:
+                    raise BridgeError("submission_unavailable", 404)
+                if row["expires"] <= now:
+                    raise BridgeError("submission_expired", 410)
+                if row["state"] == "TAKEN" and row["take_request_id"] == take_request_id:
+                    # Idempotent replay: stored facts plus the CURRENT instance, never a
+                    # contradictory "original response" from an earlier instance.
+                    result = {"version": 1, "instance": self.instance, "submission_id": submission_id,
+                              "state": "TAKEN", "taken_at": row["taken_at"], "expires_at": row["expires"]}
+                    self.execute("COMMIT")
+                    return result
+                if row["state"] == "TAKEN":
+                    raise BridgeError("proposal_taken", 409)
+                if row["state"] == "WITHDRAWN":
+                    raise BridgeError("proposal_withdrawn", 409)
+                if row["state"] != "WAITING":
+                    raise BridgeError("proposal_unknown", 409)
+                updated = self.execute("UPDATE proposals SET state='TAKEN', taken_at=?, take_request_id=?,"
+                                       " lifecycle_updated_at=? WHERE id=? AND state='WAITING' AND expires>?",
+                                       (now, take_request_id, now, submission_id, now)).rowcount
+                check(updated == 1, "proposal_taken", 409)
+                self.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.execute("ROLLBACK")
+                raise
+        return {"version": 1, "instance": self.instance, "submission_id": submission_id,
+                "state": "TAKEN", "taken_at": now, "expires_at": row["expires"]}
+
+    def withdraw(self, submission_id):
+        """AI-facing withdrawal; the answer is always RECORDED, never a success claim."""
+        opaque(submission_id)
+        with self.lock:
+            now = self.clock()
+            self.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.execute("SELECT * FROM proposals WHERE id=? AND expires>?",
+                                   (submission_id, now)).fetchone()
+                if row is not None:
+                    if row["state"] == "WAITING":
+                        self.execute("UPDATE proposals SET state='WITHDRAWN', withdraw_requested_at=?,"
+                                     " withdrawn_at=?, lifecycle_updated_at=?"
+                                     " WHERE id=? AND state='WAITING' AND expires>?",
+                                     (now, now, now, submission_id, now))
+                    elif row["state"] in ("TAKEN", "UNKNOWN") and row["withdraw_requested_at"] is None:
+                        # Recorded request fact without a state transition (not-withdrawable).
+                        self.execute("UPDATE proposals SET withdraw_requested_at=?, lifecycle_updated_at=?"
+                                     " WHERE id=?", (now, now, submission_id))
+                self.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.execute("ROLLBACK")
+                raise
+        return {"submission_id": submission_id, "state": "RECORDED"}
+
+    def observe(self, token, value):
+        """Controller-observed lifecycle facts; first-write-wins on the fact column only."""
+        exact(value, {"version", "submission_id", "kind", "observed_at", "observation_request_id"})
+        check(type(value["version"]) is int and value["version"] == 1)
+        check(value["kind"] in {"TERMINAL_SENT", "OUTPUT_REVIEWED"}, "invalid_schema")
+        observed_at = value["observed_at"]
+        # Bounds-checked client hint only (approved_at precedent); the stored fact time is
+        # always the server clock, so no client can backdate a lifecycle fact.
+        check(type(observed_at) in {int, float} and observed_at == observed_at
+              and abs(observed_at) != float("inf")
+              and self.clock() - BRIDGE_RETENTION < observed_at <= self.clock() + 300, "invalid_schema")
+        opaque(value["observation_request_id"])  # Validated, deliberately not persisted (N5).
+        submission_id = opaque(value["submission_id"])
+        self.authenticate(token, "CONTROLLER")
+        column = "terminal_sent_at" if value["kind"] == "TERMINAL_SENT" else "output_reviewed_at"
+        with self.lock:
+            now = self.clock()
+            self.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.execute("SELECT * FROM proposals WHERE id=?", (submission_id,)).fetchone()
+                if row is None:
+                    raise BridgeError("submission_unavailable", 404)
+                if row["expires"] <= now:
+                    raise BridgeError("submission_expired", 410)
+                if row["state"] != "TAKEN":
+                    raise BridgeError("proposal_not_taken", 409)
+                if row[column] is None:
+                    self.execute("UPDATE proposals SET " + column + "=?, lifecycle_updated_at=? WHERE id=?"
+                                 " AND state='TAKEN' AND " + column + " IS NULL", (now, now, submission_id))
+                self.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.execute("ROLLBACK")
+                raise
+        return {"version": 1, "instance": self.instance, "submission_id": submission_id,
+                "kind": value["kind"], "state": "TAKEN"}
 
     def ai_output(self, principal, value):
         exact(value, set(), {"submission_id", "cursor"})
@@ -7482,6 +8013,9 @@ BRIDGE_TOOLS = [
     {"name": "get_preferences", "description": "Read the human's preferred command block size: SINGLE, SMALL, MEDIUM or LARGE. A comfort preference, never permission.",
      "inputSchema": object_schema({}),
      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+    {"name": "withdraw_proposal", "description": "Ask to withdraw one of your own not-yet-taken proposals by id. Always answers RECORDED, never success; read get_submission_status for the authoritative outcome. No terminal access.",
+     "inputSchema": object_schema({"submission_id": BRIDGE_ID_SCHEMA}, ("submission_id",)),
+     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
 ]
 for bridge_tool in BRIDGE_TOOLS:
     # Tunnel authentication identifies an app, not a particular ChatGPT chat.
@@ -7879,6 +8413,8 @@ class BridgeService:
             "CONTROLLER": {"/v1/status": (self._controller_status, "GET"),
                             "/v1/inbox": (self._controller_inbox, "GET"),
                             "/v1/approved-output": (self._controller_output, "POST"),
+                            "/v1/proposal/take": (self._controller_take, "POST"),
+                            "/v1/proposal/observation": (self._controller_observation, "POST"),
                             "/v1/preferences": (self._controller_preferences, "PUT"),
                             "/v1/chat-binding": (self._controller_chat_binding, "GET"),
                             "/v1/chat-binding/rotate": (self._controller_chat_binding_rotate, "POST"),
@@ -8005,6 +8541,21 @@ class BridgeService:
         self.principal(request, "CONTROLLER")
         return self.json(self.store.approved_output(value))
 
+    def _controller_take(self, request):
+        token, _ = self.principal(request, "CONTROLLER")
+        value = self.body(request)
+        self.principal(request, "CONTROLLER")
+        exact(value, {"version", "submission_id", "take_request_id", "expected_instance"})
+        check(type(value["version"]) is int and value["version"] == 1, "invalid_schema")
+        return self.json(self.store.take(token, value["submission_id"], value["take_request_id"],
+                                         value["expected_instance"]))
+
+    def _controller_observation(self, request):
+        token, _ = self.principal(request, "CONTROLLER")
+        value = self.body(request)
+        self.principal(request, "CONTROLLER")
+        return self.json(self.store.observe(token, value))
+
     def _controller_preferences(self, request):
         self.principal(request, "CONTROLLER")
         value = self.body(request)
@@ -8090,6 +8641,10 @@ class BridgeService:
                     elif name == "get_preferences":
                         exact(args, set())
                         data = {"block_size": self.store.preference}
+                    elif name == "withdraw_proposal":
+                        exact(args, {"submission_id"})
+                        opaque(args["submission_id"])
+                        data = self.store.withdraw(args["submission_id"])
                     else:
                         raise BridgeError("unknown_tool")
                 # Every MCP client can read content; some hosts discard structuredContent.

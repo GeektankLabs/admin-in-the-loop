@@ -195,9 +195,11 @@ Alle GUI-Aktionen führen in denselben Kern beziehungsweise lokale Launcher. `Ap
 |---|---|
 | Terminal vorbereiten/starten | `start_local()`, `helper_argv()`, `helper_command()`, `launch_terminal()` |
 | Zustände und exakten Review lesen | `pump()`, `snapshot()`, `bridge_snapshot()`, `review_fragments()` |
-| Vorschlag bereitstellen und prüfen | `add_proposal()`, `review_pending_proposal()` |
+| Vorschlag bereitstellen und prüfen | `add_proposal()`, `review_pending_proposal()` (bridge-gebunden asynchron: `TAKE_PENDING` bis Bridge-ACK) |
+| Übernahme-Pending verwerfen | `discard_pending_take()` (stellt den Vorzustand wieder her, entwertet die Nonce; Bridge-`TAKEN` bleibt) |
 | Review erstellen, bearbeiten, verwerfen | `review_command()`, `edit_review()`, `reject()` |
 | Return, Blockgröße, Ausgabeauswahl | `set_final_return()`, `set_preferences()`, `set_output_mode()`, `select_current_output()` |
+| Offene Rückgabe (W2/M5) | `take_return_review()`, `close_open_return()`, `note_output_binding()`, `resolve_stage_conflict()`, `resume_staged_proposal()`, `stage_conflict_info()` |
 | Freigabe / identischen Output erneut zustellen | `approve()`, `retry_output()` |
 | Bridge verbinden/trennen | `connect_local_bridge()`, `connect_profile()`, `connect_saved_bridge()`, `reconnect_bridge()`, `disconnect_bridge()` |
 | Remote koppeln | `pair_remote()`; GUI nutzt `begin_pair_remote()` |
@@ -208,20 +210,35 @@ Die lokale Test-API ist privilegierter Anwendungscode. Sie darf nicht als AI-Too
 
 ## HTTP und MCP
 
-Controllerrolle: `GET /v1/status`, `GET /v1/inbox`, `POST /v1/approved-output`, `PUT /v1/preferences`, Kopplung über `POST /v1/pair/claim` und `/v1/pair/confirm`. Authentisierte Inbox mit begrenztem Long-Polling, Backoff und opaken Cursorwerten. Der lokale Controller zeigt immer einen Vorschlag; weitere Bridge-Vorschläge ersetzen nie einen laufenden Review.
+Controllerrolle: `GET /v1/status`, `GET /v1/inbox`, `POST /v1/approved-output`, `PUT /v1/preferences`, `POST /v1/proposal/take` und `POST /v1/proposal/observation` (W2/M5), Kopplung über `POST /v1/pair/claim` und `/v1/pair/confirm`. Authentisierte Inbox mit begrenztem Long-Polling, Backoff und opaken Cursorwerten; ausgeliefert werden nur noch wartende (`WAITING`) Vorschläge. `POST /v1/proposal/take` überführt atomar `WAITING→TAKEN` (Nonce-idempotent, `expected_instance`-gebunden); `POST /v1/proposal/observation` schreibt Controller-Beobachtungen `TERMINAL_SENT`/`OUTPUT_REVIEWED` first-write-wins auf Serverclock-Basis, nur bei `TAKEN`. Feste Fehlerhüllen `{"error": code}`; gutartige Rennen (`proposal_withdrawn`, `proposal_taken`, `proposal_unknown`, `submission_expired`, `submission_unavailable`, `proposal_not_taken`) sind für den Worker nicht fatal, echte Instanz-/Bindungsfehler bleiben fail-closed. Der lokale Controller zeigt immer einen Vorschlag; weitere Bridge-Vorschläge ersetzen nie einen laufenden Review.
 
 AI-Rolle ausschließlich über `POST /mcp`:
 
 | Tool | Argumente zusätzlich zu `conversation` | Ergebnis |
 |---|---|---|
 | `submit_proposal` | `request_id`, `text` | Empfang/ID; keine Ausführung |
-| `get_submission_status` | `submission_id` | Empfangsstatus und Vorhandensein freigegebenen Outputs |
+| `get_submission_status` | `submission_id` | Lifecycle-Fakten: `ACCEPTED`/`TAKEN`/`WITHDRAWN`/`UNKNOWN`, Zeitstempel, `output_shared_ever`, Verfügbarkeit freigegebenen Outputs; keine Rohtexte, keine IDs anderer Vorschläge |
 | `get_approved_output` | optional `submission_id`, `cursor` | Ausschließlich bereits freigegebener Output |
 | `get_preferences` | keine | SINGLE/SMALL/MEDIUM/LARGE |
+| `withdraw_proposal` | `submission_id` | Immer nur `RECORDED` – kein Erfolgsbeweis; maßgeblich ist der folgende `get_submission_status`-Readback |
 
-Vier Tools, keine Resources, Shell-, Datei-, Tastatur- oder Terminal-Lesetools. Ein MCP-Tools-Teilumfang mit Legacy-Initialisierung und neuer Discovery ist implementiert; kein allgemeines Agentenframework. `ACCEPTED` bedeutet **angenommen, nicht ausgeführt**. Leerer Output beweist keinen Fehler oder Erfolg.
+Fünf Tools, keine Resources, Shell-, Datei-, Tastatur- oder Terminal-Lesetools. Ein MCP-Tools-Teilumfang mit Legacy-Initialisierung und neuer Discovery ist implementiert; kein allgemeines Agentenframework. `ACCEPTED` bedeutet **angenommen, nicht ausgeführt**; `TAKEN` bedeutet **in menschliche Review übernommen, nicht gesendet oder ausgeführt**. `withdraw_proposal` zieht ausschließlich eigene, noch nicht übernommene (`WAITING`) Vorschläge zurück; bereits übernommene bleiben `TAKEN` und werden nur als „Rücknahme angefragt“ vermerkt. Leerer Output beweist keinen Fehler oder Erfolg.
 
 Output wird exakt einmal als eigener Text-Contentblock übertragen. Der erste Block und `structuredContent` enthalten Metadaten; `text_content_index` benennt den jeweiligen Textblock. Dadurch bleibt Output auch bei Hosts verfügbar, die `structuredContent` ignorieren, ohne den Nutztext doppelt zu übertragen.
+
+## Vorschlags-Lifecycle, Review-Stage und eine offene Rückgabe (W2/M5)
+
+Ein bridge-gebundener Vorschlag wird **asynchron** übernommen: Klick „← Prüfen“ erzeugt `TAKE_PENDING` („Übernahme wird bestätigt…“), erst die Bridge-Bestätigung konstruiert den lokalen Review. Take und AI-Rücknahme werden auf der Bridge atomar entschieden – genau eine Seite gewinnt. Verwerfen während `TAKE_PENDING` stellt den vorherigen Zustand exakt wieder her und entwertet die lokale Nonce; ein später ACK wird ignoriert, die Bridge-Zeile bleibt `TAKEN` (kein Zurückdrehen, ehrlicher verwaister Zustand bis zum 24-h-Ablauf).
+
+Die Review-Stage enthält **höchstens einen** Inhalt: entweder einen neuen Kommandovorschlag oder die Ausgabeprüfung des vorherigen Kommandos. Daneben gilt: **höchstens eine offene Rückgabe** bereits übergebener Kommandos, geführt über einen flüchtigen lokalen Datensatz (`open_return`), der bei bestätigter Terminal-Übergabe entsteht und nur durch erfolgreichen Output-Versand oder die ausdrückliche Aktion „ohne Rückgabe abschließen“ endet. Ein neuer Kommandovorschlag darf bei freier Stage auch dann geprüft werden, wenn noch eine Rückgabe offen ist – **tatsächlich ans Terminal gesendet** wird er erst, wenn die offene Rückgabe abgeschlossen ist, er selbst explizit freigegeben wurde und Terminalbereitschaft besteht. `TRANSFERRED` bedeutet weiterhin nur Byte-Übergabe, nie Ausführungsende; unklare Übergaben (`TRANSFER_UNCERTAIN`) sperren neue Sendevorgänge bis zur menschlichen Klärung und werden nie automatisch wiederholt. Eine „belegte Nichtzustellung“ gibt es nicht: fehlgeschlagene Schreibversuche bleiben ungewiss.
+
+Statt stiller Überschreibung öffnen konfliktauslösende Aktionen einen richtungsbezogenen Dialog mit neutralem, voreingestelltem „Abbrechen“:
+
+1. Terminal-Senden bei offener Rückgabe: „Ohne Rückgabe fortfahren und senden“ (Verzicht **nur** auf die Rückgabe; der Versand wird anschließend normal geprüft – schlägt er fehl, bleibt der Verzicht bestehen und wird nicht als Erfolg dargestellt), „Neuen Vorschlag verwerfen“ oder „Abbrechen“.
+2. Ausgabeprüfung bei belegtem Review-Bereich: „Vorschlag verwerfen und Ausgabe prüfen“ oder „Abbrechen“. Der Vorschlag wird dabei **zurückgelegt** und kann ohne erneute Bridge-Übernahme verlustfrei wiederhergestellt werden; das endgültige Verwerfen ist eine getrennte, bewusste Aktion.
+3. Vorschlagsprüfung bei aktiver Ausgabeprüfung: „Neuen Vorschlag prüfen“ (verlässt die Ausgabeprüfung **ohne** Verzicht – die Ausgabe bleibt für eine spätere Rückgabe erhalten) oder „Abbrechen“.
+
+Headless/CLI bilden dieselben Aktionen explizit ab: `resolve_stage_conflict(...)` mit den fünf Entscheidungen, `stage_conflict_info()`/`stage_conflict` als festes Konfliktergebnis, `take_return_review()`, `close_open_return()`, `resume_staged_proposal()`, `discard_pending_take()` und `note_output_binding()`. Die Observation `OUTPUT_REVIEWED` entsteht ausschließlich aus einer **bewussten** Bindungswahl in der Output-Zuordnung, nie aus dem automatischen Standardvorschlag und nie aus `approve()` allein; Freigabe-/Payloadbytes bleiben davon unberührt. Nach Controller-Neustart sind Stage, Pending-Übernahmen, Rücklage und offene Rückgabe flüchtig verloren (fail-closed, keine Phantomzustände); die Bridge-Fakten (`TAKEN`, `terminal_sent_at`, `output_shared_ever`, Rücknahme-Vermerke) bleiben dort maßgeblich und retention-begrenzt (24 h) erhalten.
 
 ## Tests und historischer Abnahmestand
 
