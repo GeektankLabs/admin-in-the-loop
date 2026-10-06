@@ -3172,5 +3172,169 @@ class BindingDisplayRegressionTests(unittest.TestCase):
         self.render()
         self.assertEqual(self.ui.binding_submission[self.ui.binding_value.get()], self.second)
 
+
+class PermissiveSendTests(unittest.TestCase):
+    """M2/#74: generous honest readiness labels; one explicit reviewed send suffices."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-permissive-")
+        self.addCleanup(self.temp.cleanup)
+        self.fixture = a.IntegrationFixture(self.temp.name)
+        self.addCleanup(self.fixture.close)
+        self.core = self.fixture.core
+
+    def test_shell_prompt_tail_classifies_as_prompt(self):
+        self.assertEqual(a.classify_input_tail(bytes(self.core.output.data[-64:])), "PROMPT")
+
+    def test_single_send_at_unknown_tail_without_override(self):
+        self.fixture.manual("IFS= read -r -p 'PERMISSIVE_WAIT: ' answer; printf '\\nPERM_DONE\\n'\n")
+        self.fixture.wait(lambda: self.core.output.data.endswith(b"PERMISSIVE_WAIT: "))
+        self.assertNotEqual(a.classify_input_tail(bytes(self.core.output.data[-64:])), "PROMPT")
+        item = self.core.review_command("answer", True)
+        # #74: readiness UNKNOWN never forces a second confirmation click.
+        self.core.approve(item.id)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
+                          and b"\r\nPERM_DONE\r\n" in self.core.output.data)
+        with self.assertRaises(a.ProbeError):
+            self.core.approve(item.id)
+
+    def test_password_tail_single_send_and_silent_relay(self):
+        self.fixture.manual("IFS= read -r -s -p 'Password: ' pw; printf '\\nPERM_PW_DONE\\n'; unset pw\n")
+        self.fixture.wait(lambda: self.core.output.data.endswith(b"Password: "))
+        self.assertEqual(a.classify_input_tail(bytes(self.core.output.data[-32:])), "PASSWORD")
+        secret = ("synthetic_" + uuid.uuid4().hex).encode()
+        item = self.core.review_command("program-input", True)
+        self.core.approve(item.id)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
+                          and b"\r\nPERM_PW_DONE\r\n" in self.core.output.data)
+        self.fixture.manual(b"IFS= read -r -s -p 'PERM_S: ' q; printf '\\nPERM_S_DONE\\n'\n")
+        self.fixture.wait(lambda: self.core.output.data.endswith(b"PERM_S: "))
+        self.fixture.manual(secret + b"\n")
+        self.fixture.wait(lambda: b"\r\nPERM_S_DONE\r\n" in self.core.output.data)
+        self.assertNotIn(secret, self.core.output.data)
+        self.assertNotIn(secret, self.fixture.transcript)
+
+
+class RiskSentPreservationTests(unittest.TestCase):
+    """M3/AC3: the bound risk result of THIS exact snapshot stays published across
+    CHECKING→TRANSFERRED/TRANSFER_UNCERTAIN – no reanalysis, no pin release;
+    revision/binding/payload mutations invalidate instead."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-risk-sent-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name).resolve()
+        self.work = self.directory / "work"
+        self.work.mkdir(mode=0o700)
+        self.core = a.AppCore()
+        self.core.session = "RISK_SENT_SESSION"
+        self.core.connection = "CONNECTED"
+        self.core.channel = mock.Mock()
+        self.core.channel.receive.return_value = []
+        self.addCleanup(self.core.close)
+
+    def fake_tool(self, bad=False):
+        # Private fixture analyzer pinned by its actual bytes; never upstream sh-guard.
+        binary = self.directory / ("fake-" + uuid.uuid4().hex)
+        source = "#!" + str(Path(sys.executable).resolve()) + "\n" + (
+            "import json, signal, sys, time\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            "    print('sh-guard 0.1.10')\n"
+            "    sys.exit(0)\n"
+            "command = sys.argv[7]\n"
+            "if command == 'hang-command\\n':\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+            + ("print('not JSON')\nsys.exit(0)\n" if bad else
+               "value = {'command': command, 'score': 0, 'level': 'safe',\n"
+               "         'quick_decision': 'safe', 'reason': 'Fixture', 'risk_factors': [],\n"
+               "         'sub_commands': [], 'pipeline_flow': None, 'mitre_mappings': [],\n"
+               "         'parse_confidence': 'full'}\n"
+               "print(json.dumps(value))\n"
+               "sys.exit(0)\n"))
+        binary.write_text(source)
+        binary.chmod(0o500)
+        raw = binary.read_bytes()
+        return a.CommandRiskTool(str(binary), hashlib.sha256(raw).hexdigest(), len(raw), "0.1.10", 1)
+
+    def until(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snapshot = self.core.command_risk_snapshot()
+            if predicate(snapshot):
+                return snapshot
+            time.sleep(0.01)
+        self.fail("risk_sent_deadline")
+
+    def test_result_preserved_across_sent_states_without_reanalysis(self):
+        self.core.review_command("printf x")
+        self.core.set_command_risk(self.fake_tool(), str(self.work))
+        first = self.until(lambda value: value.state == "RESULT").result
+        reviewer = self.core._command_risk
+        for state in ("CHECKING", "TRANSFERRED", "TRANSFER_UNCERTAIN", "TRANSFERRED"):
+            with self.subTest(state=state):
+                self.core.review_state = state
+                snapshot = self.core.command_risk_snapshot()
+                self.assertIs(snapshot.result, first)
+                self.assertEqual(snapshot.state, "RESULT")
+                self.assertIsNone(reviewer.pending)
+        # A new revision invalidates the published evidence and rescans exactly once.
+        self.core.review = replace(self.core.review, revision=self.core.review.revision + 1)
+        self.core.review_state = "REVIEW"
+        self.assertIsNone(self.core.command_risk_snapshot().result)
+        second = self.until(lambda value: value.state == "RESULT" and value.result is not first).result
+        self.assertNotEqual(second.key.revision, first.key.revision)
+        self.assertEqual(second.key.review_id, first.key.review_id)
+        # A payload mutation during a sent state never keeps stale evidence.
+        self.core.review_state = "TRANSFERRED"
+        self.core.review = replace(self.core.review, text="printf forged\n")
+        snapshot = self.core.command_risk_snapshot()
+        self.assertIsNone(snapshot.result)
+        # Rejection/clearing returns to IDLE without a published result.
+        self.core.review, self.core.review_state = None, "EMPTY"
+        snapshot = self.core.command_risk_snapshot()
+        self.assertEqual(snapshot.state, "IDLE")
+        self.assertIsNone(snapshot.result)
+
+    def test_inflight_scan_without_result_is_cancelled_at_send(self):
+        self.core.review_command("hang-command")
+        self.core.set_command_risk(self.fake_tool(), str(self.work))
+        self.until(lambda value: value.state == "SCANNING")
+        self.core.review_state = "CHECKING"
+        snapshot = self.core.command_risk_snapshot()
+        self.assertIsNone(snapshot.result)
+        self.assertEqual(snapshot.state, "STALE")
+        self.assertIsNone(self.core._command_risk.pending)
+        time.sleep(0.2)
+        # A late completion for the dropped job never publishes into the sent state.
+        snapshot = self.core.command_risk_snapshot()
+        self.assertIsNone(snapshot.result)
+
+    def test_unavailable_evidence_is_not_preserved_at_sent(self):
+        # Narrowed M3 semantics: only REAL results (colors/checked state) are
+        # preserved at sent states; UNAVAILABLE keeps the pre-M3 discard
+        # (frozen evidence semantics, test_command_risk.py parity).
+        self.core.review_command("printf x")
+        self.core.set_command_risk(self.fake_tool(bad=True), str(self.work))
+        snapshot = self.until(lambda value: value.state == "UNAVAILABLE")
+        self.assertEqual(snapshot.result.state, "UNAVAILABLE")
+        self.core.review_state = "CHECKING"
+        snapshot = self.core.command_risk_snapshot()
+        self.assertIsNone(snapshot.result)
+        self.assertEqual(snapshot.state, "STALE")
+
+    def test_direction_and_session_changes_invalidate_at_sent(self):
+        self.core.review_command("printf x")
+        self.core.set_command_risk(self.fake_tool(), str(self.work))
+        first = self.until(lambda value: value.state == "RESULT").result
+        self.core.review_state = "TRANSFERRED"
+        self.assertIs(self.core.command_risk_snapshot().result, first)
+        self.core.session = "OTHER_SESSION"
+        snapshot = self.core.command_risk_snapshot()
+        self.assertIsNone(snapshot.result)
+        self.assertEqual(snapshot.state, "STALE")
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))

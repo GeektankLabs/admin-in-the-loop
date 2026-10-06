@@ -1115,5 +1115,95 @@ class StageConflictDialogTests(unittest.TestCase):
         self.root.update()
         self.assertNotIn("Übertragung des vorherigen Befehls ungewiss", self.ui.review_status.get())
 
+
+class SentStylingUITests(unittest.TestCase):
+    """M3/#74: sent snapshots keep their marks and gain honest sent optics;
+    unknown tails show a non-blocking readiness hint; copy stays exact."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aitl-sent-ui-")
+        self.core = a.AppCore()
+        self.core.start_local(self.tmp.name)
+        self.root = tk.Tk()
+        self.ui = a.ReviewUI(self.root, self.core)
+        self.addCleanup(self.cleanup)
+        self.root.update()
+        self.ui.open_terminal()
+        self.until(lambda: self.core.connection == "CONNECTED")
+
+    def until(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.root.update()
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("sent_ui_timeout")
+
+    def cleanup(self):
+        try:
+            if self.core.connection == "CONNECTED" and self.core.channel:
+                review = self.core.review_command("exit", True)
+                self.core.approve(review.id)
+                self.until(lambda: self.core.connection == "DISCONNECTED", 3)
+        except Exception:
+            pass
+        self.core.close()
+        if self.ui.launcher and self.ui.launcher.poll() is None:
+            try:
+                self.ui.launcher.wait(timeout=2)
+            except Exception:
+                self.ui.launcher.terminate()
+        for callback in self.root.tk.call("after", "info"):
+            self.root.after_cancel(callback)
+        self.root.destroy()
+        self.tmp.cleanup()
+
+    def test_sent_optics_labels_and_exact_copy(self):
+        item = self.core.review_command("printf SENT_MARK", True)
+        self.until(lambda: self.core.review_state == "REVIEW" and "AI → Terminal" in self.ui.direction.get())
+        self.assertNotIn("Eingabezustand unklar", self.ui.review_status.get())
+        self.assertNotIn("gesendet", self.ui.direction.get())
+        self.core.approve(item.id)
+        self.until(lambda: self.core.review_state == "TRANSFERRED")
+        self.until(lambda: "Gesendet ins Terminal · Bytes übertragen" in self.ui.review_status.get())
+        self.assertIn("AI → Terminal", self.ui.direction.get())
+        self.assertIn("gesendet", self.ui.direction.get())
+        text = self.ui.editor.text
+        self.assertTrue(text.tag_ranges("sent"))
+        # Exact copy survives the sent state (presentation only, never payload).
+        text.tag_add("sel", "1.0", "end-1c")
+        self.ui.editor.copy_selection()
+        self.assertEqual(self.root.clipboard_get(), "printf SENT_MARK\n")
+        # A fresh review removes the sent optics again.
+        self.core.review_command("printf NEXT_MARK", True)
+        self.until(lambda: self.core.review_state == "REVIEW" and not text.tag_ranges("sent"))
+        self.assertNotIn("gesendet", self.ui.direction.get())
+
+    def test_unknown_tail_hint_is_honest_and_non_blocking(self):
+        first = self.core.review_command("IFS= read -r -p 'GUI_WAIT: ' x; printf '\\nGUI_DONE\\n'", True)
+        self.core.approve(first.id)
+        self.until(lambda: self.core.review_state == "TRANSFERRED")
+        self.until(lambda: bytes(self.core.output.data).endswith(b"GUI_WAIT: "))
+        self.core.review_command("answer", True)
+        self.until(lambda: "Eingabezustand unklar" in self.ui.review_status.get())
+        # #74: the honest hint never blocks the explicit reviewed send.
+        self.core.approve(self.core.review.id)
+        self.until(lambda: self.core.review_state == "TRANSFERRED"
+                   and b"\r\nGUI_DONE\r\n" in self.core.output.data)
+
+    def test_output_share_sent_labels(self):
+        review = self.core.review_command("printf SHARED_MARK", True)
+        self.core.approve(review.id)
+        self.until(lambda: self.core.review_state == "TRANSFERRED")
+        output = self.core.select_current_output()
+        self.core.approve(output.id)
+        self.until(lambda: self.core.review_state == "ACKNOWLEDGED_LOCAL")
+        self.until(lambda: "Output lokal freigegeben · keine AI-Übertragung" in self.ui.review_status.get())
+        self.assertIn("Terminal → AI", self.ui.direction.get())
+        self.assertIn("gesendet", self.ui.direction.get())
+        self.assertTrue(self.ui.editor.text.tag_ranges("sent"))
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))

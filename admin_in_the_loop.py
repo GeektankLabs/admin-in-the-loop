@@ -202,8 +202,9 @@ class ApprovalGate:
                 snapshot.generation == session.generation, "stale_session")
         require(not session.closed and session.proc.poll() is None, "shell_not_alive")
         session.pump()
-        if not session.prompt_hint() and not override:
-            raise OverrideRequired("prompt_unknown")
+        # M2/#74 (explicit operator decision): the reviewed explicit send suffices;
+        # prompt/manual-dirty uncertainty is an honest label, never a second-click
+        # gate. Delivery-uncertainty interlocks (W2) are separate and stay blocking.
         # Consume BEFORE the first write. Failure must not make this reusable.
         self.states[snapshot.id] = "TRANSFERRING"
         self.offsets[snapshot.id] = session.output.end
@@ -214,6 +215,39 @@ class ApprovalGate:
             raise ProbeError("transfer_uncertain") from None
         self.states[snapshot.id] = "TRANSFERRED"
         return count
+
+
+def classify_input_tail(data: bytes) -> str:
+    """Generous passive classification of a terminal tail (M2/#74, hint only).
+
+    Returns "PROMPT" | "PASSWORD" | "CONTINUATION" | "UNKNOWN". This never proves
+    that a shell can safely execute; it only labels what the visible tail looks
+    like after stripping standard escape noise (CSI, OSC with BEL/ST or dangling
+    partial, two-byte Fe sequences), resolving CR redraws and backspaces.
+    """
+    tail = bytes(data[-2048:])
+    tail = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", b"", tail)   # OSC (incl. partial)
+    tail = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]?", b"", tail)             # CSI (incl. partial)
+    tail = re.sub(rb"\x1b[@-Z\\-_]", b"", tail)                        # other Fe escapes
+    lines = [segment for segment in re.split(rb"[\r\n]", tail) if segment.strip(b" \t")]
+    if not lines:
+        return "UNKNOWN"
+    line = lines[-1]
+    while b"\x08" in line:  # collapse backspace overwrites
+        index = line.index(b"\x08")
+        line = (line[:index - 1] if index else b"") + line[index + 1:]
+    line = line.rstrip()
+    if not line or len(line) > 512:
+        return "UNKNOWN"
+    lowered = line.lower()
+    if lowered.endswith(b":") and re.search(
+            rb"pass(word|wort|phrase|code|key)|kennwort|secret|otp|token", lowered):
+        return "PASSWORD"
+    if line[-1:] in (b"$", b"#", b"%"):
+        return "PROMPT"
+    if line[-1:] == b">":
+        return "CONTINUATION"
+    return "UNKNOWN"
 
 
 class PtySession:
@@ -302,15 +336,13 @@ class PtySession:
         return self.output.snapshot(start)
 
     def prompt_hint(self) -> bool:
-        # Deliberately soft. A program can emit this exact visual pattern.
+        # Deliberately soft. A program can emit this exact visual pattern, and a
+        # missing hint never blocks the explicit human send (#74); it only feeds
+        # the honest readiness label. Password/continuation tails are excluded
+        # from the positive hint on purpose (labeled separately in the UI).
         if self.closed or self.eof or self.proc.poll() is not None:
             return False
-        # Readline also disables kernel ECHO at a normal shell prompt.
-        # ECHO cannot distinguish this from a password request.
-        tail = bytes(self.output.data[-512:])
-        # Small prompt hint only, NOT a full terminal sanitizer or screen model.
-        tail = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", tail)
-        return bool(re.search(rb"(?:^|[\r\n])[^\r\n\x1b]{0,200}[$#%] $", tail))
+        return classify_input_tail(bytes(self.output.data[-2048:])) == "PROMPT"
 
     def write_transient(self, payload: bytes, *, writer=None,
                         timeout: float = 2) -> int:
@@ -522,7 +554,20 @@ def test_echo_on_positive_control(directory):
         require(password in s.output.snapshot(start).data, "positive_echo_control_failed")
 
 
-def test_prompt_override_and_false_positive(directory):
+def test_prompt_classification_and_single_send(directory):
+    # Pure classifier contract: generous, honest, never claims executable safety.
+    require(classify_input_tail(b"user@host:~$ ") == "PROMPT", "plain_bash_prompt")
+    require(classify_input_tail(b"\x1b]0;title\x07user@host:~$ ") == "PROMPT", "osc_stripped")
+    require(classify_input_tail(b"\x1b[01;32mu@h\x1b[00m:~$ ") == "PROMPT", "csi_stripped")
+    require(classify_input_tail(b"old\ruser@host:~$ ") == "PROMPT", "cr_redraw")
+    require(classify_input_tail(b"host:~xx\x08\x08$ ") == "PROMPT", "backspace_collapse")
+    require(classify_input_tail(b"user@host ~ % ") == "PROMPT", "zsh_percent")
+    require(classify_input_tail(b"root@host# ") == "PROMPT", "hash_root")
+    require(classify_input_tail(b"user@host ~> ") == "CONTINUATION", "gt_tail")
+    require(classify_input_tail(b"user@host password: ") == "PASSWORD", "password_tail")
+    require(classify_input_tail(b"Enter passphrase for key 'id': ") == "PASSWORD", "passphrase_tail")
+    require(classify_input_tail(b"some running output ") == "UNKNOWN", "unknown_tail")
+    require(classify_input_tail(b"") == "UNKNOWN", "empty_tail")
     with PtySession(directory) as s:
         gate = ApprovalGate()
         start = s.output.end
@@ -530,11 +575,11 @@ def test_prompt_override_and_false_positive(directory):
         s.wait_until(lambda: s.output.snapshot(start).data.endswith(b"AITL_WAIT: "))
         require(not s.prompt_hint(), "unexpected_hint")
         item = gate.stage(s, "test-input", True)
-        expect_error(lambda: gate.approve(s, item), "prompt_unknown")
-        require(gate.states[item.id] == "REVIEW", "override_consumed_early")
-        gate.approve(s, item, override=True)
+        # #74: one explicit reviewed send suffices; no second-click override loop.
+        gate.approve(s, item)
         s.wait_for(b"\r\nWAIT_DONE\r\n", start=start)
-        s.wait_until(lambda: s.output.snapshot().data.endswith(PROMPT))
+        require(gate.states[item.id] == "TRANSFERRED", "single_send_state")
+        expect_error(lambda: gate.approve(s, item), "approval_already_consumed")
         start = s.output.end
         s.write_transient(b"IFS= read -r -p 'FAKE$ ' answer; printf '\\nFAKE_DONE\\n'; unset answer\n")
         s.wait_until(lambda: s.output.snapshot(start).data.endswith(b"FAKE$ "))
@@ -696,7 +741,7 @@ TESTS = [
     ("internal_newlines_execute", test_multiline_internal_return),
     ("password_echo_off", test_password_echo_off),
     ("echo_on_positive_control", test_echo_on_positive_control),
-    ("prompt_override_and_false_positive", test_prompt_override_and_false_positive),
+    ("prompt_classification_and_single_send", test_prompt_classification_and_single_send),
     ("resize_and_sigwinch", test_resize_and_signal),
     ("ctrl_c_foreground_interrupt", test_ctrl_c),
     ("output_offset_background_and_frozen_selection", test_output_offset_and_snapshot),
@@ -1000,8 +1045,11 @@ def helper_transfer(session, request, consumed, manual_dirty):
     require(identifier not in consumed, "approval_already_consumed")
     require(len(consumed) < 1000, "session_transfer_limit")
     session.pump()
-    if (manual_dirty or not session.prompt_hint()) and not request["override"]:
-        return {"type": "result", "id": identifier, "state": "OVERRIDE_REQUIRED", "offset": session.output.end}
+    # M2/#74 (explicit operator decision): one reviewed explicit send is sufficient.
+    # Prompt/manual-dirty uncertainty no longer requires a second confirmation; it
+    # remains an honest controller-side label. `override` stays in the frozen payload
+    # schema but is no longer load-bearing. W2 delivery-uncertainty interlocks live
+    # in AppCore and remain blocking; this is prompt readiness only.
     consumed.add(identifier)  # Before any bytes, including a failing write.
     offset = session.output.end
     try:
@@ -2468,26 +2516,42 @@ class CommandRiskReviewer:
             self.thread = threading.Thread(target=self._run, name="aitl-command-risk", daemon=True)
             self.thread.start()
 
+    def _review_key(self, review):
+        self._owner()
+        return CommandRiskKey(self.epoch, self.tool, review.id, review.revision, review.direction,
+                              review.session, review.bridge_binding, review.proposal_id,
+                              review.expires_at, review.final_return,
+                              hashlib.sha256(review.payload).hexdigest())
+
     def poll(self, review, review_state, connection, session, bridge_binding):
         self._owner()
-        eligible = (self.enabled and review is not None and review.direction == "TO_TERMINAL"
-                    and review_state in {"REVIEW", "OVERRIDE_REQUIRED"} and connection == "CONNECTED"
-                    and review.session == session
-                    and (review.bridge_binding is None or review.bridge_binding == bridge_binding)
-                    and (review.expires_at is None or time.time() < review.expires_at))
-        if not eligible:
+        bound = (self.enabled and review is not None and review.direction == "TO_TERMINAL"
+                 and connection == "CONNECTED"
+                 and review.session == session
+                 and (review.bridge_binding is None or review.bridge_binding == bridge_binding)
+                 and (review.expires_at is None or time.time() < review.expires_at))
+        eligible = bound and review_state in {"REVIEW", "OVERRIDE_REQUIRED"}
+        # M3/AC3: the already-published REAL result (risk colors/checked state,
+        # state == "RESULT") of THIS exact snapshot (id, revision, payload hash,
+        # binding, epoch) stays published across CHECKING→TRANSFERRED/
+        # TRANSFER_UNCERTAIN – no reanalysis, no pin release, no new job; any
+        # mutation, expiry or binding change invalidates instead. UNAVAILABLE/
+        # UNKNOWN carry no colors/checked state and keep the pre-M3 discard at
+        # sent states (frozen evidence semantics, test_command_risk.py).
+        sent_keep = (bound and review_state in {"CHECKING", "TRANSFERRED", "TRANSFER_UNCERTAIN"}
+                     and self.result is not None and self.result.state == "RESULT"
+                     and _risk_review_valid(review)
+                     and self.result.key == self._review_key(review))
+        if not eligible and not sent_keep:
             self.invalidate()
             if self.enabled and (review is None or review.direction != "TO_TERMINAL"):
                 self.state = "IDLE"
-        else:
+        elif eligible:
             if not _risk_review_valid(review):
                 self.invalidate()
                 self.state = "UNAVAILABLE"
                 return CommandRiskSnapshot(self.state, error="risk_snapshot")
-            key = CommandRiskKey(self.epoch, self.tool, review.id, review.revision, review.direction,
-                                 review.session, review.bridge_binding, review.proposal_id,
-                                 review.expires_at, review.final_return,
-                                 hashlib.sha256(review.payload).hexdigest())
+            key = self._review_key(review)
             if key != self.current:
                 self.invalidate()
                 self.current, self.state = key, "SCANNING"
@@ -5738,6 +5802,12 @@ def _logo_variant(root, background):
     return "light" if sum(rgb) > 384 else "dark"
 
 
+# M3: review states in which an approved snapshot counts as "sent". Risk colors
+# and checked state of the bound result stay published across these states;
+# only the optics and labels change (no reanalysis, no pin release).
+SENT_REVIEW_STATES = frozenset({"TRANSFERRED", "TRANSFER_UNCERTAIN", "ACKNOWLEDGED", "ACKNOWLEDGED_LOCAL"})
+
+
 class ReviewUI:
     """Three columns; immutable tagged review. Context editing creates a new revision."""
     def __init__(self, root, core):
@@ -6100,6 +6170,25 @@ class ReviewUI:
             self.action(lambda: self.core.request_command_risk(False))
             self.action(self.core.remove_command_risk)
 
+    def _apply_sent_styling(self, sent):
+        """M3: mark the whole sent snapshot; risk colors and control marks stay
+        readable on top (checked state and colors are preserved, not reanalyzed)."""
+        text = self.editor.text
+        text.configure(state="normal")
+        if sent:
+            light = sum(text.winfo_rgb(text.cget("background"))) > 3 * 32768
+            text.tag_configure("sent", foreground="#2f6b45" if light else "#7fd8a0")
+            text.tag_add("sent", "1.0", "end-1c")
+            for tag in ("control", "warning"):
+                text.tag_raise(tag, "sent")
+            for tag in text.tag_names():
+                if tag.startswith("risk-sub-"):
+                    text.tag_raise(tag, "sent")
+        else:
+            text.tag_remove("sent", "1.0", "end-1c")
+        text.tag_raise("sel")
+        text.configure(state="disabled")
+
     def _render_command_risk(self, snapshot, command):
         risk = snapshot.command_risk
         self.risk_enabled.set(self.core.risk_requested or self.core._command_risk.enabled)
@@ -6126,13 +6215,15 @@ class ReviewUI:
         self.risk_status.set(status)
         if risk.state != "RESULT":
             spans = ()
-        key = (snapshot.review, risk, spans)
+        sent = snapshot.review is not None and snapshot.review_state in SENT_REVIEW_STATES
+        key = (snapshot.review, risk, spans, sent)
         if key != self.risk_render_key:
             self.copy_notice.set("")
             for tag in self.editor.text.tag_names():
                 if tag.startswith("risk-sub-"):
                     self.editor.text.tag_delete(tag)
             self.editor.show_review(snapshot.review.text if snapshot.review else "", spans)
+            self._apply_sent_styling(sent)
             if self.risk_dialog and self.risk_dialog.winfo_exists():
                 def plain(value):
                     if isinstance(value, (dict, MappingProxyType)):
@@ -6478,6 +6569,8 @@ class ReviewUI:
         self.direction.set("AI → Terminal" if command else "Terminal → AI" if review else "")
         if review and review.edited:
             self.direction.set(self.direction.get() + " · lokal bearbeitet")
+        if review and snapshot.review_state in SENT_REVIEW_STATES:
+            self.direction.set(self.direction.get() + " · gesendet")
         self.approve_button.configure(text="← Freigeben ins Terminal" if command else "Freigeben an AI →" if review else "Freigeben",
                                        state="normal" if active and not snapshot.paused else "disabled")
         if snapshot.review_state == "DELIVERY_UNCERTAIN":
@@ -6486,15 +6579,24 @@ class ReviewUI:
         self.reject_button.configure(state="normal" if active else "disabled")
         messages = {"EMPTY": "", "REVIEW": "", "CHECKING": "Übertragung wird geprüft…",
                     "TAKE_PENDING": "Übernahme wird bestätigt…",
-                    "OVERRIDE_REQUIRED": "Prompt nicht erkannt · zusätzliche Bestätigung erforderlich",
-                    "TRANSFERRED": "Text übertragen", "TRANSFER_UNCERTAIN": "Übertragung ungewiss · keine Wiederholung",
-                    "ACKNOWLEDGED_LOCAL": "Output lokal freigegeben · keine AI-Verbindung",
-                    "SENDING": "Freigegebenen Output zustellen…", "ACKNOWLEDGED": "Output an Bridge zugestellt",
+                    "OVERRIDE_REQUIRED": "Zusätzliche Bestätigung erforderlich",
+                    "TRANSFERRED": "Gesendet ins Terminal · Bytes übertragen",
+                    "TRANSFER_UNCERTAIN": "Übertragung ungewiss · keine Wiederholung",
+                    "ACKNOWLEDGED_LOCAL": "Output lokal freigegeben · keine AI-Übertragung",
+                    "SENDING": "Freigegebenen Output zustellen…",
+                    "ACKNOWLEDGED": "Output geteilt · Bridge bestätigt",
                     "DELIVERY_UNCERTAIN": "Zustellung ungewiss · nur derselbe freigegebene Output darf erneut zugestellt werden",
                     "REJECTED": "Verworfen", "STALE": "Review nicht mehr gültig"}
         message = messages.get(snapshot.review_state, snapshot.review_state)
         if command and "\n" in review.text.rstrip("\n"):
             message += " | Interne Returns können bereits Befehle ausführen"
+        # M2/#74: honest non-blocking readiness label; never blocks the explicit send.
+        if command and snapshot.review_state in {"REVIEW", "OVERRIDE_REQUIRED", "CHECKING"} \
+                and connected:
+            readiness = classify_input_tail(bytes(self.core.output.data[-2048:]))
+            message += {"PASSWORD": " | Passwort-/Passphrase-Abfrage möglich · Eingabezustand unklar",
+                        "CONTINUATION": " | Fortsetzung oder >-Prompt möglich · Eingabezustand unklar",
+                        "UNKNOWN": " | Eingabezustand unklar"}.get(readiness, "")
         if review and review.lost_prefix:
             message += " | Früherer Output fehlt"
         if snapshot.last_error:
@@ -6718,26 +6820,31 @@ class LocalIntegrationTests(unittest.TestCase):
         self.fixture.wait(lambda: self.core.output.data.endswith(b"LOCAL_PASSWORD: "))
         secret = ("synthetic_" + uuid.uuid4().hex).encode()
         item = self.core.review_command("program-input", True)
+        # #74: the password-like tail stays an honest label, never a send blocker;
+        # one explicit reviewed send suffices and read -s consumes it silently.
+        self.assertNotEqual(classify_input_tail(bytes(self.core.output.data[-64:])), "PROMPT")
         self.core.approve(item.id)
-        self.fixture.wait(lambda: self.core.review_state == "OVERRIDE_REQUIRED")
-        self.core.reject(item.id)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
+                          and b"\r\nPW_DONE\r\n" in self.core.output.data)
+        self.fixture.manual(b"IFS= read -r -s -p 'SECRET: ' q; printf '\\nS_DONE\\n'\n")
+        self.fixture.wait(lambda: self.core.output.data.endswith(b"SECRET: "))
         self.fixture.manual(secret + b"\n")
-        self.fixture.wait(lambda: b"\r\nPW_DONE\r\n" in self.core.output.data)
+        self.fixture.wait(lambda: b"\r\nS_DONE\r\n" in self.core.output.data)
         self.assertNotIn(secret, self.core.output.data)
         self.assertNotIn(secret, self.fixture.transcript)
         selection = self.core.select_output()
         self.assertNotIn(secret.decode(), selection.text)
         self.assertFalse(self.core.snapshot().approved_outputs)
 
-    def test_unknown_prompt_override_and_cancel(self):
+    def test_unknown_prompt_single_send(self):
         self.fixture.manual("IFS= read -r -p 'UNKNOWN: ' answer; printf '\\nREAD_DONE\\n'\n")
         self.fixture.wait(lambda: self.core.output.data.endswith(b"UNKNOWN: "))
         item = self.core.review_command("answer", True)
+        # #74: readiness UNKNOWN is honest but never blocks the explicit send.
+        self.assertNotEqual(classify_input_tail(bytes(self.core.output.data[-64:])), "PROMPT")
         self.core.approve(item.id)
-        self.fixture.wait(lambda: self.core.review_state == "OVERRIDE_REQUIRED")
-        self.assertNotIn(b"\r\nREAD_DONE\r\n", self.core.output.data)
-        self.core.approve(item.id, override=True)
-        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED" and b"\r\nREAD_DONE\r\n" in self.core.output.data)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
+                          and b"\r\nREAD_DONE\r\n" in self.core.output.data)
 
     def test_multiline_and_no_final_enter(self):
         item = self.fixture.approve_command(": > first-line\n: > last-line", False)
