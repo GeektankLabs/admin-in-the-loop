@@ -1248,7 +1248,7 @@ class QrexecDialogTests(unittest.TestCase):
         self.assertFalse(dialog.qrexec_panel.winfo_ismapped())
         self.assertEqual(self.callbacks, [])
 
-    def test_qrexec_guidance_policy_and_own_forwarder_wiring(self):
+    def test_bridge_first_order_check_gate_and_last_pairing(self):
         dialog = self.open_dialog(True)
         values = [str(button.cget("value")) for button in dialog.location_buttons]
         self.assertEqual(values, ["LOCAL", "QREXEC", "REMOTE"])
@@ -1256,46 +1256,72 @@ class QrexecDialogTests(unittest.TestCase):
         self.root.update()
         self.assertTrue(dialog.qrexec_panel.winfo_ismapped())
         self.assertFalse(dialog.remote.winfo_ismapped())
-        self.assertFalse(dialog.local.winfo_ismapped())
-        # Exact narrow policy line for the ONE-TIME manual dom0 entry.
-        dialog.fields["qrexec_target"].set("untrusted")
+        # Step 1 is the bridge in the target qube: exact command, no policy-first.
+        self.assertEqual(dialog.qrexec_command_box.text.get("1.0", "end-1c").strip(),
+                         "python3 ./admin_in_the_loop.py --bridge")
+        self.assertEqual(dialog.qrexec_help.winfo_manager(), "")
+        self.assertIn("Noch nicht geprüft", dialog.qrexec_status.get())
+        dialog.buttons["qrexec_copy_command"].invoke()
+        self.assertEqual(self.root.clipboard_get(), a.qrexec_first_start_command())
+        # Possible-cause failure: honest help with the exact policy line, no blanket claim.
+        fail = {"phase": "qrexec_target_unreachable", "reachable": False, "observed_pin": None}
+        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=fail):
+            dialog.fields["qrexec_target"].set("untrusted")
+            self.root.update()
+            dialog.buttons["qrexec_check"].invoke()
+        self.assertNotEqual(dialog.qrexec_help.winfo_manager(), "")
+        self.assertIn("qubes.ConnectTCP +8443 personal untrusted allow",
+                      dialog.qrexec_policy_box.text.get("1.0", "end-1c"))
+        self.assertIn("Mögliche", dialog.qrexec_status.get())
+        self.assertNotEqual(dialog.errors["bridge"].get(), "Policy fehlt.")
+        # Same primary action again with an existing grant: passes, help disappears.
+        ok = {"phase": "bridge_reachable", "reachable": True, "observed_pin": "ab" * 32}
+        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=ok):
+            dialog.buttons["qrexec_check"].invoke()
+        self.assertEqual(dialog.qrexec_help.winfo_manager(), "")
+        self.assertIn("Erreichbarkeit belegt", dialog.qrexec_status.get())
+        self.assertIn("weder Vertrauensbestätigung noch fertige Kopplung", dialog.qrexec_status.get())
+        # Pairing remains the deliberate LAST step with a manual pin entry.
+        self.core.qrexec_forwarder = mock.Mock(running=True)
         self.root.update()
-        policy = dialog.qrexec_policy_box.text.get("1.0", "end-1c")
-        self.assertIn("qubes.ConnectTCP +8443 personal untrusted allow", policy)
-        dialog.buttons["qrexec_copy_policy"].invoke()
-        self.assertEqual(self.root.clipboard_get(),
-                         "qubes.ConnectTCP +8443 personal untrusted allow")
-        # Pairing without the own running forwarder is impossible.
         self.assertTrue(dialog.buttons["qrexec_pair"].instate(["disabled"]))
-        with mock.patch.object(self.core, "start_qrexec_forwarder") as start:
-            dialog.buttons["qrexec_start"].invoke()
-        start.assert_called_once_with("untrusted", 8443)
-        self.assertIn("Weiterleitung: gestoppt", dialog.qrexec_status.get())
-        self.assertIn("Policy/Bridge/TLS/Auth", dialog.qrexec_status.get())
-        # With a running own forwarder, comparison and code: deliberate pairing only.
-        self.core.qrexec_forwarder = mock.Mock(running=True, status=mock.Mock(return_value={
-            "forwarder_running": True, "local_listener": True, "target": "untrusted", "port": 8443}))
-        dialog.fields["qrexec_pin"].set("0" * 64)
+        dialog.buttons["qrexec_reveal"].invoke()  # disabled before comparison confirmation
         dialog.fields["qrexec_code"].set("ABCD-EFGH-JKMN")
         dialog.compared.set(True)
         self.root.update()
+        self.assertTrue(dialog.buttons["qrexec_reveal"].instate(["!disabled"]))
+        dialog.buttons["qrexec_reveal"].invoke()
+        self.assertIn("Beobachteter SPKI: " + "ab" * 32, dialog.qrexec_status.get())
+        self.assertEqual(dialog.fields["qrexec_pin"].get(), "")  # never prefilled
+        self.root.update()
         self.assertTrue(dialog.buttons["qrexec_pair"].instate(["!disabled"]))
+        with self.assertRaises(a.ProbeError) as missing_pin:
+            dialog.pair_qrexec()  # missing manual pin: rejected before any network action
+        self.assertEqual(str(missing_pin.exception), "verified_pin_required")
         with mock.patch.object(self.core, "begin_pair_remote") as pair:
-            dialog.buttons["qrexec_pair"].invoke()
-        pair.assert_called_once_with("https://127.0.0.1:8443", "0" * 64, "ABCD-EFGH-JKMN")
-        self.assertEqual(dialog.fields["qrexec_code"].get(), "")  # code field cleared, never logged
+            dialog.fields["qrexec_pin"].set("ab" * 32)  # editing the pin re-arms the guard
+            self.assertFalse(dialog.compared.get())
+            dialog.compared.set(True)
+            self.root.update()
+            dialog.pair_qrexec()
+        pair.assert_called_once_with("https://127.0.0.1:8443", "ab" * 32, "ABCD-EFGH-JKMN")
+        self.assertEqual(dialog.fields["qrexec_code"].get(), "")  # code cleared, never logged
+        # Target edits invalidate the previous proof; retry is the same action again.
+        dialog.fields["qrexec_target"].set("other-vm")
+        self.root.update()
+        self.assertFalse(dialog.qrexec_verified)
+        self.assertTrue(dialog.buttons["qrexec_pair"].instate(["disabled"]))
         self.assertEqual(self.callbacks, [])
 
-    def test_invalid_target_yields_field_specific_guidance(self):
+    def test_invalid_target_yields_field_specific_error_via_primary_action(self):
         dialog = self.open_dialog(True)
         dialog.location.set("QREXEC")
         dialog.fields["qrexec_target"].set("bad name")
         self.root.update()
         self.assertIn("Ziel-Qube-Namen eingeben", dialog.qrexec_policy_box.text.get("1.0", "end-1c"))
-        with mock.patch.object(self.core, "start_qrexec_forwarder",
-                               side_effect=a.ProbeError("invalid_qube_name")):
-            dialog.buttons["qrexec_start"].invoke()
+        dialog.buttons["qrexec_check"].invoke()
         self.assertIn("Qube-Name", dialog.errors["bridge"].get())
+        self.assertFalse(dialog.qrexec_verified)
         self.assertEqual(self.callbacks, [])
 
 

@@ -2956,6 +2956,54 @@ def qrexec_policy_line(source, target, port=8443):
         port, validate_qube_name(source) if source else "personal", validate_qube_name(target))
 
 
+def qrexec_first_start_command():
+    """M9 Folgeanpassung (bridge-first): the exact target-qube start command shown
+    in the dialog. It contains no secrets, asks for no App-ID and no manual
+    absolute paths; all first-start configuration is automatic on the bridge side."""
+    return "python3 ./admin_in_the_loop.py --bridge"
+
+
+def bridge_reachability(url, timeout=6):
+    """M9 Folgeanpassung: unauthenticated reachability proof through the forwarder –
+    real TCP connect + TLS handshake + expected denial of the authenticated endpoint.
+    Returns the observed SPKI fingerprint for the human's INDEPENDENT comparison
+    only: reaching the bridge proves neither certificate trust nor a finished
+    pairing, and no credential is ever sent here."""
+    parsed = urlsplit(url)
+    require(parsed.scheme == "https" and parsed.hostname and parsed.port, "invalid_bridge_url")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE  # observation only; pinning stays a human decision
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=timeout) as raw:
+            raw.settimeout(timeout)
+            try:
+                with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
+                    der = tls.getpeercert(True)
+                    tls.sendall(b"GET /v1/status HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n"
+                                % (parsed.hostname.encode(), parsed.port))
+                    data = tls.recv(512)
+            except ssl.SSLEOFError:
+                raise ProbeError("qrexec_target_unreachable") from None
+            except ssl.SSLError:
+                raise ProbeError("tls_handshake_failed") from None
+    except (socket.timeout, ConnectionError, OSError):
+        # Own forwarder listener accepted, then nothing answered: this proves the
+        # qrexec path failed, NOT which cause – policy open vs target/bridge down.
+        raise ProbeError("qrexec_target_unreachable") from None
+    require(data.startswith(b"HTTP/1.1 ") and (b" 401" in data[:16] or b" 403" in data[:16]),
+            "qrexec_target_unreachable")
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        spki = (x509.load_der_x509_certificate(der).public_key()
+                .public_bytes(serialization.Encoding.DER,
+                              serialization.PublicFormat.SubjectPublicKeyInfo))
+    except ImportError:
+        raise ProbeError("cryptography_package_required") from None
+    return hashlib.sha256(spki).hexdigest()
+
+
 class QrexecForwarder:
     """M9: Main manages ONLY its own qvm-connect-tcp forwarder: single instance,
     never adopts or kills foreign processes, clean shutdown, restart recovery from
@@ -4208,6 +4256,40 @@ class AppCore:
     def qrexec_status(self):
         return self.qrexec_forwarder.status()
 
+    def verify_qrexec_connection(self, target, port=8443):
+        """M9 Folgeanpassung (bridge-first, operator decision comment_59567351-…): the
+        ONE primary action idempotently ensures Main's own forwarder and then proves
+        real unauthenticated bridge reachability through it. Distinguishes evidenced
+        failures (tool missing, foreign listener, forwarder exit, no TLS service,
+        pinned-certificate change) from possible causes (open policy vs target/bridge
+        down) and never claims 'policy missing' as a blanket verdict. Re-running the
+        same action after a manual fix is the retry; existing grants pass silently.
+        Reachability is neither trust confirmation nor pairing; foreign processes are
+        never adopted or killed."""
+        require(self.connection_store is not None, "connection_store_required")
+        target = validate_qube_name(target)
+        require(type(port) is int and 1 <= port <= 65535, "invalid_port")
+        forwarder = self.qrexec_forwarder
+        if forwarder.running and (forwarder.target, forwarder.port) != (target, port):
+            forwarder.stop()
+        if not forwarder.running:
+            try:
+                self.start_qrexec_forwarder(target, port)  # idempotent; persists config
+            except ProbeError as exc:
+                return {"phase": str(exc), "reachable": False, "observed_pin": None}
+        url = "https://127.0.0.1:%d" % port
+        try:
+            observed = bridge_reachability(url)
+        except ProbeError as exc:
+            return {"phase": str(exc), "reachable": False, "observed_pin": None}
+        saved = self.saved_connection or {}
+        record = saved.get("profile")
+        if record and record["url"].rstrip("/") == url and record["pin"]:
+            # A changed certificate is evidenced here; silent trust is impossible.
+            if not hmac.compare_digest(record["pin"], observed):
+                return {"phase": "pin_mismatch", "reachable": False, "observed_pin": observed}
+        return {"phase": "bridge_reachable", "reachable": True, "observed_pin": observed}
+
     def begin_local_setup(self, tunnel_id, api_key):
         require(self.connection_store is not None, "connection_store_required")
         require(self.local_setup is None and self.local_pending is None
@@ -5280,48 +5362,66 @@ class ConnectionDialog:
         comparison.grid(row=12, column=0, columnspan=2, sticky="ew", pady=6)
         self.button(self.remote, 13, "pair", "Koppeln und speichern", "bridge", self.pair)
         self.button(self.remote, 14, "saved_connect", "Gespeicherte Remote-Verbindung öffnen", "bridge", self.open_saved)
-        # M9 Qrexec panel: one coherent guided flow – policy (manual dom0) → own
-        # forwarder → real connection check → pairing. Binding alone is no success.
+        # M9 Folgeanpassung (bridge-first, comment_59567351-…): prepare the bridge in
+        # the target qube FIRST; then ONE primary "Verbindung prüfen" action that
+        # idempotently starts the own forwarder and proves real reachability; the
+        # policy/dom0 guidance appears only when actually needed; pairing with full
+        # fingerprint comparison deliberately comes last. One coherent adaptive
+        # dialog – same action re-run as "Erneut prüfen", no wizard pages.
         self.qrexec_panel = qrexec = self.ttk.Frame(bridge_section)
         qrexec.grid(row=0, column=0, sticky="ew")
         qrexec.columnconfigure(1, weight=1)
         qrexec_saved = bool(saved.get("qrexec"))
         qrexec_cfg = saved.get("qrexec") or {}
-        self.label(qrexec, 0, "Qubes erkannt. Im Ziel-Qube dieselbe Python-Datei mit --bridge starten; State, "
-                   "Konfiguration und TLS liegen dort dauerhaft privat unter ~/.local/state/aitl-bridge "
-                   "(Skript-Updates z. B. in Downloads verlieren sie nicht). Reihenfolge: 1. Policy-Zeile einmalig "
-                   "manuell in dom0 speichern → 2. eigene Weiterleitung hier starten → 3. tatsächlich koppeln/"
-                   "verbinden. Lokales Binding allein beweist keine Qrexec-Freigabe.")
-        source = source_qube_name()
-        self.label(qrexec, 1, "Quell-Qube: " + (source if source else
-                   "unbekannt – Platzhalter „personal“ in der Policy-Zeile anpassen"))
-        self.entry(qrexec, 2, "qrexec_target", "Ziel-Qube", qrexec_cfg.get("target", ""))
-        self.entry(qrexec, 3, "qrexec_port", "Port", str(qrexec_cfg.get("port", 8443)))
-        self.qrexec_policy_box = ScrollableText(qrexec, readonly=True, height=2)
-        self.qrexec_policy_box.frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=6)
-        self.button(qrexec, 5, "qrexec_copy_policy", "Policy-Zeile kopieren (für dom0 Qubes Policy Editor)",
+        self.qrexec_verified = False
+        self.qrexec_observed_pin = None
+        self.qrexec_help_visible = False
+        self.label(qrexec, 0, "1 · Bridge im Ziel-Qube bereitstellen. Dieselbe Python-Datei in den Ziel-Qube "
+                   "übertragen (z. B. qvm-copy oder eigener Weg – es gibt keine geprüfte Release-URL, diese "
+                   "Datei ist die Distribution) und dort exakt starten:")
+        self.qrexec_command_box = ScrollableText(qrexec, readonly=True, height=1)
+        self.qrexec_command_box.frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=6)
+        self.qrexec_command_box.show(((qrexec_first_start_command(), "plain"),))
+        self.button(qrexec, 2, "qrexec_copy_command", "Startbefehl kopieren", "bridge", self.copy_qrexec_command)
+        self.label(qrexec, 3, "Die Erstkonfiguration läuft dort automatisch: State/Config/TLS privat unter "
+                   "~/.local/state/aitl-bridge, SAN und nutzbare URLs automatisch, keine App-ID-Pflicht, keine "
+                   "Angaben in Chat/Argumenten/Logs. Tunnel-/Runtime-Angaben gehören zur Bridge-Umgebung und "
+                   "werden nur gefordert, wenn dort noch kein Tunnel besteht; eine bestehende Konfiguration wird "
+                   "wiederverwendet. Die Bridge-Konsole zeigt SPKI-Fingerprint und – beim Erststart – einen "
+                   "zweiminütigen Einmal-Code; bei Ablauf bewusst mit --pair neu erzeugen (Limits bleiben).")
+        self.entry(qrexec, 4, "qrexec_target", "Ziel-Qube", qrexec_cfg.get("target", ""))
+        self.entry(qrexec, 5, "qrexec_port", "Port", str(qrexec_cfg.get("port", 8443)))
+        self.button(qrexec, 6, "qrexec_check", "Verbindung prüfen", "bridge", self.verify_qrexec)
+        self.button(qrexec, 7, "qrexec_stop", "Weiterleitung beenden", "bridge", self.stop_qrexec)
+        self.qrexec_status = self.tk.StringVar(master=self.window, value="2 · Noch nicht geprüft – „Verbindung prüfen“ startet, falls nötig, die eigene Weiterleitung idempotent und prüft die echte Erreichbarkeit der Bridge.")
+        self.label(qrexec, 8, variable=self.qrexec_status)
+        self.qrexec_help = self.ttk.Frame(qrexec)
+        self.qrexec_help.grid(row=9, column=0, columnspan=2, sticky="ew")
+        self.qrexec_help.grid_remove()
+        self.qrexec_help_note = self.tk.StringVar(master=self.window, value="")
+        self.label(self.qrexec_help, 0, variable=self.qrexec_help_note)
+        self.qrexec_policy_box = ScrollableText(self.qrexec_help, readonly=True, height=2)
+        self.qrexec_policy_box.frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=6)
+        self.button(self.qrexec_help, 2, "qrexec_copy_policy", "Policy-Zeile kopieren (für dom0 Qubes Policy Editor)",
                     "bridge", self.copy_qrexec_policy)
-        self.label(qrexec, 6, "Die Zeile gehört in /etc/qubes/policy.d/ (z. B. 30-user.policy) – einmalig manuell "
-                   "über den dom0 Qubes Policy Editor eintragen (Board-Beispiel: qubes.ConnectTCP +8443 personal "
-                   "untrusted allow). AITL ändert privilegierte Policy niemals automatisch und umgeht keine "
-                   "Freigaben. Danach erst die Weiterleitung starten.")
-        self.button(qrexec, 7, "qrexec_start", "Eigene Weiterleitung starten (qvm-connect-tcp)", "bridge",
-                    self.start_qrexec)
-        self.button(qrexec, 8, "qrexec_stop", "Weiterleitung beenden", "bridge", self.stop_qrexec)
-        self.qrexec_status = self.tk.StringVar(master=self.window, value="")
-        self.label(qrexec, 9, variable=self.qrexec_status)
-        qrexec_pin = profile.get("pin", "") if qrexec_saved \
-            and str(profile.get("url", "")).startswith("https://127.0.0.1:") else ""
-        self.label(qrexec, 10, "Lokale HTTPS-Adresse über die Weiterleitung: https://127.0.0.1:<Port> "
-                   "(Fingerprint und Pairing-Code zeigt die Bridge-Konsole im Ziel-Qube).")
-        self.entry(qrexec, 11, "qrexec_pin", "SPKI SHA-256 (vollständig)", qrexec_pin)
+        self.label(self.qrexec_help, 3, "Nur wenn die Freigabe fehlt: exakte, eng begrenzte Zeile einmalig manuell "
+                   "in /etc/qubes/policy.d/ (z. B. 30-user.policy) über den dom0 Qubes Policy Editor eintragen "
+                   "(Board-Beispiel: qubes.ConnectTCP +8443 personal untrusted allow). Bestehende Freigaben nicht "
+                   "erneuern; AITL ändert privilegierte Policy niemals automatisch. Danach dieselbe Aktion "
+                   "„Erneut prüfen“.")
+        self.label(qrexec, 10, "3 · Bewusst koppeln – erst nach belegter Erreichbarkeit. Fingerprint unabhängig "
+                   "im Ziel-Qube vergleichen, Checkbox bestätigen, dann vollständigen SPKI und Code eingeben. "
+                   "Erreichbarkeit allein ist weder Vertrauensbestätigung noch fertige Kopplung.")
+        self.entry(qrexec, 11, "qrexec_pin", "SPKI SHA-256 (vollständig, manuell)", "")
         self.entry(qrexec, 12, "qrexec_code", "Kopplungscode", secret=True)
         self.qrexec_compared = self.ttk.Checkbutton(
             qrexec, text="Vollständigen Fingerabdruck unabhängig im Ziel-Qube verglichen",
             variable=self.compared, command=self.render)
         self.qrexec_compared.grid(row=13, column=0, columnspan=2, sticky="ew", pady=6)
-        self.button(qrexec, 14, "qrexec_pair", "Koppeln und speichern", "bridge", self.pair_qrexec)
-        self.button(qrexec, 15, "qrexec_saved_connect", "Gespeicherte Qrexec-Verbindung öffnen", "bridge",
+        self.button(qrexec, 14, "qrexec_reveal", "Beobachteten SPKI anzeigen (erst nach Vergleichsbestätigung)",
+                    "bridge", self.reveal_observed_pin)
+        self.button(qrexec, 15, "qrexec_pair", "Koppeln und speichern", "bridge", self.pair_qrexec)
+        self.button(qrexec, 16, "qrexec_saved_connect", "Gespeicherte Qrexec-Verbindung öffnen", "bridge",
                     self.open_saved_qrexec)
         self.label(bridge_section, 1, variable=self.errors["bridge"])
 
@@ -5412,6 +5512,7 @@ class ConnectionDialog:
             self.fields[key].trace_add("write", self.reset_comparison)
         for key in ("qrexec_target", "qrexec_port"):
             self.fields[key].trace_add("write", self.update_qrexec_policy)
+            self.fields[key].trace_add("write", self.qrexec_reset_verification)
         for variable in (self.compared, self.fields["code"], self.fields["qrexec_code"]):
             variable.trace_add("write", lambda *_: self.render())
         self.update_remote_command()
@@ -5487,11 +5588,15 @@ class ConnectionDialog:
             "verified_pin_required": "Vollständigen SPKI-Fingerprint mit 64 Hexzeichen eingeben.",
             "independent_fingerprint_comparison_required": "Fingerprint unabhängig am Gateway vergleichen und bestätigen.",
             "invalid_pair_code": "Den zwölfstelligen Gateway-Kopplungscode eingeben; Vierergruppen mit Bindestrichen sind erlaubt.",
-            "qrexec_tool_missing": "qvm-connect-tcp fehlt – dieser Modus benötigt die Qubes-Werkzeuge im Quell-Qube.",
-            "qrexec_port_conflict": "Der lokale Port ist bereits belegt (fremder Listener). AITL übernimmt oder beendet keine fremden Prozesse; anderen Port wählen oder die Belegung selbst klären.",
-            "qrexec_forwarder_failed": "Die Weiterleitung wurde gestartet, hat sich aber sofort beendet. Dom0-Policy (qubes.ConnectTCP), Ziel-Qube-Namen und laufenden Bridge-Dienst im Ziel prüfen.",
-            "qrexec_listener_timeout": "Weiterleitung gestartet, aber kein lokaler Listener sichtbar. Kein Erfolg behauptet; Verbindung getrennt prüfen.",
-            "qrexec_forwarder_not_running": "Zuerst die eigene Weiterleitung starten; Koppeln ohne laufenden Forwarder ist nicht möglich.",
+            "qrexec_tool_missing": "qvm-connect-tcp fehlt – dieser Modus benötigt die Qubes-Werkzeuge im Quell-Qube; das ist keine Policy-Aussage.",
+            "qrexec_port_conflict": "Der lokale Port ist belegt (fremder Listener – belegt, nicht übernommen). AITL beendet keine fremden Prozesse; Belegung selbst klären oder anderen Port wählen, dann erneut prüfen.",
+            "qrexec_forwarder_failed": "Die eigene Weiterleitung wurde gestartet, beendete sich aber sofort. Mögliche (nicht belegte) Ursachen: Qrexec-Freigabe fehlt/nicht gespeichert, Ziel-Qube-Name fehlerhaft, Ziel startet nicht. Vorhandene Freigaben werden nicht unterstellt – nach Korrektur „Erneut prüfen“.",
+            "qrexec_listener_timeout": "Weiterleitung gestartet, aber kein lokaler Listener sichtbar – kein Erfolg behauptet; nach Korrektur „Erneut prüfen“.",
+            "qrexec_target_unreachable": "Eigene Weiterleitung läuft, aber die Bridge antwortet nicht über Qrexec. Mögliche (nicht belegte) Ursachen: dom0-Freigabe fehlt/nicht gespeichert, Bridge im Ziel läuft nicht, Ziel-Qube aus. Eine bestehende Freigabe muss nicht erneut werden; nach Korrektur „Erneut prüfen“.",
+            "pin_mismatch": "Belegter Zertifikatswechsel: der beobachtete SPKI-Fingerprint weicht vom gespeicherten ab. Niemals stillschweigend vertrauen – unabhängig im Ziel vergleichen und bewusst neu koppeln.",
+            "bridge_not_verified": "Zuerst „Verbindung prüfen“ erfolgreich abschließen – die Kopplung ist bewusst der letzte Schritt.",
+            "reveal_requires_comparison": "Der beobachtete Fingerprint wird erst nach bestätigter unabhängiger Vergleichsprüfung angezeigt.",
+            "qrexec_forwarder_not_running": "Eigene Weiterleitung nicht (mehr) aktiv – „Verbindung prüfen“ startet sie idempotent.",
             "invalid_qube_name": "Qube-Name: Buchstaben/Ziffern/._-, maximal 63 Zeichen, ohne Leerzeichen.",
             "invalid_port": "Port 1–65535 eingeben.",
             "state_dir_required": "State-Verzeichnis darf nicht leer sein.",
@@ -5584,7 +5689,6 @@ class ConnectionDialog:
             panel.grid() if visible else panel.grid_remove()
         if location == "QREXEC":
             self.update_qrexec_policy()
-            self.update_qrexec_status()
         self.canvas.yview_moveto(0)
         self.render()
 
@@ -5636,31 +5740,83 @@ class ConnectionDialog:
     def update_qrexec_policy(self, *_):
         self.qrexec_policy_box.show(((self.qrexec_policy_text(), "plain"),))
 
-    def update_qrexec_status(self, *_):
-        # Separate honest phases; forwarder check is process-local, listener check
-        # is a bounded local connect – neither claims qrexec policy success.
-        status = self.core.qrexec_status()
-        parts = ["Weiterleitung: " + ("läuft (eigener Prozess)" if status["forwarder_running"] else "gestoppt"),
-                 "Lokaler Listener: " + ("ja" if status["local_listener"] else "nein")]
-        if status["target"]:
-            parts.append("Ziel: %s · Port %s" % (status["target"], status["port"]))
-        parts.append("Policy/Bridge/TLS/Auth werden erst beim echten Verbindungsversuch getrennt geprüft.")
-        self.qrexec_status.set(" · ".join(parts))
+    def copy_qrexec_command(self):
+        self.window.clipboard_clear()
+        self.window.clipboard_append(qrexec_first_start_command())
 
     def copy_qrexec_policy(self):
         self.window.clipboard_clear()
         self.window.clipboard_append(self.qrexec_policy_text())
 
-    def start_qrexec(self):
-        self.core.start_qrexec_forwarder(self.fields["qrexec_target"].get(), self.qrexec_port())
-        self.update_qrexec_status()
+    def qrexec_reset_verification(self, *_):
+        # Target/port edits invalidate the previous proof; retry is the same action.
+        self.qrexec_verified = False
+        self.qrexec_observed_pin = None
+        self.qrexec_status.set("2 · Noch nicht geprüft – „Verbindung prüfen“ startet, falls nötig, die eigene "
+                               "Weiterleitung idempotent und prüft die echte Erreichbarkeit der Bridge.")
+
+    def verify_qrexec(self):
+        """M9 Folgeanpassung: the ONE primary action; also serves as 'Erneut prüfen'.
+        Policy help appears only for phases where an open grant is a possible cause;
+        evidenced other failures are named specifically, never as blanket 'policy is
+        missing' claims. An already working grant simply passes through unseen."""
+        result = self.core.verify_qrexec_connection(self.fields["qrexec_target"].get(), self.qrexec_port())
+        phase = result["phase"]
+        if result["reachable"]:
+            self.qrexec_verified = True
+            self.qrexec_observed_pin = result["observed_pin"]
+            self.qrexec_help.grid_remove()
+            self.qrexec_help_visible = False
+            self.qrexec_status.set("Erreichbarkeit belegt – das ist weder Vertrauensbestätigung noch fertige "
+                                   "Kopplung. Nächster Schritt: Fingerprint unabhängig im Ziel-Qube vergleichen, "
+                                   "unten bestätigen, dann SPKI und Kopplungscode eingeben und koppeln.")
+            return
+        self.qrexec_verified = False
+        self.qrexec_observed_pin = None
+        self.qrexec_status.set(self.error_text(phase) + " Danach dieselbe Aktion erneut ausführen (Erneut prüfen).")
+        policy_possible = phase in {"qrexec_target_unreachable", "qrexec_listener_timeout",
+                                    "qrexec_forwarder_failed"}
+        help_needed = policy_possible or phase in {"qrexec_tool_missing", "qrexec_port_conflict",
+                                                   "tls_handshake_failed", "pin_mismatch"}
+        if policy_possible:
+            self.update_qrexec_policy()
+            self.qrexec_help_note.set("Mögliche, nicht belegte Ursachen: dom0-Freigabe fehlt oder ist nicht "
+                                      "gespeichert; Ziel-/Bridge-Prozess läuft nicht. Nur wenn die Freigabe "
+                                      "tatsächlich fehlt, einmalig die exakte Zeile unten in dom0 eintragen.")
+        elif phase == "qrexec_port_conflict":
+            self.qrexec_help_note.set("Belegt: lokaler Port durch fremden Prozess belegt. AITL übernimmt oder "
+                                      "beendet ihn nicht – Belegung selbst klären oder anderen Port wählen.")
+        elif phase == "qrexec_tool_missing":
+            self.qrexec_help_note.set("Belegt: qvm-connect-tcp nicht gefunden – dieser Modus braucht die "
+                                      "Qubes-Werkzeuge im Quell-Qube; keine Policy-Aussage.")
+        elif phase == "tls_handshake_failed":
+            self.qrexec_help_note.set("Belegt: Port antwortet ohne gültiges Bridge-TLS – Startbefehl/Bridge im "
+                                      "Ziel prüfen; kein Policy-Fehler behauptet.")
+        elif phase == "pin_mismatch":
+            self.qrexec_help_note.set("Belegt: beobachteter SPKI weicht vom gespeicherten ab – Zertifikatswechsel "
+                                      "nie stillschweigend vertrauen; unabhängig vergleichen und bewusst neu "
+                                      "koppeln.")
+        if help_needed != self.qrexec_help_visible:
+            self.qrexec_help.grid() if help_needed else self.qrexec_help.grid_remove()
+            self.qrexec_help_visible = help_needed
+
+    def reveal_observed_pin(self):
+        # Anti-copypasta: the observed fingerprint only becomes visible AFTER the
+        # human confirmed an independent comparison in the target qube.
+        require(self.qrexec_verified and self.compared.get(), "reveal_requires_comparison")
+        self.qrexec_status.set("Beobachteter SPKI: " + str(self.qrexec_observed_pin)
+                               + " – bei Übereinstimmung unten eintragen und bewusst koppeln.")
 
     def stop_qrexec(self):
         self.core.stop_qrexec_forwarder()
-        self.update_qrexec_status()
+        self.qrexec_reset_verification()
+        self.qrexec_status.set("Eigene Weiterleitung beendet; keine fremden Prozesse berührt. "
+                               "„Verbindung prüfen“ startet sie bei Bedarf wieder.")
 
     def pair_qrexec(self):
-        # Pairing through the own forwarder is the real qrexec policy proof.
+        # M9 Folgeanpassung: pairing is the deliberate LAST step – only after the
+        # primary check proved reachability through the own forwarder.
+        require(self.qrexec_verified, "bridge_not_verified")
         require(self.core.qrexec_forwarder.running, "qrexec_forwarder_not_running")
         require(self.compared.get(), "independent_fingerprint_comparison_required")
         port = self.qrexec_port()
@@ -5765,10 +5921,14 @@ class ConnectionDialog:
             "pair": self.location.get() == "REMOTE" and self.compared.get() and bool(self.fields["code"].get()),
             "saved_connect": self.location.get() == "REMOTE" and self.saved_matches(),
             "remote_copy": bool(self.remote_command),
-            "qrexec_copy_policy": qrexec_mode,
-            "qrexec_start": qrexec_mode,
+            "qrexec_copy_command": qrexec_mode,
+            "qrexec_check": qrexec_mode,
             "qrexec_stop": qrexec_mode and self.core.qrexec_forwarder.running,
-            "qrexec_pair": qrexec_mode and self.core.qrexec_forwarder.running
+            "qrexec_copy_policy": qrexec_mode and self.qrexec_help_visible,
+            "qrexec_reveal": qrexec_mode and self.qrexec_verified and self.compared.get()
+                and not self.qrexec_status.get().startswith("Beobachteter SPKI"),
+            "qrexec_pair": qrexec_mode and self.qrexec_verified
+                and self.core.qrexec_forwarder.running
                 and self.compared.get() and bool(self.fields["qrexec_code"].get()),
             "qrexec_saved_connect": qrexec_mode and self.saved_qrexec_matches(),
             "chat_show": bridge.state == "CONNECTED" and bool(code), "chat_copy": visible
@@ -9534,6 +9694,9 @@ def bridge_serve(store, bind="127.0.0.1", port=0, names=(), ready_fd=None, boots
                 print("SPKI SHA-256: " + pin, flush=True)
             if pair:
                 print("PAIR CODE (2 minutes): " + store.open_pair(), flush=True)
+                # M9 Folgeanpassung: limits stay 2 minutes/max five failures; a long
+                # setup ends with an explicit local regeneration, never an extension.
+                print("Bewusste Neuerzeugung bei Ablauf: die Bridge mit --pair neu starten.", flush=True)
         stop.wait()
     finally:
         service.stop()

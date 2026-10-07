@@ -3579,6 +3579,9 @@ class BridgeStandaloneSetupTests(unittest.TestCase):
                     code_line = line
                     break
             self.assertIsNotNone(code_line)  # guided first start opens pairing automatically
+            hint = self.read_line(process, 4)
+            self.assertIn("--pair", hint or "")  # explicit local regeneration guidance only
+            self.assertIn("(2 minutes)", code_line)  # limits unchanged, never extended
             self.assertTrue(any(line.startswith("Nutzbare URLs") for line in lines))
             self.assertTrue(any(line.startswith("SPKI SHA-256: ") for line in lines))
             for line in lines:
@@ -3607,6 +3610,158 @@ class BridgeStandaloneSetupTests(unittest.TestCase):
                     break
             self.assertFalse(any(line.startswith("PAIR CODE") for line in extra))
             self.reap(second)
+
+
+class QrexecBridgeFirstTests(unittest.TestCase):
+    """M9 Folgeanpassung (bridge-first): ONE primary check action idempotently starts
+    the own forwarder and proves real unauthenticated reachability; evidenced
+    failures stay separate from possible causes; pairing stays the last step and
+    the 2-minute code limit only allows explicit local regeneration."""
+
+    FAKE_FORWARDER = (
+        "import socket, sys, threading\n"
+        "local, target, remote = sys.argv[1].split(':')\n"
+        "srv = socket.socket()\n"
+        "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "srv.bind(('127.0.0.1', int(local)))\n"
+        "srv.listen(5)\n"
+        "def pump(a, b):\n"
+        "    try:\n"
+        "        while True:\n"
+        "            data = a.recv(8192)\n"
+        "            if not data:\n"
+        "                break\n"
+        "            b.sendall(data)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    for side in (a, b):\n"
+        "        try:\n"
+        "            side.shutdown(socket.SHUT_RDWR)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "        side.close()\n"
+        "while True:\n"
+        "    conn, _ = srv.accept()\n"
+        "    if target == 'denyqube':\n"
+        "        conn.close()\n"
+        "        continue\n"
+        "    if target == 'plainqube':\n"
+        "        conn.sendall(b'NOPE NOT TLS\\r\\n')\n"
+        "        conn.close()\n"
+        "        continue\n"
+        "    up_port = int(__import__('os').environ.get('AITL_TEST_REMOTE_PORT') or remote)\n"
+        "    upstream = socket.socket()\n"
+        "    upstream.settimeout(3)\n"
+        "    try:\n"
+        "        upstream.connect(('127.0.0.1', up_port))\n"
+        "    except OSError:\n"
+        "        conn.close()\n"
+        "        continue\n"
+        "    threading.Thread(target=pump, args=(conn, upstream), daemon=True).start()\n"
+        "    threading.Thread(target=pump, args=(upstream, conn), daemon=True).start()\n")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-bridgefirst-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        binary = self.base / "qvm-connect-tcp"
+        binary.write_text("#!" + str(Path(sys.executable).resolve()) + "\n" + self.FAKE_FORWARDER)
+        binary.chmod(0o700)
+        patcher = mock.patch.object(a.shutil, "which", return_value=str(binary))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.bridge = RemoteFixture(self.base / "bridge")  # real standalone TLS bridge
+        self.addCleanup(self.bridge.close)
+        self.bridge_port = int(self.bridge.url.rsplit(":", 1)[1])
+        self.bridge_pin = self.bridge.pin
+
+    def make_core(self):
+        core = a.AppCore(connection_store=a.ConnectionStore(self.base / ("cfg-" + uuid.uuid4().hex)))
+        self.addCleanup(core.close)
+        return core
+
+    def free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def verify_with_env(self, target, port, remote_port):
+        core = self.make_core()
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(remote_port)}):
+            return core.verify_qrexec_connection(target, port)
+
+    def test_reachable_existing_grant_passes_and_persists(self):
+        core = self.make_core()
+        port = self.free_port()
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
+            result = core.verify_qrexec_connection("fwdqube", port)
+        self.assertEqual(result["phase"], "bridge_reachable")
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["observed_pin"], self.bridge.pin)  # independent comparison source
+        self.assertEqual(core.qrexec, {"target": "fwdqube", "port": port})
+        self.assertEqual(core.connection_store.load_connection()["qrexec"], {"target": "fwdqube", "port": port})
+        first_pid = core.qrexec_forwarder.process.pid
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
+            again = core.verify_qrexec_connection("fwdqube", port)  # "Erneut prüfen": idempotent
+        self.assertTrue(again["reachable"])
+        self.assertEqual(core.qrexec_forwarder.process.pid, first_pid)  # no double forwarder
+
+    def test_deny_down_plain_are_evidenced_separately_not_blanket_policy(self):
+        text = a.ConnectionDialog.error_text
+        dead = str(self.free_port())  # nothing listening: "target down"
+        live = str(self.bridge_port)
+        denied = self.verify_with_env("denyqube", self.free_port(), live)
+        down = self.verify_with_env("downqube", self.free_port(), dead)
+        plain = self.verify_with_env("plainqube", self.free_port(), live)
+        self.assertEqual(denied["phase"], "qrexec_target_unreachable")
+        self.assertEqual(down["phase"], "qrexec_target_unreachable")
+        self.assertEqual(plain["phase"], "tls_handshake_failed")
+        message = text("qrexec_target_unreachable")
+        self.assertIn("Mögliche", message)  # possible causes, never a definite policy claim
+        self.assertNotEqual(message.strip(), "Policy fehlt.")
+        self.assertNotIn("Policy", text("tls_handshake_failed"))  # TLS is a separate evidenced phase
+
+    def test_port_conflict_foreign_listener_untouched(self):
+        core = self.make_core()
+        foreign = socket.socket()
+        foreign.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        foreign.bind(("127.0.0.1", 0))
+        foreign.listen(1)
+        self.addCleanup(foreign.close)
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
+            result = core.verify_qrexec_connection("fwdqube", foreign.getsockname()[1])
+        self.assertEqual(result["phase"], "qrexec_port_conflict")
+        self.assertFalse(core.qrexec_forwarder.running)
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            self.assertEqual(probe.connect_ex(("127.0.0.1", foreign.getsockname()[1])), 0)
+
+    def test_pinned_certificate_change_is_evidenced_not_silent(self):
+        port = self.free_port()
+        store = a.ConnectionStore(self.base / ("cfg-pin-" + uuid.uuid4().hex))
+        profile = a.ConnectionProfile("https://127.0.0.1:%d" % port, "1" * 64,
+                                      "0" * 32, "0" * 32, "0" * 64)
+        store.save_connection(profile, None, {"target": "fwdqube", "port": port})
+        core = a.AppCore(connection_store=store)
+        self.addCleanup(core.close)
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
+            result = core.verify_qrexec_connection("fwdqube", port)
+        self.assertEqual(result["phase"], "pin_mismatch")
+        self.assertFalse(result["reachable"])
+
+    def test_pairing_code_expiry_and_explicit_local_regeneration(self):
+        with tempfile.TemporaryDirectory(prefix="aitl-codeexpiry-") as directory:
+            store = a.BridgeStore(Path(directory), uuid.uuid4().hex)
+            self.addCleanup(store.close)
+            code = store.open_pair()
+            store.clock = lambda: time.time() + 121  # 2-minute window elapsed
+            with self.assertRaises(a.BridgeError):
+                store.claim({"code": code, "request_id": uuid.uuid4().hex})
+            # Explicit local regeneration is allowed; limits stay 2 minutes/5 failures.
+            fresh = store.open_pair()
+            store.clock = time.time
+            claim = store.claim({"code": fresh, "request_id": uuid.uuid4().hex})
+            self.assertEqual(claim["state"], "PAIR_PENDING")
 
 
 if __name__ == "__main__":

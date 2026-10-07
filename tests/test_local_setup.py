@@ -505,6 +505,14 @@ class BridgeSetupDefaultsTests(unittest.TestCase):
         for good in ("personal", "untrusted", "work-2", "sys_net.ext"):
             self.assertEqual(a.validate_qube_name(good), good)
 
+    def test_qrexec_first_start_command_and_probe_url_guard(self):
+        # M9 Folgeanpassung: exact, secret-free target-qube command; the unauthenticated
+        # reachability probe only accepts an explicit https URL with port.
+        self.assertEqual(a.qrexec_first_start_command(), "python3 ./admin_in_the_loop.py --bridge")
+        for bad in ("http://127.0.0.1:8443", "https://127.0.0.1", "", "https://u:p@127.0.0.1:8443/x"):
+            with self.assertRaises(a.ProbeError):
+                a.bridge_reachability(bad)
+
 
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))
