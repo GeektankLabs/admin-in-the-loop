@@ -3522,9 +3522,9 @@ class BridgeStandaloneSetupTests(unittest.TestCase):
     def setUp(self):
         self.buffers = {}
 
-    def spawn(self, state_dir):
+    def spawn(self, state_dir, extra=()):
         process = subprocess.Popen([sys.executable, "-I", str(Path(a.__file__).resolve()),
-                                    "--bridge", "--state-dir", str(state_dir), "--port", "0"],
+                                    "--bridge", "--state-dir", str(state_dir), "--port", "0", *extra],
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    env=a.isolated_service_environment(), close_fds=True)
         self.addCleanup(lambda: self.reap(process))
@@ -3578,24 +3578,40 @@ class BridgeStandaloneSetupTests(unittest.TestCase):
                 if line.startswith("PAIR CODE"):
                     code_line = line
                     break
-            self.assertIsNotNone(code_line)  # guided first start opens pairing automatically
-            hint = self.read_line(process, 4)
-            self.assertIn("--pair", hint or "")  # explicit local regeneration guidance only
-            self.assertIn("(2 minutes)", code_line)  # limits unchanged, never extended
+            # M9 Ergänzung (comment_e6630467): a fresh unpaired standalone start has
+            # NO code and NO 2-minute window – only the readiness announcement.
+            self.assertIsNone(code_line)
+            self.assertTrue(any(line.startswith("Bridge läuft; zurück zur Haupt-App") for line in lines))
             self.assertTrue(any(line.startswith("Nutzbare URLs") for line in lines))
             self.assertTrue(any(line.startswith("SPKI SHA-256: ") for line in lines))
             for line in lines:
                 if line.strip().startswith("https://"):
                     self.assertNotIn("0.0.0.0", line)  # wildcard bind is never a URL
-            url = "https://127.0.0.1:%d" % info["port"]
+            # Explicit --pair stays compatible for operator/service starts.
+            self.reap(process)
+            paired_process = self.spawn(state, extra=["--pair"])
+            info2 = json.loads(self.read_line(paired_process))
+            code_line = None
+            for _ in range(32):
+                line = self.read_line(paired_process, 4)
+                if line is None:
+                    break
+                if line.startswith("PAIR CODE"):
+                    code_line = line
+                    break
+            self.assertIsNotNone(code_line)
+            self.assertIn("(2 minutes)", code_line)  # limits unchanged, never extended
+            hint = self.read_line(paired_process, 4)
+            self.assertIn("--pair", hint or "")  # explicit regeneration guidance only
+            url = "https://127.0.0.1:%d" % info2["port"]
             store = a.ConnectionStore(Path(directory, "config"))
             core = a.AppCore(connection_store=store)
             try:
-                profile = core.pair_remote(url, info["pin"], code_line.split(": ", 1)[1].strip())
+                profile = core.pair_remote(url, info2["pin"], code_line.split(": ", 1)[1].strip())
                 self.assertEqual(profile.mode, "REMOTE")
             finally:
                 core.close()
-            self.reap(process)
+            self.reap(paired_process)
             # Later start: persisted identity/auth – no new pairing window.
             second = self.spawn(state)
             info2 = json.loads(self.read_line(second))
@@ -3609,7 +3625,137 @@ class BridgeStandaloneSetupTests(unittest.TestCase):
                 if line.startswith("PAIR CODE"):
                     break
             self.assertFalse(any(line.startswith("PAIR CODE") for line in extra))
+            self.assertTrue(any(line.startswith("Bridge läuft; zurück zur Haupt-App") for line in extra))
             self.reap(second)
+
+
+class PairingHelloContractTests(unittest.TestCase):
+    """M9 Ergänzung (comment_e6630467): pairing codes exist only after an explicit
+    code-free controller hello (or --pair). Dedup without rotation, already-paired
+    never re-pairs, expiry allows conscious regeneration, strict machine-readable
+    contract without any secret in the unauthenticated response."""
+
+    def test_store_dedup_no_rotation_and_regeneration_after_expiry(self):
+        with tempfile.TemporaryDirectory(prefix="aitl-hello-") as directory:
+            store = a.BridgeStore(Path(directory), uuid.uuid4().hex)
+            self.addCleanup(store.close)
+            state, code = store.hello_pair()
+            self.assertEqual((state, code is not None), ("pairing_required", True))
+            deadline = store.pair["deadline"]
+            state2, code2 = store.hello_pair()
+            self.assertEqual((state2, code2), ("pairing_required", None))
+            self.assertEqual(store.pair["deadline"], deadline)  # neither rotated nor extended
+            store.clock = lambda: time.time() + 121  # window expired; claim path limits untouched
+            state3, code3 = store.hello_pair()
+            self.assertEqual(state3, "pairing_required")
+            self.assertIsNotNone(code3)
+            self.assertNotEqual(code3, code)
+            self.assertGreater(store.pair["deadline"], deadline)
+
+    def test_hello_contract_strict_and_secret_free(self):
+        class Session:
+            def __init__(self, payload):
+                self.payload, self.sent = payload, bytearray()
+            def settimeout(self, _timeout):
+                pass
+            def sendall(self, data):
+                self.sent.extend(data)
+            def recv(self, _size):
+                data, self.payload = self.payload[:1024], b""
+                return data
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+        class Context:
+            check_hostname = None
+            verify_mode = None
+            def __init__(self, session):
+                self.session = session
+            def wrap_socket(self, raw, server_hostname=None):
+                return self.session
+        def call(payload):
+            session = Session(payload)
+            with mock.patch.object(a.ssl, "SSLContext", return_value=Context(session)), \
+                 mock.patch.object(a.socket, "create_connection", return_value=session):
+                return a.bridge_hello("https://127.0.0.1:8443")
+        ok = b'HTTP/1.1 200 OK\r\n\r\n{"version": 1, "state": "pairing_required"}'
+        self.assertEqual(call(ok), "pairing_required")
+        for bad, code in ((b"HTTP/1.1 401 Unauthorized\r\n\r\n{\"error\": \"unauthorized\"}", "pairing_contract"),
+                          (b"HTTP/1.1 429 Too Many Requests\r\n\r\n{\"error\": \"rate_limit\"}", "pairing_rate_limited"),
+                          (b'HTTP/1.1 200 OK\r\n\r\n{"version": 1, "state": "pairing_required", "code": "ABCD-EFGH-JKMN"}', "pairing_contract"),
+                          (b'HTTP/1.1 200 OK\r\n\r\n{"version": 1, "state": "success"}', "pairing_contract"),
+                          (b"HTTP/1.1 200 OK\r\n\r\nnot json", "pairing_contract")):
+            with self.assertRaises(a.ProbeError) as failure:
+                call(bad)
+            self.assertEqual(str(failure.exception), code)
+
+    def test_real_bridge_hello_triggers_local_code_then_full_pairing(self):
+        with tempfile.TemporaryDirectory(prefix="aitl-hello-e2e-") as directory:
+            state_dir = Path(directory, "state")
+            state_dir.mkdir()
+            os.chmod(state_dir, 0o700)
+            process = subprocess.Popen([sys.executable, "-I", str(Path(a.__file__).resolve()),
+                                        "--bridge", "--state-dir", str(state_dir), "--port", "0"],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       env=a.isolated_service_environment(), close_fds=True)
+            self.addCleanup(lambda: self.reap(process))
+            buffer = bytearray()
+            def read_line(timeout=8):
+                deadline = time.monotonic() + timeout
+                while True:
+                    index = buffer.find(b"\n")
+                    if index >= 0:
+                        line = bytes(buffer[:index + 1])
+                        del buffer[:index + 1]
+                        return line.decode()
+                    if time.monotonic() >= deadline:
+                        return None
+                    if select.select([process.stdout], [], [], 0.05)[0]:
+                        chunk = os.read(process.stdout.fileno(), 4096)
+                        if not chunk:
+                            return None
+                        buffer.extend(chunk)
+            info = json.loads(read_line())
+            url = "https://127.0.0.1:%d" % info["port"]
+            seen = []
+            while (line := read_line(1.0)) is not None:
+                seen.append(line)
+            self.assertFalse(any(line.startswith("PAIR CODE") for line in seen))
+            self.assertEqual(a.bridge_hello(url), "pairing_required")  # hello itself authorises nothing
+            code_line = None
+            for _ in range(8):
+                line = read_line(4)
+                if line is None:
+                    break
+                code_line = line if line.startswith("PAIR CODE") else code_line
+                if code_line:
+                    break
+            self.assertIsNotNone(code_line)  # the code appears only on the LOCAL console
+            code = code_line.split(": ", 1)[1].strip()
+            hint = read_line(4)  # regeneration guidance belongs to the code output
+            self.assertTrue(hint and ("Hallo" in hint or "--pair" in hint))
+            self.assertEqual(a.bridge_hello(url), "pairing_required")  # dedup: no reprint, no rotation
+            self.assertIsNone(read_line(0.6))
+            core = a.AppCore(connection_store=a.ConnectionStore(Path(directory, "cfg")))
+            try:
+                core.pair_remote(url, info["pin"], code)
+                self.assertEqual(a.bridge_hello(url), "already_paired")  # never re-pair via hello
+                with self.assertRaises(a.ProbeError):
+                    core.pair_remote(url, info["pin"], code)  # replay after single consumption
+            finally:
+                core.close()
+
+    @staticmethod
+    def reap(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        process.stdout.close()
 
 
 class QrexecBridgeFirstTests(unittest.TestCase):

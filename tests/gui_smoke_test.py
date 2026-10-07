@@ -1324,6 +1324,28 @@ class QrexecDialogTests(unittest.TestCase):
         self.assertFalse(dialog.qrexec_verified)
         self.assertEqual(self.callbacks, [])
 
+    def test_hello_button_gating_states_and_errors(self):
+        dialog = self.open_dialog(True)
+        dialog.location.set("QREXEC")
+        self.root.update()
+        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["disabled"]))  # no hello before proof
+        ok = {"phase": "bridge_reachable", "reachable": True, "observed_pin": "ab" * 32}
+        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=ok):
+            dialog.buttons["qrexec_check"].invoke()
+        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["!disabled"]))
+        with mock.patch.object(self.core, "hello_bridge", return_value="pairing_required") as hello:
+            dialog.buttons["qrexec_hello"].invoke()
+        hello.assert_called_once_with("https://127.0.0.1:8443")
+        self.assertIn("Bridge erreicht, Kopplung erforderlich", dialog.qrexec_status.get())
+        self.assertIn("autorisiert nichts", dialog.qrexec_status.get())
+        with mock.patch.object(self.core, "hello_bridge", return_value="already_paired"):
+            dialog.buttons["qrexec_hello"].invoke()
+        self.assertIn("bereits gekoppelt", dialog.qrexec_status.get())
+        with mock.patch.object(self.core, "hello_bridge", side_effect=a.ProbeError("pairing_rate_limited")):
+            dialog.buttons["qrexec_hello"].invoke()
+        self.assertIn("Cooldown", dialog.errors["bridge"].get())
+        self.assertEqual(self.callbacks, [])
+
 
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))

@@ -2679,6 +2679,54 @@ def check_profile(profile):
     return parsed
 
 
+def bridge_hello(url, timeout=6):
+    """M9 Ergänzung (comment_e6630467): the explicit code-free setup contact. Same
+    trust level as the reachability probe (observation only; hello authorises
+    neither pairing, trust, nor commands). The machine-readable contract is strict:
+    only version:1 plus state pairing_required/already_paired is accepted – any
+    other status or body (including generic 401/403 rejections and any answer that
+    carries a code) is an error, never success. Never returns a secret."""
+    parsed = urlsplit(url)
+    require(parsed.scheme == "https" and parsed.hostname and parsed.port, "invalid_bridge_url")
+    body = b'{"version": 1}'
+    head = ("POST /v1/pair/hello HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
+            "Content-Length: %d\r\nConnection: close\r\n\r\n"
+            % (parsed.hostname, parsed.port, len(body))).encode()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=timeout) as raw:
+            raw.settimeout(timeout)
+            with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
+                tls.sendall(head + body)
+                chunks, total = [], 0
+                while True:
+                    piece = tls.recv(2048)
+                    if not piece:
+                        break
+                    chunks.append(piece)
+                    total += len(piece)
+                    require(total <= 8192, "pairing_contract")
+                data = b"".join(chunks)
+    except ProbeError:
+        raise
+    except (socket.timeout, ssl.SSLError, ConnectionError, OSError):
+        raise ProbeError("qrexec_target_unreachable") from None
+    head_line, _, payload = data.partition(b"\r\n\r\n")
+    parts = head_line.splitlines()
+    require(bool(parts) and parts[0].startswith(b"HTTP/1.1 200"),
+            "pairing_rate_limited" if b"HTTP/1.1 429" in (parts[0] if parts else b"") else "pairing_contract")
+    try:
+        value = parse(payload)
+        fields(value, {"version", "state"})
+    except (BridgeError, ProbeError, ValueError):
+        raise ProbeError("pairing_contract") from None  # any deviation: no success, no confusion
+    require(type(value["version"]) is int and value["version"] == 1
+            and value["state"] in {"pairing_required", "already_paired"}, "pairing_contract")
+    return value["state"]
+
+
 def check_certificate(der, host, pin):
     """Pinned self-signed profile, on the same TLS socket used for the request.
 
@@ -4290,6 +4338,11 @@ class AppCore:
                 return {"phase": "pin_mismatch", "reachable": False, "observed_pin": observed}
         return {"phase": "bridge_reachable", "reachable": True, "observed_pin": observed}
 
+    def hello_bridge(self, url):
+        """M9 Ergänzung: explicit code-free setup hello; authorises nothing, returns
+        only the strict contract state pairing_required/already_paired."""
+        return bridge_hello(url)
+
     def begin_local_setup(self, tunnel_id, api_key):
         require(self.connection_store is not None, "connection_store_required")
         require(self.local_setup is None and self.local_pending is None
@@ -5387,16 +5440,19 @@ class ConnectionDialog:
                    "~/.local/state/aitl-bridge, SAN und nutzbare URLs automatisch, keine App-ID-Pflicht, keine "
                    "Angaben in Chat/Argumenten/Logs. Tunnel-/Runtime-Angaben gehören zur Bridge-Umgebung und "
                    "werden nur gefordert, wenn dort noch kein Tunnel besteht; eine bestehende Konfiguration wird "
-                   "wiederverwendet. Die Bridge-Konsole zeigt SPKI-Fingerprint und – beim Erststart – einen "
-                   "zweiminütigen Einmal-Code; bei Ablauf bewusst mit --pair neu erzeugen (Limits bleiben).")
+                   "wiederverwendet. Die Bridge-Konsole zeigt SPKI-Fingerprint; ein zweiminütiger "
+                   "Einmal-Code erscheint dort erst nach ausdrücklichem Hallo von hier (Knopf unten) oder bei "
+                   "Explizitstart mit --pair – nie automatisch, bei Ablauf bewusst neu erzeugbar (Limits bleiben).")
         self.entry(qrexec, 4, "qrexec_target", "Ziel-Qube", qrexec_cfg.get("target", ""))
         self.entry(qrexec, 5, "qrexec_port", "Port", str(qrexec_cfg.get("port", 8443)))
         self.button(qrexec, 6, "qrexec_check", "Verbindung prüfen", "bridge", self.verify_qrexec)
-        self.button(qrexec, 7, "qrexec_stop", "Weiterleitung beenden", "bridge", self.stop_qrexec)
+        self.button(qrexec, 7, "qrexec_hello", "Kopplungscode auf Bridge anfordern (Hallo)", "bridge",
+                    self.request_qrexec_hello)
+        self.button(qrexec, 8, "qrexec_stop", "Weiterleitung beenden", "bridge", self.stop_qrexec)
         self.qrexec_status = self.tk.StringVar(master=self.window, value="2 · Noch nicht geprüft – „Verbindung prüfen“ startet, falls nötig, die eigene Weiterleitung idempotent und prüft die echte Erreichbarkeit der Bridge.")
-        self.label(qrexec, 8, variable=self.qrexec_status)
+        self.label(qrexec, 9, variable=self.qrexec_status)
         self.qrexec_help = self.ttk.Frame(qrexec)
-        self.qrexec_help.grid(row=9, column=0, columnspan=2, sticky="ew")
+        self.qrexec_help.grid(row=10, column=0, columnspan=2, sticky="ew")
         self.qrexec_help.grid_remove()
         self.qrexec_help_note = self.tk.StringVar(master=self.window, value="")
         self.label(self.qrexec_help, 0, variable=self.qrexec_help_note)
@@ -5409,19 +5465,19 @@ class ConnectionDialog:
                    "(Board-Beispiel: qubes.ConnectTCP +8443 personal untrusted allow). Bestehende Freigaben nicht "
                    "erneuern; AITL ändert privilegierte Policy niemals automatisch. Danach dieselbe Aktion "
                    "„Erneut prüfen“.")
-        self.label(qrexec, 10, "3 · Bewusst koppeln – erst nach belegter Erreichbarkeit. Fingerprint unabhängig "
+        self.label(qrexec, 11, "3 · Bewusst koppeln – erst nach belegter Erreichbarkeit. Fingerprint unabhängig "
                    "im Ziel-Qube vergleichen, Checkbox bestätigen, dann vollständigen SPKI und Code eingeben. "
                    "Erreichbarkeit allein ist weder Vertrauensbestätigung noch fertige Kopplung.")
-        self.entry(qrexec, 11, "qrexec_pin", "SPKI SHA-256 (vollständig, manuell)", "")
-        self.entry(qrexec, 12, "qrexec_code", "Kopplungscode", secret=True)
+        self.entry(qrexec, 12, "qrexec_pin", "SPKI SHA-256 (vollständig, manuell)", "")
+        self.entry(qrexec, 13, "qrexec_code", "Kopplungscode", secret=True)
         self.qrexec_compared = self.ttk.Checkbutton(
             qrexec, text="Vollständigen Fingerabdruck unabhängig im Ziel-Qube verglichen",
             variable=self.compared, command=self.render)
-        self.qrexec_compared.grid(row=13, column=0, columnspan=2, sticky="ew", pady=6)
-        self.button(qrexec, 14, "qrexec_reveal", "Beobachteten SPKI anzeigen (erst nach Vergleichsbestätigung)",
+        self.qrexec_compared.grid(row=14, column=0, columnspan=2, sticky="ew", pady=6)
+        self.button(qrexec, 15, "qrexec_reveal", "Beobachteten SPKI anzeigen (erst nach Vergleichsbestätigung)",
                     "bridge", self.reveal_observed_pin)
-        self.button(qrexec, 15, "qrexec_pair", "Koppeln und speichern", "bridge", self.pair_qrexec)
-        self.button(qrexec, 16, "qrexec_saved_connect", "Gespeicherte Qrexec-Verbindung öffnen", "bridge",
+        self.button(qrexec, 16, "qrexec_pair", "Koppeln und speichern", "bridge", self.pair_qrexec)
+        self.button(qrexec, 17, "qrexec_saved_connect", "Gespeicherte Qrexec-Verbindung öffnen", "bridge",
                     self.open_saved_qrexec)
         self.label(bridge_section, 1, variable=self.errors["bridge"])
 
@@ -5595,6 +5651,8 @@ class ConnectionDialog:
             "qrexec_target_unreachable": "Eigene Weiterleitung läuft, aber die Bridge antwortet nicht über Qrexec. Mögliche (nicht belegte) Ursachen: dom0-Freigabe fehlt/nicht gespeichert, Bridge im Ziel läuft nicht, Ziel-Qube aus. Eine bestehende Freigabe muss nicht erneut werden; nach Korrektur „Erneut prüfen“.",
             "pin_mismatch": "Belegter Zertifikatswechsel: der beobachtete SPKI-Fingerprint weicht vom gespeicherten ab. Niemals stillschweigend vertrauen – unabhängig im Ziel vergleichen und bewusst neu koppeln.",
             "bridge_not_verified": "Zuerst „Verbindung prüfen“ erfolgreich abschließen – die Kopplung ist bewusst der letzte Schritt.",
+            "pairing_contract": "Die Bridge antwortet nicht mit dem erwarteten Kopplungsvertrag; nur das feste pairing_required/already_paired wird akzeptiert – keine Erfolgs- oder Netzwerkverwechslung.",
+            "pairing_rate_limited": "Zu viele Kopplungsanfragen in kurzer Zeit – Cooldown abwarten; bestehendes Codefenster läuft unverändert weiter.",
             "reveal_requires_comparison": "Der beobachtete Fingerprint wird erst nach bestätigter unabhängiger Vergleichsprüfung angezeigt.",
             "qrexec_forwarder_not_running": "Eigene Weiterleitung nicht (mehr) aktiv – „Verbindung prüfen“ startet sie idempotent.",
             "invalid_qube_name": "Qube-Name: Buchstaben/Ziffern/._-, maximal 63 Zeichen, ohne Leerzeichen.",
@@ -5800,6 +5858,21 @@ class ConnectionDialog:
             self.qrexec_help.grid() if help_needed else self.qrexec_help.grid_remove()
             self.qrexec_help_visible = help_needed
 
+    def request_qrexec_hello(self):
+        """M9 Ergänzung: after proven reachability, one explicit code-free contact
+        makes the target-qube bridge console show the fresh one-time code. The hello
+        itself authorises nothing; pairing stays the deliberate last step."""
+        require(self.qrexec_verified, "bridge_not_verified")
+        state = self.core.hello_bridge("https://127.0.0.1:%d" % self.qrexec_port())
+        if state == "already_paired":
+            self.qrexec_status.set("Diese Bridge ist bereits gekoppelt – keine erneute Kopplung nötig; "
+                                   "gespeicherte Verbindung öffnen oder bei Bedarf bewusst neu koppeln "
+                                   "(Neu-Kopplung ersetzt die aktive Freigabe).")
+        else:
+            self.qrexec_status.set("Bridge erreicht, Kopplung erforderlich; Code jetzt auf der Bridge-Konsole "
+                                   "im Ziel-Qube ablesen, unten eintragen, Fingerprint dort unabhängig "
+                                   "vergleichen und bestätigen. Der Hallo selbst autorisiert nichts.")
+
     def reveal_observed_pin(self):
         # Anti-copypasta: the observed fingerprint only becomes visible AFTER the
         # human confirmed an independent comparison in the target qube.
@@ -5923,6 +5996,7 @@ class ConnectionDialog:
             "remote_copy": bool(self.remote_command),
             "qrexec_copy_command": qrexec_mode,
             "qrexec_check": qrexec_mode,
+            "qrexec_hello": qrexec_mode and self.qrexec_verified,
             "qrexec_stop": qrexec_mode and self.core.qrexec_forwarder.running,
             "qrexec_copy_policy": qrexec_mode and self.qrexec_help_visible,
             "qrexec_reveal": qrexec_mode and self.qrexec_verified and self.compared.get()
@@ -8249,11 +8323,25 @@ class BridgeStore:
                 "controller_id": row["id"], "state": "PAIRED", "retention_seconds": BRIDGE_RETENTION}
 
     def controller_paired(self):
-        """M9: guided first start – true once a controller credential is paired.
-        A fresh bridge (no pairing yet) opens its pairing window automatically."""
+        """M9: true once a controller credential is paired. A fresh unpaired
+        standalone bridge waits for an explicit controller hello (see hello_pair)
+        or --pair before any code/window exists."""
         with self.lock:
             return bool(self.execute(
                 "SELECT 1 FROM tokens WHERE role='CONTROLLER' AND state='PAIRED' LIMIT 1").fetchone())
+
+    def hello_pair(self):
+        """M9 Ergänzung (comment_e6630467): an explicit code-free controller hello opens
+        the local one-time window. An active window is never rotated, extended or
+        reprinted; an already-paired bridge never re-pairs; a code is only ever
+        created for the LOCAL console, never returned over HTTP. After expiry a
+        fresh hello intentionally regenerates; claim-side limits are untouched."""
+        with self.lock:
+            if self.controller_paired():
+                return "already_paired", None
+            if self.pair is not None and self.pair["deadline"] > self.clock():
+                return "pairing_required", None
+            return "pairing_required", self.open_pair()
 
     def cursor_position(self, value, owner, kind):
         if not value:
@@ -9042,7 +9130,8 @@ class BridgeService:
                             "/v1/chat-binding": (self._controller_chat_binding, "GET"),
                             "/v1/chat-binding/rotate": (self._controller_chat_binding_rotate, "POST"),
                             "/v1/pair/claim": (self._controller_claim, "POST"),
-                            "/v1/pair/confirm": (self._controller_confirm, "POST")},
+                            "/v1/pair/confirm": (self._controller_confirm, "POST"),
+                            "/v1/pair/hello": (self._controller_hello, "POST")},
             "MCP": {"/mcp": (self.mcp, "POST")},
         }
 
@@ -9192,6 +9281,20 @@ class BridgeService:
     def _controller_claim(self, request):
         self.throttle("PAIR", 10)
         return self.json(self.store.claim(self.body(request)))
+
+    def _controller_hello(self, request):
+        # M9 Ergänzung (comment_e6630467): code-free setup contact. Fixed minimal
+        # contract, shared PAIR rate limit, deduplicated window handling; the
+        # response carries no secret – the code only ever appears on this console.
+        self.throttle("PAIR", 10)
+        value = self.body(request)
+        exact(value, {"version"})
+        check(type(value["version"]) is int and value["version"] == 1)
+        state, code = self.store.hello_pair()
+        if code is not None:
+            print("PAIR CODE (2 minutes): " + code, flush=True)
+            print("Bewusste Neuerzeugung bei Ablauf: erneutes Hallo oder --pair-Neustart.", flush=True)
+        return self.json({"version": 1, "state": state})
 
     def _controller_confirm(self, request):
         token, _ = self.principal(request, "CONTROLLER", pending=True)
@@ -9694,9 +9797,15 @@ def bridge_serve(store, bind="127.0.0.1", port=0, names=(), ready_fd=None, boots
                 print("SPKI SHA-256: " + pin, flush=True)
             if pair:
                 print("PAIR CODE (2 minutes): " + store.open_pair(), flush=True)
-                # M9 Folgeanpassung: limits stay 2 minutes/max five failures; a long
-                # setup ends with an explicit local regeneration, never an extension.
+                # M9 Folgeanpassung: Limits bleiben 2 Minuten/max. fünf Fehlversuche; eine lange
+                # Einrichtung endet mit bewusster lokaler Neuerzeugung, nie mit Verlängerung.
                 print("Bewusste Neuerzeugung bei Ablauf: die Bridge mit --pair neu starten.", flush=True)
+            else:
+                # M9 Ergänzung (comment_e6630467): a fresh unpaired bridge starts without
+                # any code/window; the one-time code appears only after an explicit
+                # controller hello (or with --pair). Hello authorises nothing itself.
+                print("Bridge läuft; zurück zur Haupt-App und Verbindung testen. Der Kopplungscode "
+                      "erscheint hier erst nach ausdrücklichem Hallo des Controllers (oder --pair).", flush=True)
         stop.wait()
     finally:
         service.stop()
@@ -9782,11 +9891,11 @@ def bridge_main(argv=None):
             else:
                 store.authenticate(private_read(ai_file, 64).decode(), "AI")
         check(0 <= port <= 65535, "invalid_port")
-        # M9 guided first start: a bridge without any paired controller opens its
-        # pairing window automatically once HTTPS is actually ready; later starts
-        # load the persisted auth directly. Re-pairing stays explicit (--pair).
-        first_launch = not bootstrap and not store.controller_paired()
-        bridge_serve(store, bind, port, names, args.ready_fd, pair=args.pair or first_launch)
+        # M9 Ergänzung (comment_e6630467): no automatic first-start pairing window.
+        # A fresh unpaired bridge only announces readiness; the explicit controller
+        # hello (or --pair for operator/service starts) creates the local one-time
+        # code. Limits and claim rules are unchanged.
+        bridge_serve(store, bind, port, names, args.ready_fd, pair=args.pair)
         return 0
     finally:
         store.close()
