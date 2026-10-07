@@ -2867,7 +2867,10 @@ class ConnectionStore(PreferenceStore):
                 raw = source.read(16385)
             require(len(raw) <= 16384, "connection_config_limit")
             value = decode_packet(raw)
-            fields(value, {"version", "profile", "tunnel"})
+            # M9: optional "qrexec" record (target/port of Main's own forwarder);
+            # older three-field files stay readable, unknown keys stay rejected.
+            require(type(value) is dict and {"version", "profile", "tunnel"} <= set(value)
+                    and set(value) <= {"version", "profile", "tunnel", "qrexec"}, "invalid_schema")
             require(type(value["version"]) is int and value["version"] == 1, "connection_config_version")
             if value["profile"] is not None:
                 fields(value["profile"], {"url", "pin", "conversation", "controller_id", "token", "mode"})
@@ -2876,22 +2879,32 @@ class ConnectionStore(PreferenceStore):
             if value["tunnel"] is not None:
                 fields(value["tunnel"], {"binary", "tunnel_id", "api_key"})
                 validate_tunnel(value["tunnel"], check_binary=False)
+            qrexec = value.get("qrexec")
+            if qrexec is not None:
+                fields(qrexec, {"target", "port"})
+                validate_qube_name(qrexec["target"])
+                require(type(qrexec["port"]) is int and 1 <= qrexec["port"] <= 65535, "invalid_port")
+            value["qrexec"] = qrexec
             return value
         except OSError:
             raise ProbeError("connection_config_read_failure") from None
         finally:
             os.close(dfd)
 
-    def save_connection(self, profile=None, tunnel=None):
+    def save_connection(self, profile=None, tunnel=None, qrexec=None):
         self.load_connection()  # Reject malformed, insecure or symlinked existing state.
         if profile is not None:
             check_profile(profile)
             require(profile.mode == "REMOTE", "local_tokens_not_persistent")
         if tunnel is not None:
             validate_tunnel(tunnel)
+        if qrexec is not None:
+            fields(qrexec, {"target", "port"})
+            validate_qube_name(qrexec["target"])
+            require(type(qrexec["port"]) is int and 1 <= qrexec["port"] <= 65535, "invalid_port")
         body = {"version": 1, "profile": None if profile is None else
                 {name: getattr(profile, name) for name in ("url", "pin", "conversation", "controller_id", "token", "mode")},
-                "tunnel": tunnel}
+                "tunnel": tunnel, "qrexec": qrexec}
         dfd = self._directory_fd()
         temporary = ".connection-" + uuid.uuid4().hex
         try:
@@ -2915,6 +2928,99 @@ class ConnectionStore(PreferenceStore):
 def isolated_service_environment():
     # Explicit allowlist: no SSH agent, proxies, Python path, API tokens or HOME.
     return {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+
+
+def qubes_detected():
+    """M9: reliable Qubes marker; detection never excludes free remote targets."""
+    return Path("/usr/share/qubes/marker-vm").exists() or bool(os.environ.get("QUBES_VM_NAME"))
+
+
+def source_qube_name():
+    # Honest: without the environment marker the source qube stays unknown and the
+    # policy line must be adjusted manually – never guess a privileged identity.
+    name = os.environ.get("QUBES_VM_NAME")
+    return name if name and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", name) else None
+
+
+def validate_qube_name(name):
+    value = bounded_string(str(name).strip(), 63)
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", value), "invalid_qube_name")
+    return value
+
+
+def qrexec_policy_line(source, target, port=8443):
+    """Exact, narrowly scoped qubes.ConnectTCP policy line for the ONE-TIME manual
+    dom0 entry. Main never creates or changes privileged policy automatically."""
+    require(type(port) is int and 1 <= port <= 65535, "invalid_port")
+    return "qubes.ConnectTCP +%d %s %s allow" % (
+        port, validate_qube_name(source) if source else "personal", validate_qube_name(target))
+
+
+class QrexecForwarder:
+    """M9: Main manages ONLY its own qvm-connect-tcp forwarder: single instance,
+    never adopts or kills foreign processes, clean shutdown, restart recovery from
+    saved config. A local listener alone is not success – only the real qrexec
+    connection attempt through the forwarder proves the dom0 policy."""
+
+    def __init__(self):
+        self.process = None
+        self.target = None
+        self.port = None
+
+    @property
+    def running(self):
+        return self.process is not None and self.process.poll() is None
+
+    @staticmethod
+    def _listener_present(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.25)
+            return probe.connect_ex(("127.0.0.1", int(port))) == 0
+
+    def start(self, target, port=8443):
+        target = validate_qube_name(target)
+        port = int(port)
+        require(1 <= port <= 65535, "invalid_port")
+        if self.running:
+            if (self.target, self.port) == (target, port):
+                return  # single instance: this forwarder is already ours
+            self.stop()
+        tool = shutil.which("qvm-connect-tcp")
+        require(tool is not None, "qrexec_tool_missing")
+        if self._listener_present(port):
+            # Occupied by a foreign listener: report honestly, never adopt/kill it.
+            raise ProbeError("qrexec_port_conflict")
+        self.process = subprocess.Popen([tool, "%d:%s:%d" % (port, target, port)],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+        self.target, self.port = target, port
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                self.process, self.target, self.port = None, None, None
+                raise ProbeError("qrexec_forwarder_failed")
+            if self._listener_present(port):
+                return  # own listener is up; policy proof comes from the real connect
+            time.sleep(0.05)
+        self.stop()
+        raise ProbeError("qrexec_listener_timeout")
+
+    def stop(self):
+        process = self.process
+        self.process, self.target, self.port = None, None, None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+
+    def status(self):
+        """Separate honest phases; binding TCP alone is never reported as success."""
+        return {"forwarder_running": self.running,
+                "local_listener": bool(self.port) and self._listener_present(self.port),
+                "target": self.target, "port": self.port}
 
 
 class LocalBridgeProcess:
@@ -3749,6 +3855,11 @@ class AppCore:
         self.last_error = None
         self.connection_store = connection_store
         self.saved_connection = connection_store.load_connection() if connection_store else None
+        # M9: Main owns exactly one qvm-connect-tcp forwarder; config survives via
+        # the connection store, the process itself is volatile and restarted on demand.
+        self.qrexec_forwarder = QrexecForwarder()
+        self.qrexec = dict(self.saved_connection["qrexec"]) if self.saved_connection \
+            and self.saved_connection.get("qrexec") else None
         self.bridge_profile = None
         self.bridge_process = None
         self.bridge_worker = None
@@ -3995,6 +4106,14 @@ class AppCore:
             self.saved_connection = self.connection_store.load_connection()
         require(self.saved_connection is not None and self.saved_connection["profile"] is not None,
                 "no_saved_remote_connection")
+        qrexec = self.saved_connection.get("qrexec")
+        if qrexec:
+            # M9 restart recovery: restore Main's OWN forwarder from the saved
+            # config before using the saved local HTTPS address; foreign listeners
+            # are never adopted (start fails honestly on a port conflict).
+            self.qrexec = dict(qrexec)
+            if not self.qrexec_forwarder.running:
+                self.qrexec_forwarder.start(qrexec["target"], qrexec["port"])
         self.connect_profile(ConnectionProfile(**self.saved_connection["profile"]))
 
     def disconnect_bridge(self):
@@ -4042,7 +4161,8 @@ class AppCore:
         profile = replace(provisional, conversation=claim["conversation"], controller_id=claim["controller_id"], token=claim["token"])
         check_profile(profile)
         saved = self.connection_store.load_connection()
-        self.connection_store.save_connection(profile, saved["tunnel"] if saved else None)
+        self.connection_store.save_connection(profile, saved["tunnel"] if saved else None,
+                                              saved.get("qrexec") if saved else None)
         # Save before confirm. On lost confirm response, connect_saved_bridge recovers
         # idempotently with this exact already-pinned credential, no code reuse.
         validate_status(BridgeHTTP(profile).request("POST", "/v1/pair/confirm", {"version": 1}), profile)
@@ -4067,8 +4187,26 @@ class AppCore:
         config = {"binary": binary, "tunnel_id": tunnel_id, "api_key": api_key}
         saved = self.connection_store.load_connection()
         profile = ConnectionProfile(**saved["profile"]) if saved and saved["profile"] else None
-        self.connection_store.save_connection(profile, config)
+        self.connection_store.save_connection(profile, config, saved.get("qrexec") if saved else None)
         self.saved_connection = self.connection_store.load_connection()
+
+    def start_qrexec_forwarder(self, target, port=8443):
+        """M9: start Main's own forwarder only. The dom0 policy line is produced for
+        the one-time MANUAL entry; binding alone is never treated as success."""
+        require(self.connection_store is not None, "connection_store_required")
+        target = validate_qube_name(target)
+        self.qrexec_forwarder.start(target, port)
+        self.qrexec = {"target": target, "port": int(port)}
+        saved = self.connection_store.load_connection()
+        profile = ConnectionProfile(**saved["profile"]) if saved and saved["profile"] else None
+        self.connection_store.save_connection(profile, saved["tunnel"] if saved else None, self.qrexec)
+        self.saved_connection = self.connection_store.load_connection()
+
+    def stop_qrexec_forwarder(self):
+        self.qrexec_forwarder.stop()
+
+    def qrexec_status(self):
+        return self.qrexec_forwarder.status()
 
     def begin_local_setup(self, tunnel_id, api_key):
         require(self.connection_store is not None, "connection_store_required")
@@ -4862,6 +5000,7 @@ class AppCore:
         self.risk_requested = False
         self.risk_setup_pending = None
         self._command_risk.close()
+        self.qrexec_forwarder.stop()  # only Main's own forwarder; foreign processes untouched
         self.disconnect_bridge()
         self.pending_output = None
         if self.channel:
@@ -5072,11 +5211,16 @@ class ConnectionDialog:
         self.last_diagnostic = None
         saved = self.core.saved_connection or {"profile": None, "tunnel": None}
         profile = saved["profile"] or {}
+        # M9: three explicit connection kinds; Qrexec appears only on real Qubes,
+        # remote HTTPS stays available everywhere (also on Qubes).
+        self.qubes = qubes_detected()
         active = self.core.bridge_profile if self.core.bridge_state != "DISCONNECTED" else None
         self.location = self.tk.StringVar(master=self.window,
                                          value="LOCAL" if self.core.local_setup_state != "IDLE" else
                                          "REMOTE" if self.core.bridge_state == "PAIRING" else
-                                         active.mode if active else "REMOTE" if profile else "LOCAL")
+                                         active.mode if active else
+                                         "QREXEC" if self.qubes and saved.get("qrexec") else
+                                         "REMOTE" if profile else "LOCAL")
         self.compared = self.tk.BooleanVar(master=self.window, value=False)
         base = self.ttk.Style(self.window).lookup("TFrame", "background") or self.window.cget("background")
         self.canvas = self.tk.Canvas(self.window, highlightthickness=0, background=base)
@@ -5098,7 +5242,11 @@ class ConnectionDialog:
         choices = self.ttk.Frame(self.content)
         choices.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         self.location_buttons = []
-        for value, text in (("LOCAL", "Lokal — dieser Rechner"), ("REMOTE", "Remote — anderer Rechner / Gateway")):
+        location_choices = [("LOCAL", "Auf diesem System / in diesem Qube")]
+        if self.qubes:
+            location_choices.append(("QREXEC", "Anderer Qube — über Qrexec"))
+        location_choices.append(("REMOTE", "Remote — über HTTPS (freies Ziel, auch auf Qubes)"))
+        for value, text in location_choices:
             button = self.ttk.Radiobutton(choices, text=text, variable=self.location, value=value)
             button.pack(anchor="w", pady=2)
             self.location_buttons.append(button)
@@ -5132,6 +5280,49 @@ class ConnectionDialog:
         comparison.grid(row=12, column=0, columnspan=2, sticky="ew", pady=6)
         self.button(self.remote, 13, "pair", "Koppeln und speichern", "bridge", self.pair)
         self.button(self.remote, 14, "saved_connect", "Gespeicherte Remote-Verbindung öffnen", "bridge", self.open_saved)
+        # M9 Qrexec panel: one coherent guided flow – policy (manual dom0) → own
+        # forwarder → real connection check → pairing. Binding alone is no success.
+        self.qrexec_panel = qrexec = self.ttk.Frame(bridge_section)
+        qrexec.grid(row=0, column=0, sticky="ew")
+        qrexec.columnconfigure(1, weight=1)
+        qrexec_saved = bool(saved.get("qrexec"))
+        qrexec_cfg = saved.get("qrexec") or {}
+        self.label(qrexec, 0, "Qubes erkannt. Im Ziel-Qube dieselbe Python-Datei mit --bridge starten; State, "
+                   "Konfiguration und TLS liegen dort dauerhaft privat unter ~/.local/state/aitl-bridge "
+                   "(Skript-Updates z. B. in Downloads verlieren sie nicht). Reihenfolge: 1. Policy-Zeile einmalig "
+                   "manuell in dom0 speichern → 2. eigene Weiterleitung hier starten → 3. tatsächlich koppeln/"
+                   "verbinden. Lokales Binding allein beweist keine Qrexec-Freigabe.")
+        source = source_qube_name()
+        self.label(qrexec, 1, "Quell-Qube: " + (source if source else
+                   "unbekannt – Platzhalter „personal“ in der Policy-Zeile anpassen"))
+        self.entry(qrexec, 2, "qrexec_target", "Ziel-Qube", qrexec_cfg.get("target", ""))
+        self.entry(qrexec, 3, "qrexec_port", "Port", str(qrexec_cfg.get("port", 8443)))
+        self.qrexec_policy_box = ScrollableText(qrexec, readonly=True, height=2)
+        self.qrexec_policy_box.frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=6)
+        self.button(qrexec, 5, "qrexec_copy_policy", "Policy-Zeile kopieren (für dom0 Qubes Policy Editor)",
+                    "bridge", self.copy_qrexec_policy)
+        self.label(qrexec, 6, "Die Zeile gehört in /etc/qubes/policy.d/ (z. B. 30-user.policy) – einmalig manuell "
+                   "über den dom0 Qubes Policy Editor eintragen (Board-Beispiel: qubes.ConnectTCP +8443 personal "
+                   "untrusted allow). AITL ändert privilegierte Policy niemals automatisch und umgeht keine "
+                   "Freigaben. Danach erst die Weiterleitung starten.")
+        self.button(qrexec, 7, "qrexec_start", "Eigene Weiterleitung starten (qvm-connect-tcp)", "bridge",
+                    self.start_qrexec)
+        self.button(qrexec, 8, "qrexec_stop", "Weiterleitung beenden", "bridge", self.stop_qrexec)
+        self.qrexec_status = self.tk.StringVar(master=self.window, value="")
+        self.label(qrexec, 9, variable=self.qrexec_status)
+        qrexec_pin = profile.get("pin", "") if qrexec_saved \
+            and str(profile.get("url", "")).startswith("https://127.0.0.1:") else ""
+        self.label(qrexec, 10, "Lokale HTTPS-Adresse über die Weiterleitung: https://127.0.0.1:<Port> "
+                   "(Fingerprint und Pairing-Code zeigt die Bridge-Konsole im Ziel-Qube).")
+        self.entry(qrexec, 11, "qrexec_pin", "SPKI SHA-256 (vollständig)", qrexec_pin)
+        self.entry(qrexec, 12, "qrexec_code", "Kopplungscode", secret=True)
+        self.qrexec_compared = self.ttk.Checkbutton(
+            qrexec, text="Vollständigen Fingerabdruck unabhängig im Ziel-Qube verglichen",
+            variable=self.compared, command=self.render)
+        self.qrexec_compared.grid(row=13, column=0, columnspan=2, sticky="ew", pady=6)
+        self.button(qrexec, 14, "qrexec_pair", "Koppeln und speichern", "bridge", self.pair_qrexec)
+        self.button(qrexec, 15, "qrexec_saved_connect", "Gespeicherte Qrexec-Verbindung öffnen", "bridge",
+                    self.open_saved_qrexec)
         self.label(bridge_section, 1, variable=self.errors["bridge"])
 
         self.tunnel_section = tunnel_section = self.section(3, "2 · OpenAI Secure MCP Tunnel")
@@ -5217,9 +5408,14 @@ class ConnectionDialog:
             self.fields[key].trace_add("write", self.reset_comparison)
         for key in ("url", "remote_python", "remote_script", "remote_state", "remote_bind"):
             self.fields[key].trace_add("write", self.update_remote_command)
-        for variable in (self.compared, self.fields["code"]):
+        for key in ("qrexec_target", "qrexec_port", "qrexec_pin"):
+            self.fields[key].trace_add("write", self.reset_comparison)
+        for key in ("qrexec_target", "qrexec_port"):
+            self.fields[key].trace_add("write", self.update_qrexec_policy)
+        for variable in (self.compared, self.fields["code"], self.fields["qrexec_code"]):
             variable.trace_add("write", lambda *_: self.render())
         self.update_remote_command()
+        self.update_qrexec_policy()
         self.select_location()
         self.window.bind("<Destroy>", self.destroyed, add="+")
 
@@ -5291,6 +5487,14 @@ class ConnectionDialog:
             "verified_pin_required": "Vollständigen SPKI-Fingerprint mit 64 Hexzeichen eingeben.",
             "independent_fingerprint_comparison_required": "Fingerprint unabhängig am Gateway vergleichen und bestätigen.",
             "invalid_pair_code": "Den zwölfstelligen Gateway-Kopplungscode eingeben; Vierergruppen mit Bindestrichen sind erlaubt.",
+            "qrexec_tool_missing": "qvm-connect-tcp fehlt – dieser Modus benötigt die Qubes-Werkzeuge im Quell-Qube.",
+            "qrexec_port_conflict": "Der lokale Port ist bereits belegt (fremder Listener). AITL übernimmt oder beendet keine fremden Prozesse; anderen Port wählen oder die Belegung selbst klären.",
+            "qrexec_forwarder_failed": "Die Weiterleitung wurde gestartet, hat sich aber sofort beendet. Dom0-Policy (qubes.ConnectTCP), Ziel-Qube-Namen und laufenden Bridge-Dienst im Ziel prüfen.",
+            "qrexec_listener_timeout": "Weiterleitung gestartet, aber kein lokaler Listener sichtbar. Kein Erfolg behauptet; Verbindung getrennt prüfen.",
+            "qrexec_forwarder_not_running": "Zuerst die eigene Weiterleitung starten; Koppeln ohne laufenden Forwarder ist nicht möglich.",
+            "invalid_qube_name": "Qube-Name: Buchstaben/Ziffern/._-, maximal 63 Zeichen, ohne Leerzeichen.",
+            "invalid_port": "Port 1–65535 eingeben.",
+            "state_dir_required": "State-Verzeichnis darf nicht leer sein.",
             "network_http_403": "Kopplung nicht möglich. Code und Gateway-Fenster prüfen (zwei Minuten, maximal fünf Fehlversuche).",
             "network_http_401": "Bridge-Zugang nicht bestätigt oder widerrufen; gespeicherte Verbindung prüfen bzw. neu koppeln.",
             "network_unavailable": "Gateway/Bridge nicht erreichbar. Adresse, Port und Netzwerk prüfen. Falls bereits gespeichert: gespeicherte Verbindung öffnen.",
@@ -5362,7 +5566,8 @@ class ConnectionDialog:
         return self.core.pair_thread is not None and self.core.pair_thread.is_alive()
 
     def select_location(self):
-        local = self.location.get() == "LOCAL"
+        location = self.location.get()
+        local = location == "LOCAL"
         if not local:
             self.errors["tunnel"].set("")  # Local test errors do not describe a gateway-managed tunnel.
         self.intro.configure(text="OpenAI-Anbindung auf diesem Rechner: zwei Platform-Werte und Starten & testen. "
@@ -5373,9 +5578,13 @@ class ConnectionDialog:
         self.tunnel_section.configure(text="OpenAI Secure MCP Tunnel" if local else "2 · OpenAI Secure MCP Tunnel")
         self.details_button.grid() if local else self.details_button.grid_remove()
         self.controls.grid() if not local or self.details.get() else self.controls.grid_remove()
-        for panel, visible in ((self.local, local), (self.remote, not local),
+        for panel, visible in ((self.local, local), (self.remote, location == "REMOTE"),
+                               (self.qrexec_panel, location == "QREXEC"),
                                (self.local_tunnel, local), (self.remote_tunnel, not local)):
             panel.grid() if visible else panel.grid_remove()
+        if location == "QREXEC":
+            self.update_qrexec_policy()
+            self.update_qrexec_status()
         self.canvas.yview_moveto(0)
         self.render()
 
@@ -5411,6 +5620,73 @@ class ConnectionDialog:
         require(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{12}", code.replace("-", "").upper()), "invalid_pair_code")
         self.core.begin_pair_remote(self.fields["url"].get(), pin, code)
         self.fields["code"].set("")
+
+    def qrexec_port(self):
+        raw = self.fields["qrexec_port"].get().strip()
+        require(raw.isdigit() and 1 <= int(raw) <= 65535, "invalid_port")
+        return int(raw)
+
+    def qrexec_policy_text(self):
+        try:
+            return qrexec_policy_line(source_qube_name(), self.fields["qrexec_target"].get(), self.qrexec_port())
+        except ProbeError:
+            return ("Ziel-Qube-Namen eingeben (Buchstaben/Ziffern/._-, max. 63 Zeichen); "
+                    "Port 1–65535. Erzeugt wird genau eine enge qubes.ConnectTCP-Zeile.")
+
+    def update_qrexec_policy(self, *_):
+        self.qrexec_policy_box.show(((self.qrexec_policy_text(), "plain"),))
+
+    def update_qrexec_status(self, *_):
+        # Separate honest phases; forwarder check is process-local, listener check
+        # is a bounded local connect – neither claims qrexec policy success.
+        status = self.core.qrexec_status()
+        parts = ["Weiterleitung: " + ("läuft (eigener Prozess)" if status["forwarder_running"] else "gestoppt"),
+                 "Lokaler Listener: " + ("ja" if status["local_listener"] else "nein")]
+        if status["target"]:
+            parts.append("Ziel: %s · Port %s" % (status["target"], status["port"]))
+        parts.append("Policy/Bridge/TLS/Auth werden erst beim echten Verbindungsversuch getrennt geprüft.")
+        self.qrexec_status.set(" · ".join(parts))
+
+    def copy_qrexec_policy(self):
+        self.window.clipboard_clear()
+        self.window.clipboard_append(self.qrexec_policy_text())
+
+    def start_qrexec(self):
+        self.core.start_qrexec_forwarder(self.fields["qrexec_target"].get(), self.qrexec_port())
+        self.update_qrexec_status()
+
+    def stop_qrexec(self):
+        self.core.stop_qrexec_forwarder()
+        self.update_qrexec_status()
+
+    def pair_qrexec(self):
+        # Pairing through the own forwarder is the real qrexec policy proof.
+        require(self.core.qrexec_forwarder.running, "qrexec_forwarder_not_running")
+        require(self.compared.get(), "independent_fingerprint_comparison_required")
+        port = self.qrexec_port()
+        pin = re.sub(r"[\s:-]", "", bounded_string(self.fields["qrexec_pin"].get(), 128)).lower()
+        url = "https://127.0.0.1:%d" % port
+        check_profile(ConnectionProfile(url, pin, "0" * 32, "0" * 32, "0" * 64))
+        code = bounded_string(self.fields["qrexec_code"].get(), 16)
+        require(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{12}", code.replace("-", "").upper()), "invalid_pair_code")
+        self.core.begin_pair_remote(url, pin, code)
+        self.fields["qrexec_code"].set("")
+
+    def saved_qrexec_matches(self):
+        saved = self.core.saved_connection
+        if not (saved and saved["profile"] and saved.get("qrexec")):
+            return False
+        try:
+            port = self.qrexec_port()
+        except ProbeError:
+            return False
+        return saved["profile"]["url"].rstrip("/") == "https://127.0.0.1:%d" % port
+
+    def open_saved_qrexec(self):
+        self.refresh_saved()
+        require(self.saved_qrexec_matches(), "no_saved_remote_connection")
+        # connect_saved_bridge restores Main's own forwarder before connecting.
+        self.core.connect_saved_bridge()
 
     def refresh_saved(self):
         if self.core.connection_store is not None:
@@ -5482,11 +5758,19 @@ class ConnectionDialog:
         busy = self.busy or self.pairing() or bridge.state in {"PAIRING", "CONNECTING"} or self.core.local_setup is not None or self.core.local_pending is not None
         for key in ("tunnel_id", "api_key"):
             self.entries[key].configure(state="disabled" if busy and local else "normal")
+        qrexec_mode = self.location.get() == "QREXEC"
         available = {
             "local_start": local, "local_stop": local and self.core.tunnel is not None,
             "tunnel_help": True, "key_help": True,
-            "pair": not local and self.compared.get() and bool(self.fields["code"].get()),
-            "saved_connect": not local and self.saved_matches(), "remote_copy": bool(self.remote_command),
+            "pair": self.location.get() == "REMOTE" and self.compared.get() and bool(self.fields["code"].get()),
+            "saved_connect": self.location.get() == "REMOTE" and self.saved_matches(),
+            "remote_copy": bool(self.remote_command),
+            "qrexec_copy_policy": qrexec_mode,
+            "qrexec_start": qrexec_mode,
+            "qrexec_stop": qrexec_mode and self.core.qrexec_forwarder.running,
+            "qrexec_pair": qrexec_mode and self.core.qrexec_forwarder.running
+                and self.compared.get() and bool(self.fields["qrexec_code"].get()),
+            "qrexec_saved_connect": qrexec_mode and self.saved_qrexec_matches(),
             "chat_show": bridge.state == "CONNECTED" and bool(code), "chat_copy": visible
                 and chat_binding_presentation(bridge)[2],
             "chat_rotate": bridge.state == "CONNECTED" and bridge.chat_binding is not None
@@ -7804,6 +8088,13 @@ class BridgeStore:
         return {"version": 1, "instance": self.instance, "conversation": row["conversation"],
                 "controller_id": row["id"], "state": "PAIRED", "retention_seconds": BRIDGE_RETENTION}
 
+    def controller_paired(self):
+        """M9: guided first start – true once a controller credential is paired.
+        A fresh bridge (no pairing yet) opens its pairing window automatically."""
+        with self.lock:
+            return bool(self.execute(
+                "SELECT 1 FROM tokens WHERE role='CONTROLLER' AND state='PAIRED' LIMIT 1").fetchone())
+
     def cursor_position(self, value, owner, kind):
         if not value:
             return 0
@@ -9084,6 +9375,61 @@ class BridgeService:
                 self.jobs.append({"subscription": dict(job["subscription"]), "event": event,
                                   "attempts": attempts + 1, "ready": time.monotonic() + delay})
 
+def default_state_dir():
+    """M9: private persistent bridge state under the user's home. Config/TLS/auth
+    survive replacing the (exchangeable) script file, e.g. a fresh download."""
+    return Path.home() / ".local" / "state" / "aitl-bridge"
+
+
+def resolve_state_dir(raw):
+    # ~, relative paths and spaces resolve deterministically; the result is absolute.
+    text = str(raw).strip()
+    check(text != "", "state_dir_required")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return str(path)
+
+
+def local_interface_ips():
+    """Best-effort local interface IPv4s via stdlib only; no network probing.
+    Any failure is non-fatal: localhost/127.0.0.1 always remain usable SANs."""
+    addresses = []
+    try:
+        import fcntl
+        import struct
+        for _, name in socket.if_nameindex():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    raw = fcntl.ioctl(probe.fileno(), 0x8915,  # SIOCGIFADDR
+                                      struct.pack("256s", name.encode()[:15]))
+                value = socket.inet_ntoa(raw[20:24])
+            except OSError:
+                continue
+            if not value.startswith("127."):
+                addresses.append(value)
+    except (OSError, AttributeError, ValueError, ImportError):
+        return []
+    return list(dict.fromkeys(addresses))
+
+
+def default_tls_names(extra=()):
+    # localhost + loopback are always included; interface IPs and explicit
+    # --tls-name additions extend the SAN set (deduplicated, order preserved).
+    names = ["localhost", "127.0.0.1"]
+    for value in list(local_interface_ips()) + [str(item) for item in extra]:
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def usable_urls(bind, port, names):
+    # A wildcard bind address is never a usable destination; show real addresses only.
+    del bind  # documented distinction: bind != connect URL
+    return ["https://%s:%d" % (name, int(port)) for name in names
+            if name not in ("0.0.0.0", "::", "*")]
+
+
 def bridge_certificate(directory, names, renew=False):
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
@@ -9179,6 +9525,13 @@ def bridge_serve(store, bind="127.0.0.1", port=0, names=(), ready_fd=None, boots
         else:
             # Operator console is explicit credential setup, not an application log.
             print(json.dumps(info), flush=True)
+            if names:
+                # M9: bind address vs usable destinations; never show the wildcard as URL.
+                print("Nutzbare URLs (Bind %s:%d ist keine Zieladresse):" % (bind, assigned), flush=True)
+                for url in usable_urls(bind, assigned, names):
+                    print("  " + url, flush=True)
+            if pin:
+                print("SPKI SHA-256: " + pin, flush=True)
             if pair:
                 print("PAIR CODE (2 minutes): " + store.open_pair(), flush=True)
         stop.wait()
@@ -9192,15 +9545,30 @@ def bridge_serve(store, bind="127.0.0.1", port=0, names=(), ready_fd=None, boots
             signal.signal(value, handler_function)
 
 
+def resolve_bridge_runtime(bind, port, tls_extra, bootstrap):
+    """M9 startup defaults: the internal pipe bootstrap stays loopback without TLS;
+    a standalone operator start binds 0.0.0.0:8443 with automatic SAN names and
+    never prompts for the bind address."""
+    if bootstrap:
+        return (bind if bind is not None else "127.0.0.1",
+                port if port is not None else 0,
+                list(tls_extra))
+    return (bind if bind is not None else "0.0.0.0",
+            port if port is not None else 8443,
+            default_tls_names(tls_extra))
+
+
 def bridge_main(argv=None):
     os.umask(0o077)
     # Include parser and access logs: hostile paths/body errors must not reach logs.
     logging.disable(logging.CRITICAL)
     parser = BridgeArgumentParser(description="Admin in the Loop — transport-only Bridge/MCP service")
-    parser.add_argument("--state-dir", required=True)
+    # M9: no mandatory paths/flags for the common start; home state dir and
+    # 0.0.0.0:8443 defaults apply, overrides stay explicit. No bind prompting.
+    parser.add_argument("--state-dir", default=None)
     parser.add_argument("--conversation", default=None)
-    parser.add_argument("--bind", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--bind", default=None)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--tls-name", action="append", default=[])
     parser.add_argument("--pair", action="store_true", help="Open a local two-minute pairing window on start")
     parser.add_argument("--revoke", metavar="CONTROLLER_ID")
@@ -9208,7 +9576,10 @@ def bridge_main(argv=None):
     parser.add_argument("--bootstrap-fd", type=int)
     parser.add_argument("--ready-fd", type=int)
     args = parser.parse_args(argv)
-    directory = protected_directory(args.state_dir)
+    bootstrap = args.bootstrap_fd is not None
+    bind, port, names = resolve_bridge_runtime(args.bind, args.port, args.tls_name, bootstrap)
+    directory = protected_directory(resolve_state_dir(args.state_dir) if args.state_dir
+                                    else str(default_state_dir()))
     conversation_path = directory / "conversation"
     if conversation_path.exists():
         conversation = private_read(conversation_path, 64).decode("ascii")
@@ -9222,20 +9593,22 @@ def bridge_main(argv=None):
     store = BridgeStore(directory, conversation, new_cycle=not (args.revoke or args.renew_cert))
     try:
         if args.renew_cert:
-            check(bool(args.tls_name) and args.bootstrap_fd is None, "tls_names_required")
-            _, pin = bridge_certificate(directory, args.tls_name, renew=True)
+            check(not bootstrap, "invalid_bootstrap")
+            # Without explicit names the current automatic SAN set is recomputed;
+            # the SPKI key (and thus the pinned fingerprint) is preserved.
+            _, pin = bridge_certificate(directory, args.tls_name or default_tls_names(), renew=True)
             print("Renewed SPKI SHA-256: " + pin)
             return 0
         if args.revoke:
             store.revoke(args.revoke)
             print("Controller token revoked.")
             return 0
-        if args.bootstrap_fd is not None:
+        if bootstrap:
             with os.fdopen(args.bootstrap_fd, "rb") as source:
                 boot = parse(source.read(4097))
             exact(boot, {"controller_token", "ai_token", "conversation"})
             check(boot["conversation"] == conversation and args.ready_fd is not None and not args.tls_name
-                  and args.bind == "127.0.0.1", "invalid_bootstrap")
+                  and bind == "127.0.0.1", "invalid_bootstrap")
             store.issue("CONTROLLER", boot["controller_token"])
             store.issue("AI", boot["ai_token"])
         else:
@@ -9245,8 +9618,12 @@ def bridge_main(argv=None):
                 private_write(ai_file, ai.encode())
             else:
                 store.authenticate(private_read(ai_file, 64).decode(), "AI")
-        check(0 <= args.port <= 65535, "invalid_port")
-        bridge_serve(store, args.bind, args.port, args.tls_name, args.ready_fd, pair=args.pair)
+        check(0 <= port <= 65535, "invalid_port")
+        # M9 guided first start: a bridge without any paired controller opens its
+        # pairing window automatically once HTTPS is actually ready; later starts
+        # load the persisted auth directly. Re-pairing stays explicit (--pair).
+        first_launch = not bootstrap and not store.controller_paired()
+        bridge_serve(store, bind, port, names, args.ready_fd, pair=args.pair or first_launch)
         return 0
     finally:
         store.close()
@@ -9265,6 +9642,8 @@ for _bridge_name in ("BridgeError", "BridgeStore", "BridgeService", "BRIDGE_BODY
                      "BRIDGE_CHAT_CODE_SCHEMA", "new_chat_code", "normalize_chat_code",
                      "bridge_certificate", "bridge_serve",
                      "bridge_main", "parse", "encoded", "WebhookFailure",
+                     "default_state_dir", "resolve_state_dir", "local_interface_ips",
+                     "default_tls_names", "usable_urls", "resolve_bridge_runtime",
                      "BRIDGE_EVENT_NAME", "BRIDGE_EVENT_DEFINITION", "WebhookConnection",
                      "standard_webhook_headers", "webhook_address_allowed"):
     globals()[_bridge_name] = _bridge_components[_bridge_name]

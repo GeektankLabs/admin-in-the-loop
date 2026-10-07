@@ -1687,7 +1687,15 @@ class RemoteFixture:
             value = json.loads(line())
             self.url = "https://127.0.0.1:" + str(value["port"])
             self.pin = value["pin"]
-            self.code = line().split(": ", 1)[1].strip()
+            # M9: the guided console may show usable URLs and the SPKI pin before
+            # the pairing code; consume a bounded number of informational lines.
+            pair_line = line()
+            for _ in range(32):
+                if pair_line.startswith("PAIR CODE"):
+                    break
+                pair_line = line()
+            a.require(pair_line.startswith("PAIR CODE"), "remote_start_failed")
+            self.code = pair_line.split(": ", 1)[1].strip()
         except BaseException:
             self.close()
             raise
@@ -3334,6 +3342,271 @@ class RiskSentPreservationTests(unittest.TestCase):
         snapshot = self.core.command_risk_snapshot()
         self.assertIsNone(snapshot.result)
         self.assertEqual(snapshot.state, "STALE")
+
+
+class QrexecForwarderTests(unittest.TestCase):
+    """M9: Main manages ONLY its own qvm-connect-tcp forwarder; honest phases;
+    foreign processes are never adopted or killed; no double instances."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-qrexec-")
+        self.addCleanup(self.temp.cleanup)
+        binary = Path(self.temp.name, "qvm-connect-tcp")
+        binary.write_text("#!" + str(Path(sys.executable).resolve()) + "\n" + (
+            "import socket, sys, time\n"
+            "local, target, remote = sys.argv[1].split(':')\n"
+            "if target == 'failqube':\n"
+            "    sys.exit(3)\n"
+            "srv = socket.socket()\n"
+            "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "srv.bind(('127.0.0.1', int(local)))\n"
+            "srv.listen(5)\n"
+            "while True:\n"
+            "    time.sleep(0.5)\n"))
+        binary.chmod(0o700)
+        patcher = mock.patch.object(a.shutil, "which", return_value=str(binary))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_start_listener_status_stop(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        port = self.free_port()
+        self.assertEqual(forwarder.status(), {"forwarder_running": False, "local_listener": False,
+                                              "target": None, "port": None})
+        forwarder.start("target-vm", port)
+        self.assertTrue(forwarder.running)
+        status = forwarder.status()
+        self.assertTrue(status["forwarder_running"])
+        self.assertTrue(status["local_listener"])  # listener present – still no policy proof
+        self.assertEqual((status["target"], status["port"]), ("target-vm", port))
+        forwarder.stop()
+        self.assertFalse(forwarder.running)
+
+    def test_single_instance_and_target_switch(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        port = self.free_port()
+        forwarder.start("target-vm", port)
+        first = forwarder.process
+        forwarder.start("target-vm", port)  # identical request: no duplicate process
+        self.assertIs(forwarder.process, first)
+        second_port = self.free_port()
+        forwarder.start("other-vm", second_port)
+        self.assertIsNot(forwarder.process, first)
+        self.assertEqual(forwarder.status()["target"], "other-vm")
+        self.assertIsNotNone(first.poll())  # the old OWN process was shut down cleanly
+
+    def test_immediate_exit_is_reported_honestly(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        with self.assertRaisesRegex(a.ProbeError, "qrexec_forwarder_failed"):
+            forwarder.start("failqube", self.free_port())
+        self.assertFalse(forwarder.running)
+
+    def test_foreign_listener_is_never_adopted_or_killed(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        foreign = socket.socket()
+        foreign.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        foreign.bind(("127.0.0.1", 0))
+        foreign.listen(1)
+        self.addCleanup(foreign.close)
+        port = foreign.getsockname()[1]
+        with self.assertRaisesRegex(a.ProbeError, "qrexec_port_conflict"):
+            forwarder.start("target-vm", port)
+        self.assertFalse(forwarder.running)
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0)  # foreign listener untouched
+
+    def test_missing_tool_and_invalid_names(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        with mock.patch.object(a.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(a.ProbeError, "qrexec_tool_missing"):
+                forwarder.start("target-vm", self.free_port())
+        with self.assertRaisesRegex(a.ProbeError, "invalid_qube_name"):
+            forwarder.start("bad name", self.free_port())
+        self.assertFalse(forwarder.running)
+
+
+class QrexecConfigPersistenceTests(unittest.TestCase):
+    """M9: qrexec config is private persistent state; restart recovery restores
+    Main's own forwarder; legacy three-field connection files stay readable."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-qrexec-store-")
+        self.addCleanup(self.temp.cleanup)
+        self.store = a.ConnectionStore(Path(self.temp.name, "config"))
+
+    def test_legacy_file_and_schema_guards(self):
+        legacy = self.store.directory / "connection.json"
+        self.store.directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.store.directory, 0o700)
+        legacy.write_bytes(a.net_json({"version": 1, "profile": None, "tunnel": None}))
+        os.chmod(legacy, 0o600)
+        self.assertIsNone(self.store.load_connection()["qrexec"])
+        self.store.save_connection()
+        self.assertIsNone(self.store.load_connection()["qrexec"])
+        for body in ({"version": 1, "profile": None, "tunnel": None, "qrexec": None, "extra": 1},
+                     {"version": 1, "profile": None, "tunnel": None, "qrexec": {"target": "ok", "port": "8443"}},
+                     {"version": 1, "profile": None, "tunnel": None, "qrexec": {"target": "bad name", "port": 1}}):
+            legacy.write_bytes(a.net_json(body))
+            with self.assertRaises(a.ProbeError):
+                self.store.load_connection()
+
+    def test_core_persists_and_recovers_own_forwarder_config(self):
+        binary = Path(self.temp.name, "qvm-connect-tcp")
+        binary.write_text("#!" + str(Path(sys.executable).resolve()) + "\n" + (
+            "import socket, sys, time\n"
+            "local, target, remote = sys.argv[1].split(':')\n"
+            "srv = socket.socket()\n"
+            "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            "srv.bind(('127.0.0.1', int(local)))\n"
+            "srv.listen(5)\n"
+            "while True:\n"
+            "    time.sleep(0.5)\n"))
+        binary.chmod(0o700)
+        with mock.patch.object(a.shutil, "which", return_value=str(binary)):
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            core = a.AppCore(connection_store=self.store)
+            try:
+                core.start_qrexec_forwarder("target-vm", port)
+                self.assertEqual(core.qrexec, {"target": "target-vm", "port": port})
+                self.assertEqual(self.store.load_connection()["qrexec"], {"target": "target-vm", "port": port})
+            finally:
+                core.close()
+            self.assertFalse(core.qrexec_forwarder.running)  # clean shutdown of the own process
+            restored = a.AppCore(connection_store=self.store)
+            try:
+                self.assertEqual(restored.qrexec, {"target": "target-vm", "port": port})
+                profile = a.ConnectionProfile("https://127.0.0.1:%d" % port, "0" * 64,
+                                              "0" * 32, "0" * 32, "0" * 64)
+                self.store.save_connection(profile, None, restored.qrexec)
+                forwarder = mock.Mock(running=False)
+                restored.qrexec_forwarder = forwarder
+                restored.saved_connection = None
+                with mock.patch.object(restored, "connect_profile") as connect:
+                    restored.connect_saved_bridge()
+                forwarder.start.assert_called_once_with("target-vm", port)  # restart recovery
+                connect.assert_called_once()
+                self.assertEqual(connect.call_args.args[0].url, "https://127.0.0.1:%d" % port)
+            finally:
+                restored.close()
+
+    def test_controller_paired_lifecycle(self):
+        with tempfile.TemporaryDirectory(prefix="aitl-paired-") as directory:
+            store = a.BridgeStore(Path(directory), uuid.uuid4().hex)
+            self.addCleanup(store.close)
+            self.assertFalse(store.controller_paired())
+            code = store.open_pair()
+            claim = store.claim({"code": code, "request_id": uuid.uuid4().hex})
+            self.assertFalse(store.controller_paired())  # PAIR_PENDING is not paired yet
+            store.confirm(claim["token"])
+            self.assertTrue(store.controller_paired())
+
+
+class BridgeStandaloneSetupTests(unittest.TestCase):
+    """M9: standalone --bridge without flags beyond state/port – automatic TLS
+    SANs, usable-URL display, guided first-launch pairing; a paired bridge never
+    re-opens pairing on later starts and keeps its persisted certificate."""
+
+    def setUp(self):
+        self.buffers = {}
+
+    def spawn(self, state_dir):
+        process = subprocess.Popen([sys.executable, "-I", str(Path(a.__file__).resolve()),
+                                    "--bridge", "--state-dir", str(state_dir), "--port", "0"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env=a.isolated_service_environment(), close_fds=True)
+        self.addCleanup(lambda: self.reap(process))
+        return process
+
+    @staticmethod
+    def reap(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        process.stdout.close()
+
+    def read_line(self, process, timeout=8):
+        # One full line per call; leftover bytes stay buffered for the next read.
+        buffer = self.buffers.setdefault(process, bytearray())
+        deadline = time.monotonic() + timeout
+        while True:
+            index = buffer.find(b"\n")
+            if index >= 0:
+                line = bytes(buffer[:index + 1])
+                del buffer[:index + 1]
+                return line.decode()
+            if time.monotonic() >= deadline:
+                return None
+            readable = select.select([process.stdout], [], [], 0.05)[0]
+            if not readable:
+                if process.poll() is not None:
+                    return None
+                continue
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                return None
+            buffer.extend(chunk)
+
+    def test_first_launch_guided_pairing_and_paired_restart(self):
+        with tempfile.TemporaryDirectory(prefix="aitl-standalone-") as directory:
+            state = Path(directory, "state")
+            process = self.spawn(state)
+            info = json.loads(self.read_line(process))
+            self.assertIsNotNone(info["pin"])  # automatic TLS without --tls-name
+            lines, code_line = [], None
+            for _ in range(32):
+                line = self.read_line(process, 4)
+                if line is None:
+                    break
+                lines.append(line)
+                if line.startswith("PAIR CODE"):
+                    code_line = line
+                    break
+            self.assertIsNotNone(code_line)  # guided first start opens pairing automatically
+            self.assertTrue(any(line.startswith("Nutzbare URLs") for line in lines))
+            self.assertTrue(any(line.startswith("SPKI SHA-256: ") for line in lines))
+            for line in lines:
+                if line.strip().startswith("https://"):
+                    self.assertNotIn("0.0.0.0", line)  # wildcard bind is never a URL
+            url = "https://127.0.0.1:%d" % info["port"]
+            store = a.ConnectionStore(Path(directory, "config"))
+            core = a.AppCore(connection_store=store)
+            try:
+                profile = core.pair_remote(url, info["pin"], code_line.split(": ", 1)[1].strip())
+                self.assertEqual(profile.mode, "REMOTE")
+            finally:
+                core.close()
+            self.reap(process)
+            # Later start: persisted identity/auth – no new pairing window.
+            second = self.spawn(state)
+            info2 = json.loads(self.read_line(second))
+            self.assertEqual(info2["pin"], info["pin"])  # certificate/trust persisted
+            extra = []
+            for _ in range(32):
+                line = self.read_line(second, 1.0)
+                if line is None:
+                    break
+                extra.append(line)
+                if line.startswith("PAIR CODE"):
+                    break
+            self.assertFalse(any(line.startswith("PAIR CODE") for line in extra))
+            self.reap(second)
 
 
 if __name__ == "__main__":

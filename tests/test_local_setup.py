@@ -444,5 +444,67 @@ class CompactConnectionPresentationTests(unittest.TestCase):
             self.assertIn("gesperrt", a.local_setup_summary(core))
 
 
+class BridgeSetupDefaultsTests(unittest.TestCase):
+    """M9: home-state defaults, path resolution, auto SAN, usable URLs, policy line."""
+
+    def test_default_state_dir_is_private_home_path(self):
+        with mock.patch.object(a.Path, "home", return_value=Path("/home/operator")):
+            self.assertEqual(a.default_state_dir(), Path("/home/operator/.local/state/aitl-bridge"))
+
+    def test_resolve_state_dir_expands_tilde_relative_and_spaces(self):
+        with mock.patch.dict(os.environ, {"HOME": "/home/operator"}):
+            self.assertEqual(a.resolve_state_dir("~/.aitl x"), "/home/operator/.aitl x")
+        with mock.patch.object(a.Path, "cwd", return_value=Path("/tmp/base")):
+            self.assertEqual(a.resolve_state_dir("relative dir"), "/tmp/base/relative dir")
+        self.assertEqual(a.resolve_state_dir("/abs/path"), "/abs/path")
+        with self.assertRaises(a.BridgeError):
+            a.resolve_state_dir("   ")
+
+    def test_resolve_bridge_runtime_defaults_and_bootstrap_contract(self):
+        # Standalone: 0.0.0.0:8443 without prompting, automatic SAN names.
+        bind, port, names = a.resolve_bridge_runtime(None, None, [], False)
+        self.assertEqual((bind, port), ("0.0.0.0", 8443))
+        self.assertEqual(names[:2], ["localhost", "127.0.0.1"])
+        # Explicit overrides win; internal bootstrap stays loopback without TLS.
+        self.assertEqual(a.resolve_bridge_runtime("127.0.0.1", 9000, ["x.example"], False)[0:2],
+                         ("127.0.0.1", 9000))
+        self.assertEqual(a.resolve_bridge_runtime(None, None, [], True), ("127.0.0.1", 0, []))
+
+    def test_default_tls_names_and_usable_urls(self):
+        with mock.patch.object(a, "local_interface_ips", return_value=["192.168.1.50", "192.168.1.50"]):
+            names = a.default_tls_names(["bridge.example", "192.168.1.50"])
+        self.assertEqual(names[:2], ["localhost", "127.0.0.1"])
+        self.assertIn("192.168.1.50", names)
+        self.assertIn("bridge.example", names)
+        self.assertEqual(len(names), len(set(names)))
+        # A wildcard bind is never shown as a usable destination URL.
+        self.assertEqual(a.usable_urls("0.0.0.0", 8443, ["0.0.0.0", "localhost", "192.168.1.50"]),
+                         ["https://localhost:8443", "https://192.168.1.50:8443"])
+
+    def test_local_interface_ips_failure_is_non_fatal(self):
+        with mock.patch.object(a.socket, "if_nameindex", side_effect=OSError):
+            self.assertEqual(a.local_interface_ips(), [])
+
+    def test_qrexec_policy_line_and_qube_names(self):
+        with mock.patch.dict(os.environ, {"QUBES_VM_NAME": "work-qube"}):
+            self.assertEqual(a.source_qube_name(), "work-qube")
+            self.assertTrue(a.qubes_detected())
+            self.assertEqual(a.qrexec_policy_line(a.source_qube_name(), "untrusted", 8443),
+                             "qubes.ConnectTCP +8443 work-qube untrusted allow")
+        environ = {key: value for key, value in os.environ.items() if key != "QUBES_VM_NAME"}
+        with mock.patch.dict(os.environ, environ, clear=True):
+            self.assertIsNone(a.source_qube_name())
+            # Honest marker-only detection; never a guessed privileged identity.
+            self.assertEqual(a.qubes_detected(), Path("/usr/share/qubes/marker-vm").exists())
+        # Unknown source uses the documented board placeholder, never a silent guess.
+        self.assertEqual(a.qrexec_policy_line(None, "untrusted"),
+                         "qubes.ConnectTCP +8443 personal untrusted allow")
+        for bad in ("", "  ", "with space", "-start", "x" * 64, "a;b", "a\nb"):
+            with self.assertRaises(a.ProbeError):
+                a.validate_qube_name(bad)
+        for good in ("personal", "untrusted", "work-2", "sys_net.ext"):
+            self.assertEqual(a.validate_qube_name(good), good)
+
+
 if __name__ == "__main__":
     unittest.main(testRunner=unittest.TextTestRunner(verbosity=2, resultclass=a.SafeResult))
