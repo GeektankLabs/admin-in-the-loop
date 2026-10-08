@@ -437,9 +437,22 @@ class CompactConnectionPresentationTests(unittest.TestCase):
         with mock.patch.object(core, "bridge_snapshot", return_value=bridge):
             summary = a.local_setup_summary(core)
             self.assertIn("authentifiziert", summary)
-            self.assertIn("Tunnelbetrieb am Gateway", summary)
+            # M9: kein unbelegter Blankett-Satz mehr – ohne Statusprobe wird der
+            # Tunnelstatus als „wird geprüft“ ausgewiesen.
+            self.assertNotIn("Tunnelbetrieb am Gateway", summary)
+            self.assertIn("Tunnelstatus wird geprüft", summary)
             self.assertNotIn("Tunnel-Zugriff geprüft", summary)
             self.assertNotIn("Round", summary)
+        for phase, expected in (("missing", "Tunnel fehlt"), ("starting", "Tunnel startet"),
+                                ("connected", "Tunnel verbunden")):
+            with mock.patch.object(core, "bridge_snapshot",
+                                   return_value=a.replace(bridge, tunnel_phase=phase)):
+                self.assertIn(expected, a.local_setup_summary(core))
+        with mock.patch.object(core, "bridge_snapshot",
+                               return_value=a.replace(bridge, tunnel_phase="error",
+                                                      tunnel_detail="tunnel_client_unavailable")):
+            self.assertIn("Tunnel-Fehler", a.local_setup_summary(core))
+            self.assertIn("tunnel_client_unavailable", a.local_setup_summary(core))
         with mock.patch.object(core, "bridge_snapshot", return_value=a.replace(bridge, state="BLOCKED")):
             self.assertIn("gesperrt", a.local_setup_summary(core))
 
@@ -450,7 +463,7 @@ class AppVersionConsistencyTests(unittest.TestCase):
     muessen identisch sein; --version existiert im Haupt-Parser."""
 
     def test_version_sources_pinned(self):
-        self.assertEqual(a.APP_VERSION, "0.9.1")
+        self.assertEqual(a.APP_VERSION, "0.9.2")
         self.assertEqual(a.BRIDGE_SERVER_INFO["name"], "admin-in-the-loop")
         self.assertEqual(a.BRIDGE_SERVER_INFO["version"], a.APP_VERSION)
 

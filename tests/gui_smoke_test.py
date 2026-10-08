@@ -372,7 +372,14 @@ class ConnectionDialogTests(unittest.TestCase):
             dialog = self.ui.connection_settings()
             self.root.update()
             self.assertIn("Remote-Bridge verbunden · authentifiziert", dialog.summary.get())
-            self.assertIn("Tunnelbetrieb am Gateway", self.ui.ai_status.get())
+            # M9: kein unbelegter Tunnelbetrieb-Satz; der echte Bridge-Status wird
+            # beobachtet und die Tunnel-Seite automatisch angesteuert.
+            self.assertNotIn("Tunnelbetrieb am Gateway", dialog.summary.get())
+            self.until(lambda: "Tunnel fehlt" in self.ui.ai_status.get())
+            self.assertIn("Tunnel fehlt · Einrichtung nötig", self.ui.ai_status.get())
+            self.until(lambda: dialog.wizard_index == 2)
+            self.assertTrue(dialog.remote_tunnel_page.winfo_ismapped())
+            self.assertFalse(dialog.tunnel_section.winfo_ismapped())
             self.assertNotIn("noch nicht verifiziert", dialog.summary.get())
             self.assertNotIn("Tunnel-Zugriff geprüft", dialog.summary.get())
             self.assertNotIn("Tunnel gestoppt", self.ui.ai_status.get())
@@ -586,6 +593,47 @@ class ConnectionDialogTests(unittest.TestCase):
             self.until(lambda: self.core.bridge_state == "CONNECTED")
             self.assertEqual(len(claims), 1)
             self.assertIsNone(self.core.bridge_process)
+        self.assertEqual(self.callbacks, [])
+
+
+    def test_tunnel_step_auto_switch_and_chat_code_auto_reveal(self):
+        """M9 S4/S5: der echte Tunnelstatus steuert die Seiten – fehlt/startet ->
+        Tunnel-Seite, verbunden -> Chat-Seite und Code einmalig automatisch."""
+        dialog = self.ui.connection_settings()
+        dialog.location.set("REMOTE")
+        dialog.wizard_goto(1)
+        self.root.update()
+        base = self.core.bridge_snapshot()
+        now = time.time()
+        binding = {"code": "ABCDEFGH", "code_digest": "0" * 64, "generation": 1,
+                   "issued_at": now, "expires_at": now + 3600, "server_time": now,
+                   "status": "VALID", "retry_at": None, "restriction_scope": None,
+                   "locked_principals": 0}
+        missing = a.replace(base, state="CONNECTED", mode="REMOTE", instance="a" * 32,
+                            generation=1, tunnel_phase="missing", tunnel_detail="")
+        with mock.patch.object(self.core, "bridge_snapshot", return_value=missing), \
+                mock.patch.object(self.core, "begin_tunnel_probe"):
+            dialog.render()
+            self.root.update()
+        self.assertEqual(dialog.wizard_index, 2)
+        self.assertTrue(dialog.remote_tunnel_page.winfo_ismapped())
+        self.assertIn("Kein Tunnel konfiguriert", dialog.remote_tunnel_status.get())
+        connected = a.replace(missing, tunnel_phase="connected", chat_binding=binding,
+                              chat_binding_received_at=time.monotonic())
+        with mock.patch.object(self.core, "bridge_snapshot", return_value=connected), \
+                mock.patch.object(self.core, "begin_tunnel_probe"):
+            dialog.render()
+            self.root.update()
+        self.assertEqual(dialog.wizard_index, 3)
+        self.assertTrue(dialog.chat_section.winfo_ismapped())
+        self.assertEqual(dialog.binding.get(), "ABCD-EFGH")  # S5: einmal automatisch
+        error = a.replace(missing, tunnel_phase="error", tunnel_detail="runtime_key_rejected")
+        dialog.wizard_goto(1)
+        with mock.patch.object(self.core, "bridge_snapshot", return_value=error), \
+                mock.patch.object(self.core, "begin_tunnel_probe"):
+            dialog.render()
+        self.assertEqual(dialog.wizard_index, 2)
+        self.assertIn("Runtime API key", dialog.remote_tunnel_status.get())
         self.assertEqual(self.callbacks, [])
 
 
@@ -1293,7 +1341,7 @@ class QrexecDialogTests(unittest.TestCase):
             self.assertFalse(hidden.winfo_ismapped())
         dialog.location.set("REMOTE")
         self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 3 · Bridge-Standort und Startbefehl")
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 4 · Bridge-Standort und Startbefehl")
         self.assertTrue(dialog.remote_setup.winfo_ismapped())
         self.assertFalse(dialog.remote_pair.winfo_ismapped())
         self.assertFalse(dialog.cards.winfo_ismapped())
@@ -1324,12 +1372,12 @@ class QrexecDialogTests(unittest.TestCase):
             dialog.fields["qrexec_target"].set(bad)
             dialog.buttons["wizard_next"].invoke()
             self.assertIn("Qube-Name", dialog.errors["bridge"].get())
-            self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 4 · Ziel-Qube")
+            self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 5 · Ziel-Qube")
         dialog.fields["qrexec_target"].set("untrusted")
         dialog.buttons["wizard_next"].invoke()
         self.assertIn("nicht verifiziert", dialog.qubes_note.get())
         self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 4 · Bridge starten und verbinden")
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 5 · Bridge starten und verbinden")
         self.assertEqual(dialog.qrexec_command_box.text.get("1.0", "end-1c").strip(),
                          "python3 ./admin_in_the_loop.py --bridge")
         self.assertTrue(any("Strg+Umschalt+C" in text for text in self.labels(dialog.q2)))
@@ -1365,7 +1413,7 @@ class QrexecDialogTests(unittest.TestCase):
         check.assert_called_once()
         hello.assert_called_once_with("https://127.0.0.1:8443")
         self.assertEqual(dialog.wizard_index, 2)
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 4 · Bewusst koppeln")
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 5 · Bewusst koppeln")
         displayed = dialog.qrexec_pin_box.text.get("1.0", "end-1c").replace(" ", "")
         self.assertEqual(displayed, "ab" * 32)  # vollständiger Fingerprint, nur Anzeige
         self.assertEqual(dialog.qrexec_pin_box.text.cget("state"), "disabled")

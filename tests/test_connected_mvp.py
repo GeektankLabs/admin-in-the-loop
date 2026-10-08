@@ -2076,6 +2076,225 @@ class ServiceHarness:
         raise a.ProbeError("events_test_timeout")
 
 
+class BridgeTunnelTests(unittest.TestCase):
+    """M9: bridge-owned tunnel config/status contract, protected 0600 persistence
+    and the bounded one-start lifecycle. No real client, no cloud, no secrets."""
+
+    class FakeProcess:
+        def __init__(self, exit_code=None):
+            self.pid = 999999999
+            self.exit_code = exit_code
+
+        def poll(self):
+            return self.exit_code
+
+        def terminate(self):
+            self.exit_code = -15
+
+        def kill(self):
+            self.exit_code = -9
+
+        def wait(self, timeout=None):
+            return self.exit_code if self.exit_code is not None else 0
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-bridge-tunnel-")
+        self.addCleanup(self.temp.cleanup)
+        self.tunnel_id, self.key = "tunnel_" + "b" * 32, "R" * 32
+
+    def recorder(self):
+        calls, processes = [], []
+        def spawn(argv, **kwargs):
+            calls.append((argv, kwargs))
+            processes.append(self.FakeProcess())
+            return processes[-1]
+        return spawn, calls, processes
+
+    def live_tunnel(self, spawn, directory=None):
+        tunnel = a.BridgeTunnel(directory or self.temp.name, spawn=spawn)
+        tunnel._locate = lambda: "/bin/true"
+        tunnel.attach(41111, Path(self.temp.name, "ai-token"))
+        return tunnel
+
+    def test_config_persistence_restart_and_key_never_leaves(self):
+        spawn, calls, processes = self.recorder()
+        tunnel = a.BridgeTunnel(self.temp.name, spawn=spawn)
+        self.assertEqual(tunnel.status(), {"version": 1, "phase": "missing", "detail": ""})
+        tunnel = self.live_tunnel(spawn)
+        self.assertEqual(tunnel.configure(self.tunnel_id, self.key)["phase"], "starting")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0][0]
+        self.assertNotIn(self.key, " ".join(argv))
+        self.assertIn("file:" + str(Path(tunnel.work, "api-key")), argv)
+        key_file = Path(tunnel.work, "api-key")
+        self.assertEqual(key_file.read_text(), self.key)
+        self.assertEqual(key_file.stat().st_mode & 0o777, 0o600)
+        stored = Path(self.temp.name, "tunnel.json")
+        self.assertEqual(json.loads(stored.read_text())["runtime_key"], self.key)
+        self.assertEqual(stored.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(self.key, json.dumps(tunnel.status()))
+        self.assertNotIn(self.key, repr(tunnel.status()))
+        # A bridge restart re-loads the protected config and starts exactly once more.
+        reloaded = a.BridgeTunnel(self.temp.name, spawn=spawn)
+        self.assertEqual(reloaded.status()["phase"], "configured")
+        reloaded._locate = lambda: "/bin/true"
+        reloaded.attach(41111, Path(self.temp.name, "ai-token"))
+        self.assertEqual(reloaded.status()["phase"], "starting")
+        self.assertEqual(len(calls), 2)
+        # A deliberate replace stops the old process and starts the new config once.
+        replacement = self.recorder()
+        reloaded.spawn = replacement[0]
+        self.assertEqual(reloaded.configure("tunnel_" + "c" * 32, "S" * 32)["phase"], "starting")
+        self.assertEqual(len(replacement[1]), 1)
+        self.assertNotIn("R" * 32, " ".join(replacement[1][0][0]))
+        reloaded.close()
+        tunnel.close()
+
+    def test_health_auth_failure_transient_state_and_process_exit(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        payload = {"schema_version": 1, "component": "control-plane", "status": "ok",
+                   "details": {"http_status": 401, "last_success": None, "consecutive_failures": 3}}
+        class Health(BaseHTTPRequestHandler):
+            def do_GET(self):
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Health)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        spawn, calls, processes = self.recorder()
+        tunnel = self.live_tunnel(spawn)
+        tunnel.configure(self.tunnel_id, self.key)
+        health = Path(tunnel.work, "health-url")
+        health.write_text("http://127.0.0.1:%d" % server.server_address[1])
+        os.chmod(health, 0o600)
+        tunnel.checked_at = 0.0  # the observation throttle is not under test here
+        status = tunnel.status()
+        self.assertEqual((status["phase"], status["detail"]), ("error", "runtime_key_rejected"))
+        self.assertIsNone(tunnel.process)
+        # Transient provider state stays a bounded wait, never a premature claim.
+        payload["details"] = {"http_status": 429, "last_success": None, "consecutive_failures": 0}
+        tunnel.configure(self.tunnel_id, self.key)
+        health = Path(tunnel.work, "health-url")
+        health.write_text("http://127.0.0.1:%d" % server.server_address[1])
+        os.chmod(health, 0o600)
+        tunnel.checked_at = 0.0
+        status = tunnel.status()
+        self.assertEqual((status["phase"], status["detail"]), ("starting", "runtime_rate_limited"))
+        # A healthy control-plane poll is the only accepted readiness evidence.
+        payload["details"] = {"http_status": 200, "last_success": "2026-10-08T10:00:00Z",
+                              "consecutive_failures": 0}
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "connected")
+        tunnel.close()
+        # An exited client is reported honestly instead of being reanimated.
+        spawn2, calls2, processes2 = self.recorder()
+        tunnel2 = a.BridgeTunnel(self.temp.name, spawn=spawn2)
+        tunnel2._locate = lambda: "/bin/true"
+        tunnel2.attach(41111, Path(self.temp.name, "ai-token"))
+        self.assertEqual(tunnel2.configure(self.tunnel_id, self.key)["phase"], "starting")
+        tunnel2.tail.extend(("Runtime API key " + self.key + " rejected\nvalue " + "x" * 40 + "\n").encode())
+        tunnel2.process.exit_code = 1
+        tunnel2.checked_at = 0.0
+        detail = tunnel2.status()["detail"]
+        self.assertTrue(detail.startswith("tunnel_process_exited"))
+        self.assertNotIn(self.key, detail)
+        self.assertNotIn("x" * 40, detail)
+        self.assertIn("credential-bearing line omitted", detail)
+        self.assertIn("[REDACTED]", detail)
+        tunnel2.close()
+
+    def test_controller_only_endpoints_and_validation(self):
+        with tempfile.TemporaryDirectory(prefix="aitl-tunnel-http-") as directory:
+            store = a.BridgeStore(directory, uuid.uuid4().hex, clock=lambda: time.time())
+            self.addCleanup(store.close)
+            controller, controller_id = store.issue("CONTROLLER")
+            ai, ai_id = store.issue("AI")
+            harness = ServiceHarness(store, controller, controller_id, ai, ai_id)
+            self.addCleanup(harness.close)
+            profile = harness.profile
+            self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/tunnel/status"),
+                             {"version": 1, "phase": "missing", "detail": ""})
+            self.assertEqual(request(profile.url, path="/v1/tunnel/status")[0], 401)
+            self.assertEqual(request(profile.url, "PUT", path="/v1/tunnel/config",
+                                     body={"version": 1, "tunnel_id": "tunnel_" + "a" * 32,
+                                           "runtime_key": "k" * 16})[0], 401)
+            headers = {"Authorization": "Bearer " + controller}
+            for body, code in (({"version": 1, "tunnel_id": "tunnel_short", "runtime_key": "k" * 16},
+                                "tunnel_config_invalid_id"),
+                               ({"version": 1, "tunnel_id": "tunnel_" + "a" * 32, "runtime_key": "x"},
+                                "tunnel_config_invalid_key"),
+                               ({"version": 1, "tunnel_id": "tunnel_" + "a" * 32, "runtime_key": "k" * 16,
+                                 "extra": 1}, "invalid_schema"),
+                               ({"version": 2, "tunnel_id": "tunnel_" + "a" * 32, "runtime_key": "k" * 16},
+                                "invalid_schema")):
+                status, raw = request(profile.url, "PUT", path="/v1/tunnel/config", body=body, headers=headers)
+                self.assertEqual((status, json.loads(raw)), (400, {"error": code}))
+            value = a.BridgeHTTP(profile).request("PUT", "/v1/tunnel/config",
+                                                  {"version": 1, "tunnel_id": "tunnel_" + "a" * 32,
+                                                   "runtime_key": "k" * 16})
+            self.assertEqual(value["phase"], "configured")
+            self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/tunnel/status")["phase"], "configured")
+
+
+class RemoteTunnelCoordinationTests(unittest.TestCase):
+    """M9 S4: Main observes and saves through the same authenticated bridge."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-tunnel-coord-")
+        self.addCleanup(self.temp.cleanup)
+        self.store = a.BridgeStore(self.temp.name, uuid.uuid4().hex, clock=lambda: time.time())
+        self.addCleanup(self.store.close)
+        controller, controller_id = self.store.issue("CONTROLLER")
+        ai, ai_id = self.store.issue("AI")
+        self.harness = ServiceHarness(self.store, controller, controller_id, ai, ai_id)
+        self.addCleanup(self.harness.close)
+        self.core = a.AppCore()
+        self.addCleanup(self.core.close)
+        self.core.bridge_profile = self.harness.profile
+        self.core.bridge_state = "CONNECTED"
+        self.core.bridge_instance = self.store.instance
+
+    def wait(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.core.pump()
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("tunnel_coordination_timeout")
+
+    def test_probe_save_and_disconnect_clear_state(self):
+        key = "k" * 32
+        self.core.begin_tunnel_probe()
+        self.wait(lambda: self.core.remote_tunnel is not None)
+        self.assertEqual(self.core.remote_tunnel["phase"], "missing")
+        self.assertEqual(self.core.bridge_snapshot().tunnel_phase, "missing")
+        with self.assertRaises(a.ProbeError):
+            self.core.save_remote_tunnel("not-a-tunnel", key)
+        with self.assertRaises(a.ProbeError):
+            self.core.save_remote_tunnel("tunnel_" + "a" * 32, "short")
+        self.core.save_remote_tunnel("tunnel_" + "a" * 32, key)
+        self.wait(lambda: self.core.remote_tunnel is not None
+                  and self.core.remote_tunnel["phase"] == "configured")
+        self.assertFalse(self.core.remote_tunnel_busy)
+        self.assertNotIn(key, json.dumps(self.core.remote_tunnel))
+        self.assertNotIn(key, repr(self.core.bridge_snapshot()))
+        stored = Path(self.store.directory, "tunnel.json")
+        self.assertEqual(json.loads(stored.read_text())["runtime_key"], key)
+        self.assertEqual(stored.stat().st_mode & 0o777, 0o600)
+        self.core.disconnect_bridge()
+        self.assertIsNone(self.core.remote_tunnel)
+        self.assertIsNone(self.core.remote_tunnel_probe)
+        self.assertIsNone(self.core.bridge_snapshot().tunnel_phase)
+
+
 class EventSubscriptionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="aitl-events-suite-")
