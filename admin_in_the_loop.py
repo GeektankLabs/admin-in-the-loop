@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 
 
 def _load_bridge_component(namespace=None):
@@ -5677,6 +5677,7 @@ class ConnectionDialog:
         self.auto_chat_key = None
         self.auto_local_key = None
         self.was_tunnel_busy = False
+        self.auto_takeover_key = None
         self.fields, self.entries, self.buttons, self.labels = {}, {}, {}, []
         self.errors = {name: self.tk.StringVar(master=self.window) for name in ("bridge", "tunnel")}
         self.summary = self.tk.StringVar(master=self.window)
@@ -5813,16 +5814,22 @@ class ConnectionDialog:
         self.label(self.remote_tunnel_page, 0, "Die Bridge ist gekoppelt. Jetzt den Tunnel am Gateway verbinden: "
                    "Tunnel-ID und Restricted Runtime Key werden über die gepinnte, authentifizierte Verbindung an "
                    "dieselbe Bridge übertragen, dort geschützt gespeichert und einmalig gestartet. Die App behält "
-                   "den Key nicht dauerhaft und zeigt ihn nie im Klartext an. Fehlt der Client am Gateway, sagt "
+                   "den Key nicht dauerhaft. Beide Eingaben sind lesbar, damit du die Werte gegenprüfen kannst; "
+                   "nach bestätigter Übertragung wird das Key-Feld geleert. Fehlt der Client am Gateway, sagt "
                    "der Status das konkret – nichts wird still installiert.")
-        self.entry(self.remote_tunnel_page, 1, "remote_tunnel_id", "Tunnel-ID (tunnel_ + 32 Hexzeichen)")
-        self.entry(self.remote_tunnel_page, 2, "remote_runtime_key", "Restricted Runtime Key", secret=True)
-        self.button(self.remote_tunnel_page, 3, "save_remote_tunnel", "Tunnel verbinden und speichern", "bridge",
+        # Operator 08.10. (0.9.3): gültige vorhandene Tunnelkonfiguration überspringt
+        # das ID/Key-Formular – Status und Fortschritt bleiben sichtbar.
+        self.remote_tunnel_form = self.ttk.Frame(self.remote_tunnel_page)
+        self.remote_tunnel_form.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.remote_tunnel_form.columnconfigure(1, weight=1)
+        self.entry(self.remote_tunnel_form, 0, "remote_tunnel_id", "Tunnel-ID (tunnel_ + 32 Hexzeichen)")
+        self.entry(self.remote_tunnel_form, 1, "remote_runtime_key", "Restricted Runtime Key")
+        self.button(self.remote_tunnel_form, 2, "save_remote_tunnel", "Tunnel verbinden und speichern", "bridge",
                     self.save_tunnel_config)
-        self.label(self.remote_tunnel_page, 4, variable=self.remote_tunnel_status)
-        self.label(self.remote_tunnel_page, 5, "Der Status wird alle fünf Sekunden beobachtet; Beobachtung startet "
+        self.label(self.remote_tunnel_page, 2, variable=self.remote_tunnel_status)
+        self.label(self.remote_tunnel_page, 3, "Der Status wird alle fünf Sekunden beobachtet; Beobachtung startet "
                    "oder rotiert nichts. Nach erfolgreicher Verbindung geht es automatisch zur Chat-Seite; ohne "
-                   "Tunnel-Konfiguration bleibt diese Seite der bewusste Einrichtungsschritt.")
+                   "Tunnel-Konfiguration bleibt dieses Formular der bewusste Einrichtungsschritt.")
 
         self.qrexec_panel = self.ttk.Frame(bridge_section)
         self.qrexec_panel.columnconfigure(0, weight=1)
@@ -5931,13 +5938,17 @@ class ConnectionDialog:
         self.label(self.qrexec_tunnel_page, 0, "Die Bridge im Ziel-Qube ist gekoppelt. Jetzt den Tunnel dort "
                    "verbinden: Tunnel-ID und Restricted Runtime Key werden über die gepinnte, authentifizierte "
                    "Verbindung an dieselbe Bridge übertragen, im Ziel-Qube geschützt gespeichert (0600) und "
-                   "einmalig gestartet. Die App behält den Key nicht dauerhaft.")
-        self.entry(self.qrexec_tunnel_page, 1, "qrexec_tunnel_id", "Tunnel-ID (tunnel_ + 32 Hexzeichen)")
-        self.entry(self.qrexec_tunnel_page, 2, "qrexec_runtime_key", "Restricted Runtime Key", secret=True)
-        self.button(self.qrexec_tunnel_page, 3, "save_qrexec_tunnel", "Tunnel verbinden und speichern", "bridge",
+                   "einmalig gestartet. Die App behält den Key nicht dauerhaft. Beide Eingaben sind lesbar; "
+                   "nach bestätigter Übertragung wird das Key-Feld geleert.")
+        self.qrexec_tunnel_form = self.ttk.Frame(self.qrexec_tunnel_page)
+        self.qrexec_tunnel_form.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.qrexec_tunnel_form.columnconfigure(1, weight=1)
+        self.entry(self.qrexec_tunnel_form, 0, "qrexec_tunnel_id", "Tunnel-ID (tunnel_ + 32 Hexzeichen)")
+        self.entry(self.qrexec_tunnel_form, 1, "qrexec_runtime_key", "Restricted Runtime Key")
+        self.button(self.qrexec_tunnel_form, 2, "save_qrexec_tunnel", "Tunnel verbinden und speichern", "bridge",
                     self.save_tunnel_config)
-        self.label(self.qrexec_tunnel_page, 4, variable=self.remote_tunnel_status)
-        self.label(self.qrexec_tunnel_page, 5, "Der Status wird alle fünf Sekunden beobachtet; Beobachtung startet "
+        self.label(self.qrexec_tunnel_page, 2, variable=self.remote_tunnel_status)
+        self.label(self.qrexec_tunnel_page, 3, "Der Status wird alle fünf Sekunden beobachtet; Beobachtung startet "
                    "oder rotiert nichts. Nach erfolgreicher Verbindung geht es automatisch zur Chat-Seite.")
         self.label(bridge_section, 1, variable=self.errors["bridge"])
 
@@ -6536,9 +6547,9 @@ class ConnectionDialog:
             self.refresh_qubes_diagnostics()
             return
         if state == "already_paired":
-            self.qrexec_status.set("Diese Bridge ist bereits gekoppelt – keine erneute Kopplung nötig; "
-                                   "„Gespeicherte Qrexec-Verbindung öffnen“ oder bewusst neu koppeln "
-                                   "(Neukopplung ersetzt die aktive Freigabe).")
+            # 0.9.3: konsistente Fortführung statt Satzbremse – die gespeicherte
+            # Verbindung wird über den echt authentifizierten Weg übernommen.
+            self.qrexec_status.set(self.auto_takeover_paired())
             self.refresh_qubes_diagnostics()
             return
         self.qrexec_status.set("Code-Anforderung bestätigt: Kopplungscode jetzt auf der Bridge-Konsole im "
@@ -6577,8 +6588,7 @@ class ConnectionDialog:
             self.refresh_qubes_diagnostics()
             return
         if state == "already_paired":
-            self.remote_status.set("Gateway ist bereits gekoppelt – „Gespeicherte Remote-Verbindung öffnen“ "
-                                   "oder bewusst neu koppeln.")
+            self.remote_status.set(self.auto_takeover_paired())
         else:
             self.remote_status.set("Code-Anforderung bestätigt: Code auf der Gateway-Konsole ablesen, den "
                                    "angezeigten Fingerprint dort vollständig vergleichen, dann Code eingeben "
@@ -6591,7 +6601,7 @@ class ConnectionDialog:
         state = self.core.hello_bridge("https://127.0.0.1:%d" % self.qrexec_port())
         self.qrexec_status.set("Code-Anforderung erneuert: aktuellen Code auf der Bridge-Konsole im "
                                "Ziel-Qube ablesen (zehn Minuten, einmalig)." if state == "pairing_required"
-                               else "Diese Bridge ist bereits gekoppelt – kein neuer Code nötig.")
+                               else self.auto_takeover_paired())
         self.refresh_qubes_diagnostics()
 
     def stop_qrexec(self):
@@ -6637,13 +6647,53 @@ class ConnectionDialog:
             port = self.qrexec_port()
         except ProbeError:
             return False
-        return saved["profile"]["url"].rstrip("/") == "https://127.0.0.1:%d" % port
+        # 0.9.3: auch das eingegebene Ziel muss zum gespeicherten passen – eine
+        # Wiederherstellung darf nie stillschweigend ein anderes Qube verwenden.
+        return (saved["profile"]["url"].rstrip("/") == "https://127.0.0.1:%d" % port
+                and saved["qrexec"].get("target") == self.fields["qrexec_target"].get().strip())
 
     def open_saved_qrexec(self):
         self.refresh_saved()
         require(self.saved_qrexec_matches(), "no_saved_remote_connection")
         # connect_saved_bridge restores Main's own forwarder before connecting.
         self.core.connect_saved_bridge()
+
+    def auto_takeover_paired(self):
+        """already_paired (0.9.3): die Hallo-Meldung ist nur die Selbstangabe der
+        Brücke und autorisiert nichts; übernommen wird ausschließlich die passende,
+        gespeicherte gepinnte Controller-Verbindung über den bestehenden
+        authentifizierten Weg (Pin-Prüfung vor Bytes, idempotentes Confirm,
+        Statusvalidierung). Ohne passende eigene Credentials bleibt es ein
+        ehrlicher Status ohne Fortschritt – niemals ein Auth-Bypass und keine
+        automatische Neukopplung."""
+        if self.core.bridge_state != "DISCONNECTED":
+            return ("Bridgeverbindung besteht bereits oder wird aufgebaut; nichts wird erneut angestoßen. "
+                    "Der Assistent fährt bei Erfolg automatisch fort.")
+        self.refresh_saved()
+        location = self.location.get()
+        if location == "QREXEC":
+            matches, open_saved = self.saved_qrexec_matches(), self.open_saved_qrexec
+        elif location == "REMOTE":
+            matches, open_saved = self.saved_matches(), self.open_saved
+        else:
+            matches, open_saved = False, None
+        if not matches:
+            return ("Die Bridge meldet eine bestehende Kopplung, aber auf diesem Rechner ist keine passende "
+                    "gespeicherte Controller-Verbindung. Ohne eigene Credentials wird nichts übernommen – "
+                    "bewusst neu koppeln (ersetzt die aktive Freigabe) ist der einzige Weg.")
+        saved = self.core.saved_connection["profile"]
+        key = (location, saved["url"], saved.get("controller_id"))
+        if self.auto_takeover_key == key:
+            return ("Wiederherstellung wurde für diese gespeicherte Verbindung bereits angestoßen – "
+                    "Ergebnis abwarten; kein erneuter Verbindungsversuch.")
+        self.auto_takeover_key = key
+        try:
+            open_saved()
+        except ProbeError as exc:
+            self.auto_takeover_key = None  # bewusster Retry über dieselbe Prüfaction bleibt möglich
+            return "Wiederherstellung fehlgeschlagen: " + self.error_text(str(exc))
+        return ("Bereits gekoppelt – die gespeicherte, gepinnte Controller-Verbindung wird wiederhergestellt "
+                "und echt authentifiziert; bei Erfolg führt der Assistent automatisch weiter.")
 
     def pair(self):
         # #90: remote branch likewise binds the displayed, human-compared SPKI;
@@ -6730,14 +6780,24 @@ class ConnectionDialog:
                 except ProbeError:
                     pass
             phase, detail = bridge.tunnel_phase, bridge.tunnel_detail or ""
-            self.remote_tunnel_status.set(
-                "Zuerst die Bridge koppeln." if bridge.state != "CONNECTED" else
-                {"missing": "Kein Tunnel konfiguriert – Tunnel-ID und Runtime Key eingeben und bewusst speichern.",
-                 "configured": "Tunnel konfiguriert · Client startet am Bridge-Standort.",
-                 "starting": "Tunnel startet · Verbindung wird beobachtet …",
-                 "connected": "Tunnel verbunden · Chat-Seite ist der nächste Schritt.",
-                 "error": "Tunnel-Fehler: " + self.error_text(detail)}.get(phase or "",
-                                                                    "Tunnelstatus wird abgefragt …"))
+            if bridge.state != "CONNECTED":
+                # 0.9.3: der Widerspruch „bereits gekoppelt“ vs. Gate ist aufgelöst –
+                # der Text benennt den echten Grund und den zulässigen Weg.
+                self.remote_tunnel_status.set(
+                    "Bridge ist nicht authentifiziert verbunden. „Verbindung prüfen“ stellt eine passende "
+                    "bereits gekoppelte, gepinnte Controller-Verbindung automatisch und echt authentifiziert "
+                    "wieder her; erst danach kann der Tunnel übertragen und beobachtet werden.")
+            else:
+                self.remote_tunnel_status.set(
+                    {"missing": "Kein Tunnel konfiguriert – Tunnel-ID und Runtime Key eingeben und bewusst speichern.",
+                     "configured": "Tunnel konfiguriert · Client startet am Bridge-Standort.",
+                     "starting": "Tunnel startet · Verbindung wird beobachtet …",
+                     "connected": "Tunnel verbunden · Chat-Seite ist der nächste Schritt.",
+                     "error": "Tunnel-Fehler: " + self.error_text(detail)}.get(phase or "",
+                                                                        "Tunnelstatus wird abgefragt …"))
+            form_needed = bridge.state != "CONNECTED" or phase in (None, "missing", "error")
+            for form in (self.remote_tunnel_form, self.qrexec_tunnel_form):
+                form.grid() if form_needed else form.grid_remove()
             if self.was_tunnel_busy and not self.core.remote_tunnel_busy:
                 # The Runtime Key leaves the UI state once the save was answered.
                 self.fields["remote_runtime_key"].set("")
@@ -8487,7 +8547,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.2"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.3"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime

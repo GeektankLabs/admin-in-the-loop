@@ -2275,6 +2275,9 @@ class RemoteTunnelCoordinationTests(unittest.TestCase):
         self.core.begin_tunnel_probe()
         self.wait(lambda: self.core.remote_tunnel is not None)
         self.assertEqual(self.core.remote_tunnel["phase"], "missing")
+        probe = self.core.remote_tunnel_probe
+        self.core.begin_tunnel_probe()  # idempotent per instance: kein zweiter Beobachtungsloop
+        self.assertIs(self.core.remote_tunnel_probe, probe)
         self.assertEqual(self.core.bridge_snapshot().tunnel_phase, "missing")
         with self.assertRaises(a.ProbeError):
             self.core.save_remote_tunnel("not-a-tunnel", key)
