@@ -499,7 +499,9 @@ class BridgeSetupDefaultsTests(unittest.TestCase):
         # Unknown source uses the documented board placeholder, never a silent guess.
         self.assertEqual(a.qrexec_policy_line(None, "untrusted"),
                          "qubes.ConnectTCP +8443 personal untrusted allow")
-        for bad in ("", "  ", "with space", "-start", "x" * 64, "a;b", "a\nb"):
+        # #88/#91: IPs und localhost sind Adressen, keine Qube-Namen.
+        for bad in ("", "  ", "with space", "-start", "x" * 64, "a;b", "a\nb",
+                    "127.0.0.1", "::1", "localhost", "LOCALHOST"):
             with self.assertRaises(a.ProbeError):
                 a.validate_qube_name(bad)
         for good in ("personal", "untrusted", "work-2", "sys_net.ext"):

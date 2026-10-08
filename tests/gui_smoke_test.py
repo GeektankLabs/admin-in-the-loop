@@ -283,21 +283,26 @@ class ConnectionDialogTests(unittest.TestCase):
         with mock.patch.object(self.core, "connect_local_bridge") as local, \
                 mock.patch.object(self.core, "begin_pair_remote") as remote:
             dialog.location.set("REMOTE")
+            self.root.update()
+            self.assertTrue(dialog.remote_setup.winfo_ismapped())
+            self.assertFalse(dialog.local_tunnel.winfo_ismapped())
             dialog.fields["remote_script"].set("/opt/Remote Script/admin_in_the_loop.py")
             dialog.fields["code"].set("KEEP-DRAF-T123")
             self.root.update()
-            self.assertTrue(dialog.remote.winfo_ismapped())
-            self.assertFalse(dialog.local_tunnel.winfo_ismapped())
             self.assertIn("'/opt/Remote Script/admin_in_the_loop.py' --bridge", dialog.remote_command)
-            dialog.location.set("LOCAL")
-            dialog.location.set("REMOTE")
+            # Navigation haelt Eingaben und loest keine Aktionen aus.
+            dialog.wizard_goto(2)
+            dialog.wizard_goto(0)
             self.assertEqual(dialog.fields["code"].get(), "KEEP-DRAF-T123")
             local.assert_not_called()
             remote.assert_not_called()
         dialog.window.geometry("640x480")
-        dialog.details.set(True)
-        dialog.select_location()
+        # Verwaltung ist eigener Schritt: LOCAL letzte Seite zeigt Chat + Verwalten.
+        dialog.location.set("LOCAL")
+        dialog.wizard_goto(1)
         self.root.update()
+        self.assertTrue(dialog.chat_section.winfo_ismapped())
+        self.assertTrue(dialog.controls.winfo_ismapped())
         dialog.buttons["offline"].focus_force()
         self.root.update()
         self.assertGreater(dialog.canvas.yview()[0], 0)
@@ -308,40 +313,55 @@ class ConnectionDialogTests(unittest.TestCase):
         dialog.fields["url"].set("http://bridge.example:8443")
         self.assertTrue(dialog.buttons["remote_copy"].instate(["disabled"]))
         self.assertEqual(self.callbacks, [])
-
     def test_pair_validation_does_not_submit_or_discard_bad_draft(self):
         dialog = self.ui.connection_settings()
         dialog.location.set("REMOTE")
-        dialog.fields["pin"].set("a" * 64)
-        dialog.fields["code"].set("ABCD-EFGH-JKMP")
+        dialog.wizard_goto(1)
+        self.root.update()
+        dialog.fields["url"].set("https://bridge.example:8443")
+        dialog.fields["code"].set("ABCD-EFGH-JKLI")
         with mock.patch.object(self.core, "begin_pair_remote") as pair:
+            # Ohne belegte Verbindung ist Koppeln gesperrt; der Entwurf bleibt.
             dialog.run("bridge", dialog.pair)
             pair.assert_not_called()
-            self.assertIn("unabhängig", dialog.errors["bridge"].get())
-            self.assertEqual(dialog.fields["code"].get(), "ABCD-EFGH-JKMP")
-            dialog.compared.set(True)
-            dialog.fields["pin"].set("b" * 64)
-            self.assertFalse(dialog.compared.get())
-            dialog.compared.set(True)
-            dialog.fields["url"].set("https://user:secret@bridge.example:8443")
-            self.assertFalse(dialog.compared.get())
-            dialog.compared.set(True)
-            dialog.run("bridge", dialog.pair)
+            self.assertIn("Verbindung prüfen", dialog.errors["bridge"].get())
+            self.assertEqual(dialog.fields["code"].get(), "ABCD-EFGH-JKLI")
+            # Der eine bewusste Klick belegt Erreichbarkeit und forderte den Code.
+            with mock.patch.object(a, "bridge_reachability", return_value="a" * 64), \
+                    mock.patch.object(self.core, "hello_bridge", return_value="pairing_required"):
+                dialog.buttons["remote_check"].invoke()
+            self.assertEqual(dialog.remote_observed_pin, "a" * 64)
+            displayed = dialog.remote_pin_box.text.get("1.0", "end-1c").replace(" ", "").strip()
+            self.assertEqual(displayed, "a" * 64)  # Anzeige, kein editierbares Feld
+            self.assertIn("vergleichen", dialog.remote_status.get())
+            dialog.run("bridge", dialog.pair)  # Formatfehler: keine Einreichung, Entwurf bleibt
             pair.assert_not_called()
-            self.assertNotIn("secret", dialog.errors["bridge"].get())
+            self.assertIn("zwölfstelligen", dialog.errors["bridge"].get())
+            self.assertEqual(dialog.fields["code"].get(), "ABCD-EFGH-JKLI")
+            dialog.fields["code"].set("ABCD-EFGH-JKMN")
+            dialog.run("bridge", dialog.pair)
+            pair.assert_called_once_with("https://bridge.example:8443", "a" * 64, "ABCD-EFGH-JKMN")
+            self.assertEqual(dialog.fields["code"].get(), "")  # Code nach Aufwand geleert
+        dialog.fields["url"].set("https://user:secret@bridge.example:8443")
+        dialog.run("bridge", dialog.verify_remote)
+        self.assertNotIn("secret", dialog.errors["bridge"].get())  # keine Secrets in Meldungen
         self.assertEqual(dialog.entries["code"].cget("show"), "*")
         self.assertEqual(dialog.entries["api_key"].cget("show"), "*")
         self.assertEqual(self.callbacks, [])
-
     def test_real_remote_pair_completion_and_saved_target_guard(self):
         bridge = RemoteFixture(Path(self.tmp.name, "bridge"))
         self.addCleanup(bridge.close)
         dialog = self.ui.connection_settings()
         dialog.location.set("REMOTE")
+        dialog.wizard_goto(1)
         dialog.fields["url"].set(bridge.url)
-        dialog.fields["pin"].set(bridge.pin)
+        self.root.update()
+        # EIN bewusster Klick: echte Erreichbarkeit + Hallo/Codeanforderung.
+        dialog.buttons["remote_check"].invoke()
+        self.assertEqual(dialog.remote_observed_pin, bridge.pin)
+        self.assertEqual(dialog.remote_pin_box.text.get("1.0", "end-1c").replace(" ", "").strip(),
+                         bridge.pin)
         dialog.fields["code"].set(bridge.code)
-        dialog.compared.set(True)
         with mock.patch.object(self.core, "connect_local_bridge") as local, \
                 mock.patch.object(self.core, "start_tunnel") as tunnel:
             dialog.buttons["pair"].invoke()
@@ -390,6 +410,7 @@ class ConnectionDialogTests(unittest.TestCase):
         self.ui.render()
         self.assertEqual(dialog.binding.get(), "")
         dialog.fields["url"].set("https://unrelated.example:8443")
+        self.root.update()
         self.assertTrue(dialog.buttons["saved_connect"].instate(["disabled"]))
         with mock.patch.object(self.core, "connect_saved_bridge") as connect:
             dialog.run("bridge", dialog.open_saved)
@@ -531,10 +552,11 @@ class ConnectionDialogTests(unittest.TestCase):
         self.addCleanup(bridge.close)
         dialog = self.ui.connection_settings()
         dialog.location.set("REMOTE")
+        dialog.wizard_goto(1)
         dialog.fields["url"].set(bridge.url)
-        dialog.fields["pin"].set(bridge.pin)
+        dialog.buttons["remote_check"].invoke()
+        self.assertEqual(dialog.remote_observed_pin, bridge.pin)
         dialog.fields["code"].set(bridge.code)
-        dialog.compared.set(True)
         original = a.BridgeHTTP.request
         claims = []
         lost = False
@@ -554,9 +576,13 @@ class ConnectionDialogTests(unittest.TestCase):
             self.assertIsNone(self.core.saved_connection)
             dialog = self.ui.connection_settings()
             self.assertEqual(dialog.fields["url"].get(), bridge.url)
-            self.assertEqual(dialog.fields["pin"].get(), bridge.pin)
+            # Kein Pin-Feld mehr: das Speicherkommando nutzt den persistenten Pin
+            # und oeffnet ausschliesslich bei gleicher Adresse.
+            self.assertNotIn("pin", dialog.fields)
+            dialog.wizard_goto(1)
+            self.root.update()
             self.assertTrue(dialog.buttons["saved_connect"].instate(["!disabled"]))
-            dialog.buttons["saved_connect"].invoke()
+            dialog.run("bridge", dialog.open_saved)
             self.until(lambda: self.core.bridge_state == "CONNECTED")
             self.assertEqual(len(claims), 1)
             self.assertIsNone(self.core.bridge_process)
@@ -1214,8 +1240,9 @@ class SentStylingUITests(unittest.TestCase):
 
 
 class QrexecDialogTests(unittest.TestCase):
-    """M9 Folgefix: seitenweiser Setup-Wizard (Kartenstart, Schrittzähler, Zurück
-    behält Eingaben), Launcher-Status, Hallo-Gating, aufklappbare Diagnose."""
+    """M9 #88-#91: ein Wizard-Schritt = eine Seite; EIN Klick prueft und fordert den
+    Code; Kopplung nur per Code mit nicht-editierbarer Fingerprint-Anzeige (TOFU-Pin
+    bleibt technisch erhalten); Diagnose pro Versuch; Navigation loest nichts aus."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="aitl-qrexec-ui-")
@@ -1256,31 +1283,34 @@ class QrexecDialogTests(unittest.TestCase):
                 stack.append(child)
         return found
 
-    def test_cards_first_and_branch_navigation(self):
+    def test_cards_first_only_one_page_and_restart(self):
         dialog = self.open_dialog(False)
         values = [str(button.cget("value")) for button in dialog.location_buttons]
         self.assertEqual(values, ["LOCAL", "REMOTE"])  # keine Qube-Karte ohne Qubes
         self.assertTrue(dialog.cards.winfo_ismapped())
-        self.assertFalse(dialog.qrexec_panel.winfo_ismapped())
-        self.assertEqual(dialog.wizard_step.get(), "Willkommen – bitte Variante wählen")
+        for hidden in (dialog.local, dialog.remote, dialog.qrexec_panel,
+                       dialog.tunnel_section, dialog.chat_section, dialog.controls):
+            self.assertFalse(hidden.winfo_ismapped())
         dialog.location.set("REMOTE")
         self.root.update()
-        self.assertTrue(dialog.remote.winfo_ismapped())
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 2 · Bridge-Standort und Startbefehl")
-        dialog.buttons["wizard_next"].invoke()
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 3 · Bridge-Standort und Startbefehl")
+        self.assertTrue(dialog.remote_setup.winfo_ismapped())
+        self.assertFalse(dialog.remote_pair.winfo_ismapped())
+        self.assertFalse(dialog.cards.winfo_ismapped())
+        # Ruewaerts erhalt Eingaben; zweiter Rueckschritt erreicht die Karten erneut.
+        dialog.fields["qrexec_target"].set("untrusted")
+        dialog.wizard_goto(2)
+        dialog.wizard_goto(0)
+        self.assertEqual(dialog.fields["qrexec_target"].get(), "untrusted")
+        dialog.wizard_back()
         self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 2 · Bewusst koppeln")
-        self.assertFalse(dialog.remote_setup.winfo_ismapped())
-        self.assertTrue(dialog.remote_pair.winfo_ismapped())
-        dialog.buttons["wizard_back"].invoke()  # Schritt 2 -> Schritt 1
-        self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 2 · Bridge-Standort und Startbefehl")
-        dialog.buttons["wizard_back"].invoke()  # Schritt 1 -> Auswahlkarten
-        self.root.update()
+        self.assertEqual(dialog.location.get(), "CARD")
         self.assertTrue(dialog.cards.winfo_ismapped())
+        # Expliziter Neustart ist nur Assistent-Zustand: kein Core-Eingriff noetig.
+        dialog.location.set("QREXEC") if False else None
         self.assertEqual(self.callbacks, [])
 
-    def test_qubes_wizard_flow_launcher_status_and_diagnostics(self):
+    def test_qubes_flow_check_then_hello_then_code_page(self):
         dialog = self.open_dialog(True)
         values = [str(button.cget("value")) for button in dialog.location_buttons]
         self.assertEqual(values, ["LOCAL", "QREXEC", "REMOTE"])
@@ -1288,30 +1318,33 @@ class QrexecDialogTests(unittest.TestCase):
         self.root.update()
         self.assertTrue(dialog.q1.winfo_ismapped())
         self.assertNotIn("qrexec_copy_command", dialog.buttons)  # J82: kein Kopierbutton
-        # Schritt 1 validiert feldbezogen, bleibt sonst auf der Seite.
-        dialog.fields["qrexec_target"].set("bad name")
-        dialog.buttons["wizard_next"].invoke()
-        self.assertIn("Qube-Name", dialog.errors["bridge"].get())
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 4 · Ziel-Qube und Port")
+        self.assertNotIn("qrexec_pin", dialog.fields)  # #90: keine Hex-Pflichteingabe
+        # Feldbezogene Validierung am Schritt 1, inkl. IP/localhost-Ausschluss.
+        for bad in ("bad name", "127.0.0.1", "localhost"):
+            dialog.fields["qrexec_target"].set(bad)
+            dialog.buttons["wizard_next"].invoke()
+            self.assertIn("Qube-Name", dialog.errors["bridge"].get())
+            self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 5 · Ziel-Qube")
         dialog.fields["qrexec_target"].set("untrusted")
         dialog.buttons["wizard_next"].invoke()
+        self.assertIn("nicht verifiziert", dialog.qubes_note.get())
         self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 4 · Bridge im Ziel starten")
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 5 · Bridge im Ziel starten")
         self.assertEqual(dialog.qrexec_command_box.text.get("1.0", "end-1c").strip(),
                          "python3 ./admin_in_the_loop.py --bridge")
         self.assertTrue(any("Strg+Umschalt+C" in text for text in self.labels(dialog.q2)))
-        self.assertTrue(any("Ziel nicht verifiziert" in text or True for text in self.labels(dialog.q1)))
+        self.assertTrue(dialog.tunnel_section.winfo_ismapped())  # Tunnel-Umgebung als Schritt-Geschwister
         dialog.buttons["wizard_next"].invoke()
         self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 4 · Verbindung prüfen")
-        self.assertIn("Ziel: untrusted · Port 8443", dialog.q3_summary.get())
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 5 · Verbindung prüfen")
+        # Kein zwingender separater Hallo-Button auf der Pruefen-Seite (#90).
+        self.assertFalse(dialog.buttons["qrexec_hello"].winfo_ismapped())
         fail = {"phase": "qrexec_target_unreachable", "reachable": False, "observed_pin": None}
-        def fail_verify(target, port=8443):
-            # Die echte Methode notiert vor der Rückgabe; das Mock übernimmt diesen Teil.
+        def fail_check(target, port=8443):
             self.core._qrexec_note("qvm-connect-tcp", "qrexec_target_unreachable", None,
                                    "Beleg aus Mock", "Erneut prüfen")
             return fail
-        with mock.patch.object(self.core, "verify_qrexec_connection", side_effect=fail_verify):
+        with mock.patch.object(self.core, "verify_qrexec_connection", side_effect=fail_check):
             dialog.buttons["qrexec_check"].invoke()
         self.assertIn("Erneut prüfen", dialog.qrexec_status.get())
         self.assertNotEqual(dialog.qrexec_help.winfo_manager(), "")
@@ -1320,67 +1353,79 @@ class QrexecDialogTests(unittest.TestCase):
         dialog.q3_diag_open.set(True)
         dialog.refresh_qubes_diagnostics()
         self.root.update()
-        diag = dialog.q3_diag_box.text.get("1.0", "end-1c")
-        self.assertIn("Phase qrexec_target_unreachable", diag)
-        self.assertIn("#1", diag)
+        self.assertIn("Phase qrexec_target_unreachable", dialog.q3_diag_box.text.get("1.0", "end-1c"))
+        # EIN Klick: Erreichbarkeit erfolgreich -> desselbe Klick fordert den Code an.
         ok = {"phase": "bridge_reachable", "reachable": True, "observed_pin": "ab" * 32}
-        def ok_verify(target, port=8443):
-            self.core._qrexec_note("reachability-probe", "bridge_reachable", None,
-                                   "Beleg aus Mock", "Hallo")
-            return ok
-        with mock.patch.object(self.core, "verify_qrexec_connection", side_effect=ok_verify):
+        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=ok) as check, \
+                mock.patch.object(self.core, "hello_bridge", return_value="pairing_required") as hello:
             dialog.buttons["qrexec_check"].invoke()
-        self.assertEqual(dialog.qrexec_help.winfo_manager(), "")
-        self.assertIn("Kopplungscode auf Bridge anfordern", dialog.qrexec_status.get())
-        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["!disabled"]))
-        with mock.patch.object(self.core, "hello_bridge", return_value="pairing_required"):
-            dialog.buttons["qrexec_hello"].invoke()
-        self.assertIn("Code jetzt auf der Bridge-Konsole", dialog.qrexec_status.get())
-        dialog.buttons["wizard_next"].invoke()
-        self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 4 von 4 · Bewusst koppeln")
+        check.assert_called_once()
+        hello.assert_called_once_with("https://127.0.0.1:8443")  # kein separater Pflicht-Button
+        self.assertEqual(dialog.wizard_index, 3)  # erst jetzt automatisch die Code-Seite
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 4 von 5 · Bewusst koppeln")
+        self.assertEqual(dialog.qrexec_pin_box.text.get("1.0", "end-1c").replace(" ", "").strip(), "ab" * 32)
+        self.assertIn("abab ababab", dialog.qrexec_pin_box.text.get("1.0", "end-1c"))  # lesbar gruppiert
+        self.assertEqual(dialog.qrexec_pin_box.text.cget("state"), "disabled")
         self.core.qrexec_forwarder = mock.Mock(running=True)
         self.root.update()
-        self.assertTrue(dialog.buttons["qrexec_pair"].instate(["disabled"]))
+        self.assertTrue(dialog.buttons["qrexec_pair"].instate(["disabled"]))  # ohne Code gesperrt
         dialog.fields["qrexec_code"].set("ABCD-EFGH-JKMN")
-        dialog.compared.set(True)
         self.root.update()
-        dialog.buttons["qrexec_reveal"].invoke()
-        self.assertIn("Beobachteter SPKI: " + "ab" * 32, dialog.qrexec_status.get())
-        self.assertEqual(dialog.fields["qrexec_pin"].get(), "")  # nie vorbelegt
+        self.assertTrue(dialog.buttons["qrexec_pair"].instate(["!disabled"]))
         with mock.patch.object(self.core, "begin_pair_remote") as pair:
-            dialog.fields["qrexec_pin"].set("ab" * 32)
-            dialog.compared.set(True)
-            self.root.update()
             dialog.pair_qrexec()
         pair.assert_called_once_with("https://127.0.0.1:8443", "ab" * 32, "ABCD-EFGH-JKMN")
-        # Zurück behält Eingaben und Diagnose.
-        dialog.buttons["wizard_back"].invoke()
-        self.root.update()
-        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 4 · Verbindung prüfen")
-        self.assertEqual(dialog.fields["qrexec_pin"].get(), "ab" * 32)
-        self.assertIn("Phase qrexec_target_unreachable",
-                      dialog.q3_diag_box.text.get("1.0", "end-1c"))
+        self.assertEqual(dialog.fields["qrexec_code"].get(), "")
         self.assertEqual(self.callbacks, [])
 
-    def test_hello_requires_verified_reachability(self):
+    def test_hello_failure_and_already_paired_stay_on_check_page(self):
         dialog = self.open_dialog(True)
         dialog.location.set("QREXEC")
         dialog.fields["qrexec_target"].set("untrusted")
-        dialog.buttons["wizard_next"].invoke()
-        dialog.buttons["wizard_next"].invoke()
+        dialog.wizard_goto(2)
+        ok = {"phase": "bridge_reachable", "reachable": True, "observed_pin": "cd" * 32}
+        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=ok):
+            # Code-Anforderung scheitert (Cooldown): Schritt bleibt, Retry bleibt moeglich.
+            with mock.patch.object(self.core, "hello_bridge", side_effect=a.ProbeError("pairing_rate_limited")):
+                dialog.buttons["qrexec_check"].invoke()
+            self.assertEqual(dialog.wizard_index, 2)
+            self.assertIn("Code-Anforderung fehlgeschlagen", dialog.qrexec_status.get())
+            # already_paired fuehrt nicht auf die Kopplungsseite (keine Zweitrunde).
+            with mock.patch.object(self.core, "hello_bridge", return_value="already_paired"):
+                dialog.buttons["qrexec_check"].invoke()
+            self.assertEqual(dialog.wizard_index, 2)
+            self.assertIn("bereits gekoppelt", dialog.qrexec_status.get())
+        # Navigation loest niemals Bridge-/Hallo-Aktionen aus (Negativkontrolle).
+        with mock.patch.object(self.core, "verify_qrexec_connection") as check, \
+                mock.patch.object(self.core, "hello_bridge") as hello, \
+                mock.patch.object(self.core, "start_qrexec_forwarder") as start:
+            dialog.buttons["wizard_next"].invoke()  # -> Kopplungsseite (leere Felder)
+            dialog.buttons["wizard_back"].invoke()
+            dialog.wizard_restart()
+        check.assert_not_called()
+        hello.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(dialog.location.get(), "CARD")
+        self.assertEqual(self.callbacks, [])
+
+    def test_remote_reachability_is_not_pairing_and_pin_is_readonly(self):
+        dialog = self.open_dialog(False)
+        dialog.location.set("REMOTE")
+        dialog.wizard_goto(1)
         self.root.update()
-        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["disabled"]))
-        self.core.qrexec_forwarder = mock.Mock(running=True)
-        with mock.patch.object(self.core, "begin_pair_remote") as pair:
-            dialog.fields["qrexec_pin"].set("0" * 64)
-            dialog.fields["qrexec_code"].set("ABCD-EFGH-JKMN")
-            dialog.compared.set(True)
-            self.root.update()
-            with self.assertRaises(a.ProbeError) as refused:
-                dialog.pair_qrexec()
-        self.assertEqual(str(refused.exception), "bridge_not_verified")
-        pair.assert_not_called()
+        self.assertTrue(dialog.buttons["pair"].instate(["disabled"]))
+        with mock.patch.object(self.core, "hello_bridge", return_value="pairing_required"):
+            with mock.patch.object(a, "bridge_reachability", return_value="ef" * 32):
+                dialog.buttons["remote_check"].invoke()
+        self.assertTrue(dialog.buttons["pair"].instate(["disabled"]))  # Code fehlt noch
+        self.assertEqual(dialog.remote_pin_box.text.get("1.0", "end-1c").replace(" ", "").strip(), "ef" * 32)
+        # Bloede Erreichbarkeit ohne bestaetigte Code-Anforderung koppelt nicht.
+        dialog.qrexec_reset_verification()
+        with mock.patch.object(a, "bridge_reachability", return_value="ef" * 32):
+            with mock.patch.object(self.core, "hello_bridge", side_effect=a.ProbeError("pairing_contract")):
+                dialog.buttons["remote_check"].invoke()
+        self.assertIsNone(dialog.remote_observed_pin)  # kein Beleg bei Vertragsfehler
+        self.assertIn("Code-Anforderung fehlgeschlagen", dialog.remote_status.get())
         self.assertEqual(self.callbacks, [])
 
 
