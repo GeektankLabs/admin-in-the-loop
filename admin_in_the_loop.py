@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.4"
+APP_VERSION = "0.9.5"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.4"
+APP_VERSION = "0.9.5"
 
 
 def _load_bridge_component(namespace=None):
@@ -2651,6 +2651,7 @@ class BridgeSnapshot:
     chat_binding_error: str | None = None
     tunnel_phase: str | None = None
     tunnel_detail: str | None = None
+    tunnel_step: str | None = None
 
 
 class TransportError(ProbeError):
@@ -2914,11 +2915,13 @@ def validate_chat_binding(value, profile, instance):
 
 
 def validate_remote_tunnel(value):
-    """Bridge tunnel status contract: fixed phases, secret-free bounded detail."""
-    fields(value, {"version", "phase", "detail"})
+    """Bridge tunnel status contract: fixed phases/steps, secret-free bounded detail."""
+    fields(value, {"version", "phase", "detail", "step"})
     require(type(value["version"]) is int and value["version"] == 1, "network_schema")
-    require(value["phase"] in {"missing", "configured", "starting", "connected", "error"}, "network_schema")
+    require(value["phase"] in {"missing", "configured", "installing", "starting", "connected", "error"},
+            "network_schema")
     require(type(value["detail"]) is str and len(value["detail"]) <= 512, "network_schema")
+    require(type(value["step"]) is str and len(value["step"]) <= 32, "network_schema")
     return value
 
 
@@ -4082,10 +4085,14 @@ class BridgeWorker:
 class RemoteTunnelProbe:
     """Read-only observation of the connected bridge's own tunnel status.
 
-    The controller polls every five seconds over the already pinned authenticated
-    connection. Observation never writes, starts or rotates anything; a deliberate
-    save is one separate PUT before the observation loop. The Runtime Key is
-    referenced only until that single PUT completes, never persisted by Main."""
+    The controller polls every five seconds (two seconds while the bridge is still
+    configuring/installing) over the already pinned authenticated connection.
+    Observation never writes, starts or rotates anything; a deliberate save is one
+    separate PUT before the observation loop. The Runtime Key is referenced only
+    until that single PUT completes, never persisted by Main. An overall bound
+    ends any silent waiting honestly."""
+
+    OVERALL_TIMEOUT = 300
 
     def __init__(self, core, instance, config=None):
         self.core, self.instance = core, instance
@@ -4113,7 +4120,11 @@ class RemoteTunnelProbe:
                     self.emit("error", str(exc))
                     return
                 self.emit("status", value)
+            started = time.monotonic()
             while not self.stop.is_set():
+                if time.monotonic() - started > self.OVERALL_TIMEOUT:
+                    self.emit("error", "tunnel_status_timeout")
+                    return
                 try:
                     value = validate_remote_tunnel(client.request("GET", "/v1/tunnel/status"))
                 except ProbeError as exc:
@@ -4122,7 +4133,8 @@ class RemoteTunnelProbe:
                 self.emit("status", value)
                 if value["phase"] in {"connected", "error"}:
                     return
-                if self.stop.wait(5):
+                wait = 2 if value["phase"] in {"configured", "installing"} else 5
+                if self.stop.wait(wait):
                     return
         finally:
             self.config = None
@@ -4324,7 +4336,7 @@ class AppCore:
                               self.tunnel.state if self.tunnel else "STOPPED", self.bridge_error,
                               self.certificate_warning, dict(self.chat_binding) if self.chat_binding else None,
                               self.chat_binding_received_at, self.chat_binding_busy, self.chat_binding_error,
-                              tunnel.get("phase"), tunnel.get("detail"))
+                              tunnel.get("phase"), tunnel.get("detail"), tunnel.get("step"))
 
     def _bridge_binding(self):
         if self.bridge_state != "CONNECTED" or self.bridge_profile is None:
@@ -4725,6 +4737,8 @@ class AppCore:
         deliberate save). Idempotent per bridge instance; navigation alone never
         saves or starts anything."""
         require(self.bridge_state == "CONNECTED" and self.bridge_profile is not None, "bridge_disconnected")
+        if config is not None:
+            require(not self.remote_tunnel_busy, "tunnel_config_busy")  # double click: one save in flight
         if config is None and self.remote_tunnel_probe is not None \
                 and self.remote_tunnel_instance == self.bridge_instance \
                 and self.remote_tunnel_probe.alive():
@@ -4763,10 +4777,11 @@ class AppCore:
                 break
             if kind == "status":
                 self.remote_tunnel = {"phase": value["phase"], "detail": value["detail"],
-                                      "received_at": time.monotonic()}
+                                      "step": value["step"], "received_at": time.monotonic()}
                 self.remote_tunnel_error = None
             else:
-                self.remote_tunnel = {"phase": "error", "detail": str(value), "received_at": time.monotonic()}
+                self.remote_tunnel = {"phase": "error", "detail": str(value), "step": "",
+                                      "received_at": time.monotonic()}
                 self.remote_tunnel_error = str(value)
             self.remote_tunnel_busy = False
         if not probe.alive() and probe.events.empty():
@@ -5597,6 +5612,7 @@ def connection_summary(bridge):
     if bridge.mode == "REMOTE":
         phases = {"missing": "Tunnel fehlt · Einrichtung nötig",
                   "configured": "Tunnel konfiguriert · Start ausstehend",
+                  "installing": "Tunnel-Client wird eingerichtet",
                   "starting": "Tunnel startet · Verbindung wird geprüft",
                   "connected": "Tunnel verbunden",
                   "error": "Tunnel-Fehler"}
@@ -5678,6 +5694,7 @@ class ConnectionDialog:
         self.auto_local_key = None
         self.was_tunnel_busy = False
         self.auto_takeover_key = None
+        self.probe_suppressed = None
         self.fields, self.entries, self.buttons, self.labels = {}, {}, {}, []
         self.errors = {name: self.tk.StringVar(master=self.window) for name in ("bridge", "tunnel")}
         self.summary = self.tk.StringVar(master=self.window)
@@ -5815,8 +5832,10 @@ class ConnectionDialog:
                    "Tunnel-ID und Restricted Runtime Key werden über die gepinnte, authentifizierte Verbindung an "
                    "dieselbe Bridge übertragen, dort geschützt gespeichert und einmalig gestartet. Die App behält "
                    "den Key nicht dauerhaft. Beide Eingaben sind lesbar, damit du die Werte gegenprüfen kannst; "
-                   "nach bestätigter Übertragung wird das Key-Feld geleert. Fehlt der Client am Gateway, sagt "
-                   "der Status das konkret – nichts wird still installiert.")
+                   "nach bestätigter Übertragung wird das Key-Feld geleert. Fehlt der Client, installiert ihn die "
+                   "Bridge unter Linux automatisch aus dem offiziellen, SHA-256-geprüften Release ins "
+                   "State-Verzeichnis (ohne sudo); auf anderen Systemen nennen Status und Bridge-Konsole den "
+                   "konkreten manuellen Weg.")
         # Operator 08.10. (0.9.3): gültige vorhandene Tunnelkonfiguration überspringt
         # das ID/Key-Formular – Status und Fortschritt bleiben sichtbar.
         self.remote_tunnel_form = self.ttk.Frame(self.remote_tunnel_page)
@@ -5827,9 +5846,12 @@ class ConnectionDialog:
         self.button(self.remote_tunnel_form, 2, "save_remote_tunnel", "Tunnel verbinden und speichern", "bridge",
                     self.save_tunnel_config)
         self.label(self.remote_tunnel_page, 2, variable=self.remote_tunnel_status)
-        self.label(self.remote_tunnel_page, 3, "Der Status wird alle fünf Sekunden beobachtet; Beobachtung startet "
-                   "oder rotiert nichts. Nach erfolgreicher Verbindung geht es automatisch zur Chat-Seite; ohne "
-                   "Tunnel-Konfiguration bleibt dieses Formular der bewusste Einrichtungsschritt.")
+        self.button(self.remote_tunnel_page, 3, "tunnel_cancel_remote", "Statusbeobachtung abbrechen", "bridge",
+                    self.cancel_tunnel_probe)
+        self.label(self.remote_tunnel_page, 4, "Der Status wird laufend beobachtet (alle fünf Sekunden, während "
+                   "der Vorbereitung schneller); Beobachtung startet oder rotiert nichts. Nach erfolgreicher "
+                   "Verbindung geht es automatisch zur Chat-Seite; ohne Tunnel-Konfiguration bleibt dieses "
+                   "Formular der bewusste Einrichtungsschritt.")
 
         self.qrexec_panel = self.ttk.Frame(bridge_section)
         self.qrexec_panel.columnconfigure(0, weight=1)
@@ -5939,7 +5961,8 @@ class ConnectionDialog:
                    "verbinden: Tunnel-ID und Restricted Runtime Key werden über die gepinnte, authentifizierte "
                    "Verbindung an dieselbe Bridge übertragen, im Ziel-Qube geschützt gespeichert (0600) und "
                    "einmalig gestartet. Die App behält den Key nicht dauerhaft. Beide Eingaben sind lesbar; "
-                   "nach bestätigter Übertragung wird das Key-Feld geleert.")
+                   "nach bestätigter Übertragung wird das Key-Feld geleert. Fehlt der Client im Ziel, installiert "
+                   "ihn die Bridge dort unter Linux automatisch (offizielles Release, SHA-256-geprüft, ohne sudo).")
         self.qrexec_tunnel_form = self.ttk.Frame(self.qrexec_tunnel_page)
         self.qrexec_tunnel_form.grid(row=1, column=0, columnspan=2, sticky="ew")
         self.qrexec_tunnel_form.columnconfigure(1, weight=1)
@@ -5948,8 +5971,11 @@ class ConnectionDialog:
         self.button(self.qrexec_tunnel_form, 2, "save_qrexec_tunnel", "Tunnel verbinden und speichern", "bridge",
                     self.save_tunnel_config)
         self.label(self.qrexec_tunnel_page, 2, variable=self.remote_tunnel_status)
-        self.label(self.qrexec_tunnel_page, 3, "Der Status wird alle fünf Sekunden beobachtet; Beobachtung startet "
-                   "oder rotiert nichts. Nach erfolgreicher Verbindung geht es automatisch zur Chat-Seite.")
+        self.button(self.qrexec_tunnel_page, 3, "tunnel_cancel_qrexec", "Statusbeobachtung abbrechen", "bridge",
+                    self.cancel_tunnel_probe)
+        self.label(self.qrexec_tunnel_page, 4, "Der Status wird laufend beobachtet (fünf Sekunden, während der "
+                   "Vorbereitung schneller); Beobachtung startet oder rotiert nichts. Nach erfolgreicher "
+                   "Verbindung geht es automatisch zur Chat-Seite.")
         self.label(bridge_section, 1, variable=self.errors["bridge"])
 
         self.tunnel_section = tunnel_section = self.section(3, "2 · OpenAI Secure MCP Tunnel")
@@ -6171,7 +6197,24 @@ class ConnectionDialog:
             "tunnel_config_invalid_key": "Runtime-Key prüfen: 16–512 Zeichen aus Buchstaben, Ziffern, _ und -.",
             "tunnel_config_invalid": "Gespeicherte Tunnel-Konfiguration am Bridge-Standort ist ungültig. Werte bewusst neu eingeben und speichern.",
             "tunnel_config_busy": "Tunnel-Konfiguration wird bereits übertragen; Ergebnis abwarten.",
-            "tunnel_client_unavailable": "Am Bridge-Standort ist kein offizieller Tunnel-Client ab v0.0.15 auffindbar. Den Client dort installieren (tunnel-client-runtime im PATH oder Homebrew) und erneut speichern.",
+            "tunnel_download_failed": "Download des offiziellen Tunnel-Clients fehlgeschlagen. Internetzugang der "
+                                       "Bridge zu github.com prüfen; dann bewusst erneut speichern.",
+            "tunnel_download_timeout": "Client-Download überschreitet das Zeitlimit. Internetzugang der Bridge "
+                                       "prüfen; erneut speichern ist der bewusste Retry.",
+            "tunnel_download_redirect": "Download auf ein nicht freigegebenes Ziel umgeleitet; nichts installiert.",
+            "tunnel_archive_checksum_mismatch": "Download stimmt nicht mit dem gepinnten offiziellen Release "
+                                                "überein; nichts installiert.",
+            "tunnel_archive_limit": "Archiv überschreitet das Größenlimit; Installation abgebrochen.",
+            "tunnel_archive_unsafe": "Archivinhalt ungültig oder unsicher; nichts ausgeführt.",
+            "tunnel_client_unsupported_version": "Der installierte Client besteht die Versions-/CLI-Prüfung "
+                                                 "(>= 0.0.15) nicht; nichts dauerhaft gestartet.",
+                        "tunnel_setup_failed": "Tunnel-Vorbereitung fehlgeschlagen (Grund nicht näher bestimmt). "
+                                   "Die Bridge-Konsole zeigt die konkrete Phase; erneut speichern ist der "
+                                   "bewusste Retry.",
+            "tunnel_client_unavailable": "Kein offizieller Tunnel-Client >= 0.0.15 gefunden; die automatisierte "
+                                         "Installation der Bridge funktioniert auf Linux amd64/arm64. Auf anderen "
+                                         "Systemen (macOS: Homebrew) bewusst manuell installieren und erneut "
+                                         "speichern; die Bridge-Konsole zeigt den konkreten Versuch.",
             "tunnel_client_start_failed": "Tunnel-Client konnte am Bridge-Standort nicht gestartet werden. Pfad, Rechte und Laufzeit dort prüfen; Details im Bridge-Log.",
             "tunnel_status_timeout": "Tunnel wurde nicht rechtzeitig verbunden. Tunnel-ID, Runtime-Key und Internet des Bridge-Standorts prüfen; „Tunnel verbinden und speichern“ ist der bewusste Retry.",
             "runtime_permission_denied": "OpenAI verweigert Tunnel-Zugriff (403). Restricted-Key und Benutzer benötigen Tunnels Read + Use für diesen Tunnel.",
@@ -6438,10 +6481,20 @@ class ConnectionDialog:
         runtime_key = self.fields[prefix + "runtime_key"].get().strip()
         try:
             self.core.save_remote_tunnel(tunnel_id, runtime_key)
+            self.probe_suppressed = None
             self.remote_tunnel_status.set("Übermittelt · Status wird beobachtet …")
         except ProbeError as exc:
             self.remote_tunnel_status.set(self.error_text(str(exc)))
             raise
+
+    def cancel_tunnel_probe(self):
+        """Ends only Main's observation. The bridge finishes its own bounded setup
+        on its own; nothing started by the bridge is killed by this click."""
+        self.probe_suppressed = self.core.bridge_instance
+        self.core.stop_tunnel_probe()
+        self.remote_tunnel_status.set("Beobachtung abgebrochen. Die Bridge führt ihre zeitlich begrenzte "
+                                      "Vorbereitung selbst zu Ende; „Tunnel verbinden und speichern“ oder "
+                                      "„Verbindung wiederherstellen“ holt den tatsächlichen Stand wieder ab.")
 
     def qrexec_port(self):
         raw = self.fields["qrexec_port"].get().strip()
@@ -6774,7 +6827,8 @@ class ConnectionDialog:
         location = self.location.get()
         if location in ("REMOTE", "QREXEC"):
             if bridge.state == "CONNECTED" and self.core.remote_tunnel is None \
-                    and self.core.remote_tunnel_probe is None and not self.core.remote_tunnel_busy:
+                    and self.core.remote_tunnel_probe is None and not self.core.remote_tunnel_busy \
+                    and self.probe_suppressed != bridge.instance:
                 try:
                     self.core.begin_tunnel_probe()
                 except ProbeError:
@@ -6787,14 +6841,26 @@ class ConnectionDialog:
                     "Bridge ist nicht authentifiziert verbunden. „Verbindung prüfen“ stellt eine passende "
                     "bereits gekoppelte, gepinnte Controller-Verbindung automatisch und echt authentifiziert "
                     "wieder her; erst danach kann der Tunnel übertragen und beobachtet werden.")
+            elif self.probe_suppressed == bridge.instance and self.core.remote_tunnel is None:
+                pass  # the deliberate cancel notice stays visible until a new save/reconnect
             else:
-                self.remote_tunnel_status.set(
-                    {"missing": "Kein Tunnel konfiguriert – Tunnel-ID und Runtime Key eingeben und bewusst speichern.",
-                     "configured": "Tunnel konfiguriert · Client startet am Bridge-Standort.",
-                     "starting": "Tunnel startet · Verbindung wird beobachtet …",
-                     "connected": "Tunnel verbunden · Chat-Seite ist der nächste Schritt.",
-                     "error": "Tunnel-Fehler: " + self.error_text(detail)}.get(phase or "",
-                                                                        "Tunnelstatus wird abgefragt …"))
+                if phase == "installing":
+                    self.remote_tunnel_status.set(
+                        {"check": "Tunnel-Client am Bridge-Standort wird geprüft …",
+                         "download": "Offizielles Release wird von GitHub geladen (SHA-256-geprüft) …",
+                         "install": "Tunnel-Client wird ins Bridge-State-Verzeichnis installiert (ohne sudo) …",
+                         "verify": "Installierter Client wird geprüft (Version/CLI) …",
+                         "start": "Tunnel-Client wird gestartet …",
+                         "wait": "Verbindung zur OpenAI-Plattform wird aufgebaut …"}.get(
+                             bridge.tunnel_step or "", "Tunnel-Client wird eingerichtet …"))
+                else:
+                    self.remote_tunnel_status.set(
+                        {"missing": "Kein Tunnel konfiguriert – Tunnel-ID und Runtime Key eingeben und bewusst speichern.",
+                         "configured": "Tunnel konfiguriert · Bridge prüft und bereitet den Client vor …",
+                         "starting": "Tunnel-Client läuft · Verbindung zur Platform wird aufgebaut …",
+                         "connected": "Tunnel verbunden · Chat-Seite ist der nächste Schritt.",
+                         "error": "Tunnel-Fehler: " + self.error_text(detail)}.get(phase or "",
+                                                                            "Tunnelstatus wird abgefragt …"))
             form_needed = bridge.state != "CONNECTED" or phase in (None, "missing", "error")
             for form in (self.remote_tunnel_form, self.qrexec_tunnel_form):
                 form.grid() if form_needed else form.grid_remove()
@@ -6838,6 +6904,8 @@ class ConnectionDialog:
                 and not self.core.remote_tunnel_busy,
             "save_qrexec_tunnel": qrexec_mode and bridge.state == "CONNECTED"
                 and not self.core.remote_tunnel_busy,
+            "tunnel_cancel_remote": remote_mode and self.core.remote_tunnel_probe is not None,
+            "tunnel_cancel_qrexec": qrexec_mode and self.core.remote_tunnel_probe is not None,
             "wizard_restart": self.location.get() == "CARD",
             "wizard_back": self.location.get() != "CARD",
             "wizard_next": self.location.get() != "CARD" and \
@@ -8524,6 +8592,7 @@ import ipaddress
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -8547,7 +8616,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.4"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.5"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime
@@ -9958,18 +10027,36 @@ class BridgeTunnel:
 
     The Runtime Key is persisted 0600 inside the protected state directory and is
     never returned in status, logs, argv or diagnostics. GET /v1/tunnel/status is
-    pure observation: it only advances the bounded start/health state machine and
-    never starts, retries or rotates anything by itself. A deliberate PUT
-    /v1/tunnel/config is the only write path; a valid configuration is started once
-    (also after a bridge restart). Phases: missing | configured | starting |
-    connected | error. A missing client binary is reported honestly instead of
-    downloading or installing anything as a side effect."""
+    pure observation: it only reads bounded state and advances the start/health
+    poll; it never starts, retries or rotates anything by itself. A deliberate PUT
+    /v1/tunnel/config is the only write path; it hands one bounded setup worker
+    over: locate a compatible official client (>= 0.0.15) or - on Linux amd64/
+    arm64 - install the pinned official release into the state directory (HTTPS,
+    redirect allowlist, SHA-256 pin, member allowlist, 0700/0600, no sudo, no
+    PATH writes), then spawn it exactly once. Phases: missing | configured |
+    installing | starting | connected | error; the status additionally reports a
+    fixed setup step. Duplicate saves of the same active configuration are
+    idempotent; replacing a configuration cancels the old worker first."""
 
-    PHASES = ("missing", "configured", "starting", "connected", "error")
+    PHASES = ("missing", "configured", "installing", "starting", "connected", "error")
     CANDIDATES = ("tunnel-client-runtime", "tunnel-client")
     FIXED_CANDIDATES = ("/opt/homebrew/bin/tunnel-client", "/usr/local/bin/tunnel-client")
+    RELEASE = "v0.0.15"
+    ARCHIVE_SHA256 = {"amd64": "f26f8b3ee6c335e38fa5cfbe6ce5635f53738f08a26eecf07d6cebacab4a1abf",
+                      "arm64": "a868d295385b22449341fa141b911f3e991583e45b1fa2a5bfb946aed1861b88"}
+    ARCHITECTURES = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+    DOWNLOAD_HOSTS = ("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
+    ARCHIVE_LIMIT = 64 * 1024 * 1024
+    DOWNLOAD_TIMEOUT = 120.0
     START_DEADLINE = 120.0
     DETAIL_LIMIT = 200
+    STEP_LABELS = {"check": "offiziellen Client am Bridge-Standort prüfen",
+                   "download": "offizielles Release von GitHub laden (SHA-256-geprüft)",
+                   "install": "Client ins Bridge-State-Verzeichnis installieren (ohne sudo)",
+                   "verify": "installierten Client auf Version und CLI prüfen",
+                   "start": "Tunnel-Client starten",
+                   "wait": "Verbindung zur Platform abwarten (Poll alle fünf Sekunden)",
+                   "done": "Tunnel verbunden"}
 
     def __init__(self, directory, spawn=None, now=time.monotonic):
         self.directory = Path(directory)
@@ -9988,6 +10075,9 @@ class BridgeTunnel:
         self.deadline = None
         self.checked_at = 0.0
         self.tail = bytearray()
+        self.step = ""
+        self.worker = None
+        self.worker_cancel = None
         self._load()
 
     # -- configuration -----------------------------------------------------
@@ -10017,16 +10107,22 @@ class BridgeTunnel:
               "tunnel_config_invalid_key")
 
     def configure(self, tunnel_id, runtime_key):
+        desired = {"tunnel_id": tunnel_id, "runtime_key": runtime_key}
         with self.lock:
-            self._validate({"version": 1, "tunnel_id": tunnel_id, "runtime_key": runtime_key})
+            self._validate(dict(desired, version=1))
+            if (self.config == desired and self.worker is not None and self.worker.is_alive()
+                    and self.phase in {"configured", "installing", "starting"}):
+                return self.status()  # duplicate save: no second installation, no second start
+        self._stop_worker()  # deliberate replace: the old attempt ends before the new state
+        with self.lock:
             private_write(self.config_path, encoded({"version": 1, "tunnel_id": tunnel_id,
                                                      "runtime_key": runtime_key}))
-            self.config = {"tunnel_id": tunnel_id, "runtime_key": runtime_key}
-            self._stop_process()  # Deliberate replace: only now does the old state go away.
+            self.config = dict(desired)
+            self._stop_process()
             self.deadline = None
             bridge_console("Tunnel-Konfiguration empfangen und geschützt gespeichert (Tunnel-ID und Key ohne Werte)")
-            self.phase, self.detail = "configured", ""
-            self._maybe_start()
+            self.phase, self.detail, self.step = "configured", "", ""
+        self._start_worker()
         return self.status()
 
     def attach(self, mcp_port, ai_token_path):
@@ -10034,7 +10130,7 @@ class BridgeTunnel:
             check(type(mcp_port) is int and 1 <= mcp_port <= 65535)
             self.mcp_url = "http://127.0.0.1:%d/mcp" % mcp_port
             self.ai_token_path = Path(ai_token_path)
-            self._maybe_start()
+        self._start_worker()
 
     # -- lifecycle ---------------------------------------------------------
     def _locate(self):
@@ -10059,8 +10155,20 @@ class BridgeTunnel:
     def _transition(self, phase, detail=""):
         changed = phase != self.phase
         self.phase, self.detail = phase, detail
+        if phase == "connected":
+            self.step = "done"
+        elif phase in {"error", "configured"}:
+            self.step = ""
         if changed:
             bridge_console("Tunnel-Status: %s%s" % (phase, (" (%s)" % detail.split(":", 1)[0]) if detail else ""))
+
+    def _step(self, step, cancel=None):
+        if cancel is not None and cancel.is_set():
+            return
+        with self.lock:
+            if step != self.step:
+                self.step = step
+                bridge_console("Tunnel-Vorbereitung: " + self.STEP_LABELS.get(step, step))
 
     @staticmethod
     def _environment():
@@ -10082,20 +10190,158 @@ class BridgeTunnel:
         except (BridgeError, OSError, subprocess.SubprocessError):
             return False
 
-    def _maybe_start(self):
-        if self.config is None or self.mcp_url is None or self.ai_token_path is None:
+    def _start_worker(self):
+        with self.lock:
+            if self.config is None or self.mcp_url is None or self.ai_token_path is None:
+                return
+            if self.worker is not None and self.worker.is_alive():
+                return
+            self.worker_cancel = threading.Event()
+            cancel = self.worker_cancel
+            self.worker = threading.Thread(target=self._advance, args=(cancel,),
+                                           name="aitl-tunnel-setup", daemon=True)
+            self.worker.start()
+
+    def _stop_worker(self):
+        worker, cancel = self.worker, self.worker_cancel
+        self.worker, self.worker_cancel = None, None
+        if cancel is not None:
+            cancel.set()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=3)
+
+    def _advance(self, cancel):
+        try:
+            self._step("check", cancel)
+            binary = self._locate()
+            if binary is None:
+                binary = self._install_official(cancel)
+            else:
+                bridge_console("Tunnel-Client gefunden: " + binary)
+            if cancel.is_set():
+                return
+            self._spawn(binary, cancel)
+            self._step("wait", cancel)
+        except BridgeError as failure:
+            if not cancel.is_set():
+                with self.lock:
+                    self._stop_process()
+                    self._transition("error", failure.code)
+        except Exception:
+            if not cancel.is_set():
+                with self.lock:
+                    self._transition("error", "tunnel_setup_failed")
+
+    def _install_official(self, cancel):
+        if cancel.is_set():
+            raise BridgeError("tunnel_setup_cancelled")
+        architecture = self.ARCHITECTURES.get(platform.machine().lower())
+        if architecture not in self.ARCHIVE_SHA256 or not sys.platform.startswith("linux"):
+            bridge_console("Kein offiziell geprüfter Tunnel-Client gefunden. Automatisches Nachinstallieren "
+                           "nur auf Linux amd64/arm64 – auf diesem System bewusst manuell installieren "
+                           "(macOS: Homebrew) und erneut speichern.")
+            raise BridgeError("tunnel_client_unavailable")
+        self._transition("installing")
+        self._step("download", cancel)
+        stem = "tunnel-client-runtime-" + self.RELEASE + "-linux-" + architecture
+        archive = self._download("https://github.com/openai/tunnel-client/releases/download/"
+                                 + self.RELEASE + "/" + stem + ".zip", cancel)
+        if hashlib.sha256(archive).hexdigest() != self.ARCHIVE_SHA256[architecture]:
+            raise BridgeError("tunnel_archive_checksum_mismatch")
+        bridge_console("Tunnel-Vorbereitung: SHA-256-Prüfung gegen das gepinnte offizielle Release bestanden")
+        self._step("install", cancel)
+        destination = self.directory / ("tunnel-client-" + self.RELEASE + "-linux-" + architecture)
+        self._install_archive(archive, destination, stem, cancel)
+        self._step("verify", cancel)
+        binary = str(destination / "tunnel-client-runtime")
+        if not self._compatible(binary):
+            raise BridgeError("tunnel_client_unsupported_version")
+        bridge_console("Tunnel-Vorbereitung: offizieller Client installiert und geprüft: " + binary)
+        return binary
+
+    def _download(self, url, cancel):
+        import urllib.request
+        hosts = self.DOWNLOAD_HOSTS
+
+        class ReleaseRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, request, fp, code, message, headers, newurl):
+                parsed = urlsplit(newurl)
+                if (parsed.scheme != "https" or parsed.hostname not in hosts
+                        or parsed.username or parsed.password):
+                    raise BridgeError("tunnel_download_redirect")
+                return super().redirect_request(request, fp, code, message, headers, newurl)
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), ReleaseRedirect())
+        data = bytearray()
+        deadline = time.monotonic() + self.DOWNLOAD_TIMEOUT
+        try:
+            with opener.open(url, timeout=10) as response:
+                while True:
+                    if cancel.is_set():
+                        raise BridgeError("tunnel_setup_cancelled")
+                    if time.monotonic() > deadline:
+                        raise BridgeError("tunnel_download_timeout")
+                    chunk = response.read(65536)
+                    if not chunk:
+                        return bytes(data)
+                    data.extend(chunk)
+                    if len(data) > self.ARCHIVE_LIMIT:
+                        raise BridgeError("tunnel_archive_limit")
+        except BridgeError:
+            raise
+        except (OSError, ValueError):
+            raise BridgeError("tunnel_download_failed") from None
+
+    def _install_archive(self, archive, destination, stem, cancel):
+        import io
+        import zipfile
+        allowed = {"tunnel-client-runtime", "LICENSE", "NOTICE", stem + "-licenses.txt", stem + ".spdx.json"}
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = destination.lstat()
+        if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                and not stat.S_IMODE(info.st_mode) & 0o077):
+            raise BridgeError("tunnel_archive_unsafe")
+        dfd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with zipfile.ZipFile(io.BytesIO(archive)) as source:
+                members = source.infolist()
+                if len(members) != len(allowed) or {item.filename for item in members} != allowed:
+                    raise BridgeError("tunnel_archive_unsafe")
+                if (sum(item.file_size for item in members) > self.ARCHIVE_LIMIT
+                        or any(item.is_dir() or stat.S_IFMT(item.external_attr >> 16) not in {0, stat.S_IFREG}
+                               for item in members)):
+                    raise BridgeError("tunnel_archive_unsafe")
+                # Publish the executable last, after its bundled legal/evidence files.
+                for item in sorted(members, key=lambda entry: entry.filename == "tunnel-client-runtime"):
+                    if cancel.is_set():
+                        raise BridgeError("tunnel_setup_cancelled")
+                    temporary = ".download-" + uuid.uuid4().hex
+                    try:
+                        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                                     0o600, dir_fd=dfd)
+                        with os.fdopen(fd, "wb") as target:
+                            target.write(source.read(item))
+                            if item.filename == "tunnel-client-runtime":
+                                os.fchmod(target.fileno(), 0o700)
+                            target.flush()
+                            os.fsync(target.fileno())
+                        os.replace(temporary, item.filename, src_dir_fd=dfd, dst_dir_fd=dfd)
+                    finally:
+                        try:
+                            os.unlink(temporary, dir_fd=dfd)
+                        except FileNotFoundError:
+                            pass
+        except BridgeError:
+            raise
+        except Exception:
+            raise BridgeError("tunnel_archive_unsafe") from None
+        finally:
+            os.close(dfd)
+
+    def _spawn(self, binary, cancel):
+        if cancel.is_set():
             return
-        if self.process is not None:
-            return
-        binary = self._locate()
-        if binary is None:
-            self._transition("error", "tunnel_client_unavailable")
-            bridge_console("Kein Tunnel-Client gefunden. Gesucht: State-Verzeichnis tunnel-client-*/tunnel-client-runtime,"
-                           " PATH-Namen tunnel-client-runtime/tunnel-client, Homebrew- und /usr/local/bin-Pfade."
-                           " Die Bridge installiert bewusst nichts uebers Netz: manuell am Bridge-Standort"
-                           " installieren (offizielles Release/Homebrew) und erneut speichern.")
-            return
-        bridge_console("Tunnel-Client gefunden: " + binary)
+        self._step("start", cancel)
         self._stop_process()
         self.tail.clear()
         work = self.directory / ("tunnel-run-" + uuid.uuid4().hex[:16])
@@ -10194,7 +10440,8 @@ class BridgeTunnel:
     def status(self):
         with self.lock:
             self._refresh()
-            return {"version": 1, "phase": self.phase, "detail": self.detail[:self.DETAIL_LIMIT]}
+            return {"version": 1, "phase": self.phase, "detail": self.detail[:self.DETAIL_LIMIT],
+                    "step": self.step}
 
     def _refresh(self):
         if self.phase == "missing":
@@ -10277,6 +10524,7 @@ class BridgeTunnel:
         return accepted, failure
 
     def close(self):
+        self._stop_worker()
         with self.lock:
             self._stop_process()
 

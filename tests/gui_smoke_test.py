@@ -642,6 +642,16 @@ class ConnectionDialogTests(unittest.TestCase):
         self.assertEqual(dialog.entries["remote_tunnel_id"].cget("show"), "")
         self.assertEqual(dialog.entries["remote_runtime_key"].cget("show"), "")
         self.assertEqual(dialog.remote_tunnel_form.winfo_manager(), "grid")
+        self.assertTrue(dialog.buttons["tunnel_cancel_remote"].instate(["disabled"]))
+        # 0.9.5: die Bridge installiert automatisch; die Phase wird stufengenau gezeigt.
+        preparing = a.replace(missing, tunnel_phase="installing", tunnel_step="download")
+        with mock.patch.object(self.core, "bridge_snapshot", return_value=preparing), \
+                mock.patch.object(self.core, "begin_tunnel_probe"):
+            dialog.render()
+            self.root.update()
+        self.assertEqual(dialog.wizard_index, 2)
+        self.assertEqual(dialog.remote_tunnel_form.winfo_manager(), "")
+        self.assertIn("von GitHub geladen", dialog.remote_tunnel_status.get())
         starting = a.replace(missing, tunnel_phase="starting")
         with mock.patch.object(self.core, "bridge_snapshot", return_value=starting), \
                 mock.patch.object(self.core, "begin_tunnel_probe"):
@@ -649,7 +659,7 @@ class ConnectionDialogTests(unittest.TestCase):
             self.root.update()
         self.assertEqual(dialog.wizard_index, 2)  # wartet sichtbar, springt nicht vor
         self.assertEqual(dialog.remote_tunnel_form.winfo_manager(), "")  # gueltige Config: Formular übersprungen
-        self.assertIn("startet", dialog.remote_tunnel_status.get())
+        self.assertIn("Verbindung zur Platform", dialog.remote_tunnel_status.get())
         connected = a.replace(missing, tunnel_phase="connected", chat_binding=binding,
                               chat_binding_received_at=time.monotonic())
         with mock.patch.object(self.core, "bridge_snapshot", return_value=connected), \

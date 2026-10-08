@@ -2127,6 +2127,15 @@ class BridgeTunnelTests(unittest.TestCase):
             return processes[-1]
         return spawn, calls, processes
 
+    def settle(self, tunnel, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = tunnel.status()
+            if status["phase"] in {"starting", "connected", "error"}:
+                return status
+            time.sleep(0.03)
+        self.fail("tunnel setup worker did not settle")
+
     def live_tunnel(self, spawn, directory=None):
         tunnel = a.BridgeTunnel(directory or self.temp.name, spawn=spawn)
         tunnel._locate = lambda: "/bin/true"
@@ -2136,9 +2145,10 @@ class BridgeTunnelTests(unittest.TestCase):
     def test_config_persistence_restart_and_key_never_leaves(self):
         spawn, calls, processes = self.recorder()
         tunnel = a.BridgeTunnel(self.temp.name, spawn=spawn)
-        self.assertEqual(tunnel.status(), {"version": 1, "phase": "missing", "detail": ""})
+        self.assertEqual(tunnel.status(), {"version": 1, "phase": "missing", "detail": "", "step": ""})
         tunnel = self.live_tunnel(spawn)
-        self.assertEqual(tunnel.configure(self.tunnel_id, self.key)["phase"], "starting")
+        tunnel.configure(self.tunnel_id, self.key)
+        self.assertEqual(self.settle(tunnel)["phase"], "starting")
         self.assertEqual(len(calls), 1)
         argv = calls[0][0]
         self.assertNotIn(self.key, " ".join(argv))
@@ -2156,12 +2166,13 @@ class BridgeTunnelTests(unittest.TestCase):
         self.assertEqual(reloaded.status()["phase"], "configured")
         reloaded._locate = lambda: "/bin/true"
         reloaded.attach(41111, Path(self.temp.name, "ai-token"))
-        self.assertEqual(reloaded.status()["phase"], "starting")
+        self.assertEqual(self.settle(reloaded)["phase"], "starting")
         self.assertEqual(len(calls), 2)
         # A deliberate replace stops the old process and starts the new config once.
         replacement = self.recorder()
         reloaded.spawn = replacement[0]
-        self.assertEqual(reloaded.configure("tunnel_" + "c" * 32, "S" * 32)["phase"], "starting")
+        reloaded.configure("tunnel_" + "c" * 32, "S" * 32)
+        self.assertEqual(self.settle(reloaded)["phase"], "starting")
         self.assertEqual(len(replacement[1]), 1)
         self.assertNotIn("R" * 32, " ".join(replacement[1][0][0]))
         reloaded.close()
@@ -2188,6 +2199,7 @@ class BridgeTunnelTests(unittest.TestCase):
         spawn, calls, processes = self.recorder()
         tunnel = self.live_tunnel(spawn)
         tunnel.configure(self.tunnel_id, self.key)
+        self.settle(tunnel)
         health = Path(tunnel.work, "health-url")
         health.write_text("http://127.0.0.1:%d" % server.server_address[1])
         os.chmod(health, 0o600)
@@ -2198,6 +2210,7 @@ class BridgeTunnelTests(unittest.TestCase):
         # Transient provider state stays a bounded wait, never a premature claim.
         payload["details"] = {"http_status": 429, "last_success": None, "consecutive_failures": 0}
         tunnel.configure(self.tunnel_id, self.key)
+        self.settle(tunnel)
         health = Path(tunnel.work, "health-url")
         health.write_text("http://127.0.0.1:%d" % server.server_address[1])
         os.chmod(health, 0o600)
@@ -2215,7 +2228,8 @@ class BridgeTunnelTests(unittest.TestCase):
         tunnel2 = a.BridgeTunnel(self.temp.name, spawn=spawn2)
         tunnel2._locate = lambda: "/bin/true"
         tunnel2.attach(41111, Path(self.temp.name, "ai-token"))
-        self.assertEqual(tunnel2.configure(self.tunnel_id, self.key)["phase"], "starting")
+        tunnel2.configure(self.tunnel_id, self.key)
+        self.assertEqual(self.settle(tunnel2)["phase"], "starting")
         tunnel2.tail.extend(("Runtime API key " + self.key + " rejected\nvalue " + "x" * 40 + "\n").encode())
         tunnel2.process.exit_code = 1
         tunnel2.checked_at = 0.0
@@ -2237,7 +2251,7 @@ class BridgeTunnelTests(unittest.TestCase):
             self.addCleanup(harness.close)
             profile = harness.profile
             self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/tunnel/status"),
-                             {"version": 1, "phase": "missing", "detail": ""})
+                             {"version": 1, "phase": "missing", "detail": "", "step": ""})
             self.assertEqual(request(profile.url, path="/v1/tunnel/status")[0], 401)
             self.assertEqual(request(profile.url, "PUT", path="/v1/tunnel/config",
                                      body={"version": 1, "tunnel_id": "tunnel_" + "a" * 32,
@@ -2268,6 +2282,7 @@ class BridgeTunnelTests(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             tunnel = self.live_tunnel(spawn)
             tunnel.configure(self.tunnel_id, self.key)
+            self.settle(tunnel)
         log = buffer.getvalue()
         self.assertIn("Tunnel-Konfiguration empfangen", log)
         self.assertIn("Tunnel-Client gefunden", log)
@@ -2286,19 +2301,37 @@ class BridgeTunnelTests(unittest.TestCase):
         self.assertNotIn(self.tunnel_id, log2)
         tunnel.close()
 
-    def test_console_missing_client_names_manual_install_responsibility(self):
+    def test_console_missing_client_unsupported_platform_names_manual_guidance(self):
         import contextlib
         import io
         with tempfile.TemporaryDirectory(prefix="aitl-tunnel-nobin-") as directory:
             buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
+            with mock.patch.dict(a.BridgeTunnel.ARCHITECTURES, {}, clear=True), contextlib.redirect_stdout(buffer):
                 tunnel = a.BridgeTunnel(directory)
                 tunnel.attach(41111, Path(directory, "ai-token"))
-                status = tunnel.configure("tunnel_" + "d" * 32, "K" * 32)
+                tunnel.configure("tunnel_" + "d" * 32, "K" * 32)
+                status = self.settle(tunnel)
             log = buffer.getvalue()
             self.assertEqual((status["phase"], status["detail"]), ("error", "tunnel_client_unavailable"))
-            self.assertIn("Kein Tunnel-Client gefunden", log)
             self.assertIn("manuell", log)  # klare Anleitung statt stiller Auslassung
+            self.assertNotIn("K" * 32, log)
+
+    def test_console_autoinstall_attempt_is_visible_and_download_failure_is_specific(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory(prefix="aitl-tunnel-dl-") as directory:
+            tunnel = a.BridgeTunnel(directory, spawn=self.recorder()[0])
+            tunnel._download = lambda url, cancel: (_ for _ in ()).throw(
+                a.BridgeError("tunnel_download_failed"))
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                tunnel.attach(41111, Path(directory, "ai-token"))
+                tunnel.configure("tunnel_" + "d" * 32, "K" * 32)
+                status = self.settle(tunnel)
+            log = buffer.getvalue()
+            self.assertEqual((status["phase"], status["detail"]), ("error", "tunnel_download_failed"))
+            self.assertIn("Tunnel-Vorbereitung: offizielles Release von GitHub laden", log)
+            self.assertIn("Tunnel-Status: error (tunnel_download_failed)", log)
             self.assertNotIn("K" * 32, log)
 
     def test_finds_state_dir_client_kit(self):
@@ -2353,6 +2386,181 @@ class ConsoleVisibilityTests(unittest.TestCase):
             self.assertNotIn(ai, log)
             self.assertNotIn(controller, log)
 
+class TunnelAutoInstallTests(unittest.TestCase):
+    """0.9.5: pinned official release, integrity-checked auto-install on Linux,
+    idempotent saves and clean replacement. Download is stubbed; extraction,
+    permissions and the version probe run for real."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-tunnel-install-")
+        self.addCleanup(self.temp.cleanup)
+        import platform
+        self.architecture = a.BridgeTunnel.ARCHITECTURES.get(platform.machine().lower())
+        if self.architecture is None or not sys.platform.startswith("linux"):
+            self.skipTest("auto-install test requires linux amd64/arm64 host")
+        self.tunnel_id = "tunnel_" + "a" * 32
+        self.key = "K" * 32
+
+    def recorder(self):
+        calls, processes = [], []
+        def spawn(argv, **kwargs):
+            calls.append((argv, kwargs))
+            process = BridgeTunnelTests.FakeProcess()
+            processes.append(process)
+            return process
+        return spawn, calls, processes
+
+    def archive(self, version="0.0.15", extra=False):
+        import hashlib
+        import io
+        import zipfile
+        stem = "tunnel-client-runtime-" + a.BridgeTunnel.RELEASE + "-linux-" + self.architecture
+        script = ("#!/bin/sh\ncase \"$*\" in\n  --version) printf '%s\\n' " + version + ";;\n"
+                  "  *) exit 2;;\nesac\n")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as target:
+            for name, content in (("tunnel-client-runtime", script), ("LICENSE", "L"), ("NOTICE", "N"),
+                                  (stem + "-licenses.txt", "T"), (stem + ".spdx.json", "{}")):
+                info = zipfile.ZipInfo(name)
+                info.external_attr = ((0o100755 if name == "tunnel-client-runtime" else 0o100644) << 16)
+                target.writestr(info, content)
+            if extra:
+                target.writestr("EXTRA", "x")
+        value = buffer.getvalue()
+        return value, hashlib.sha256(value).hexdigest()
+
+    def settle(self, tunnel, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            status = tunnel.status()
+            if status["phase"] in {"starting", "connected", "error"}:
+                return status
+            time.sleep(0.03)
+        self.fail("tunnel setup worker did not settle")
+
+    def test_installs_pinned_release_into_state_dir_and_starts_once(self):
+        import contextlib
+        import io
+        archive, digest = self.archive()
+        spawn, calls, processes = self.recorder()
+        tunnel = a.BridgeTunnel(self.temp.name, spawn=spawn)
+        urls = []
+        def fake_download(url, cancel):
+            urls.append(url)
+            return archive
+        tunnel._download = fake_download
+        buffer = io.StringIO()
+        with mock.patch.dict(a.BridgeTunnel.ARCHIVE_SHA256, {self.architecture: digest}),                 contextlib.redirect_stdout(buffer):
+            tunnel.attach(41111, Path(self.temp.name, "ai-token"))
+            tunnel.configure(self.tunnel_id, self.key)
+            status = self.settle(tunnel)
+        log = buffer.getvalue()
+        self.assertEqual(status["phase"], "starting")
+        self.assertEqual(status["step"], "wait")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(urls, ["https://github.com/openai/tunnel-client/releases/download/"
+                               + a.BridgeTunnel.RELEASE + "/tunnel-client-runtime-" + a.BridgeTunnel.RELEASE
+                               + "-linux-" + self.architecture + ".zip"])
+        destination = Path(self.temp.name, "tunnel-client-" + a.BridgeTunnel.RELEASE + "-linux-" + self.architecture)
+        binary = destination / "tunnel-client-runtime"
+        self.assertEqual(binary.read_text().splitlines()[0], "#!/bin/sh")
+        self.assertEqual(binary.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((destination / "LICENSE").stat().st_mode & 0o777, 0o600)
+        self.assertIn("SHA-256-Prüfung gegen das gepinnte offizielle Release bestanden", log)
+        self.assertIn("installiert und geprüft", log)
+        self.assertNotIn(self.key, log)
+        tunnel.close()
+
+    def test_checksum_mismatch_and_unsafe_archive_are_rejected_without_executing(self):
+        archive, digest = self.archive()
+        wrong = archive + b"!"  # digest mismatch for the pinned value
+        spawn, calls, processes = self.recorder()
+        tunnel = a.BridgeTunnel(self.temp.name, spawn=spawn)
+        tunnel._download = lambda url, cancel: wrong
+        with mock.patch.dict(a.BridgeTunnel.ARCHIVE_SHA256, {self.architecture: digest}):
+            tunnel.attach(41111, Path(self.temp.name, "ai-token"))
+            tunnel.configure(self.tunnel_id, self.key)
+            status = self.settle(tunnel)
+        self.assertEqual(status["detail"], "tunnel_archive_checksum_mismatch")
+        self.assertFalse(any(Path(self.temp.name).glob("tunnel-client-" + a.BridgeTunnel.RELEASE + "*")))
+        self.assertEqual(len(calls), 0)
+        # A structurally invalid member set is refused even with the right checksum.
+        extra, extra_digest = self.archive(extra=True)
+        spawn2, calls2, _ = self.recorder()
+        tunnel2 = a.BridgeTunnel(self.temp.name, spawn=spawn2)
+        tunnel2._download = lambda url, cancel: extra
+        with mock.patch.dict(a.BridgeTunnel.ARCHIVE_SHA256, {self.architecture: extra_digest}):
+            tunnel2.attach(41112, Path(self.temp.name, "ai-token"))
+            tunnel2.configure(self.tunnel_id, self.key)
+            status = self.settle(tunnel2)
+        self.assertEqual(status["detail"], "tunnel_archive_unsafe")
+        self.assertEqual(len(calls2), 0)
+
+    def test_old_client_is_replaced_and_current_client_never_downloads(self):
+        import platform
+        stale_dir = Path(self.temp.name, "tunnel-client-old-v1")
+        stale_dir.mkdir()
+        stale = stale_dir / "tunnel-client-runtime"
+        stale.write_text("#!/bin/sh\ncase \"$*\" in\n  --version) printf '0.0.14\\n';;\n  *) exit 2;;\nesac\n")
+        stale.chmod(0o700)
+        archive, digest = self.archive()
+        spawn, calls, processes = self.recorder()
+        tunnel = a.BridgeTunnel(self.temp.name, spawn=spawn)
+        tunnel._download = lambda url, cancel: archive
+        with mock.patch.dict(a.BridgeTunnel.ARCHIVE_SHA256, {self.architecture: digest}):
+            tunnel.attach(41113, Path(self.temp.name, "ai-token"))
+            tunnel.configure(self.tunnel_id, self.key)
+            status = self.settle(tunnel)
+        self.assertEqual(status["phase"], "starting")
+        self.assertIn("-linux-" + self.architecture, calls[0][0][0])
+        self.assertNotIn("tunnel-client-old-v1", calls[0][0][0])
+        tunnel.close()
+        # A current compatible client must be started directly without any download.
+        good_dir = Path(self.temp.name, "tunnel-client-current")
+        good_dir.mkdir()
+        good = good_dir / "tunnel-client-runtime"
+        good.write_text("#!/bin/sh\ncase \"$*\" in\n  --version) printf '0.0.16\\n';;\n  *) exit 2;;\nesac\n")
+        good.chmod(0o700)
+        spawn2, calls2, processes2 = self.recorder()
+        tunnel2 = a.BridgeTunnel(self.temp.name, spawn=spawn2)
+        def must_not_download(url, cancel):
+            raise AssertionError("download must not run for a compatible client")
+        tunnel2._download = must_not_download
+        tunnel2.attach(41114, Path(self.temp.name, "ai-token"))
+        tunnel2.configure(self.tunnel_id, self.key)
+        self.assertEqual(self.settle(tunnel2)["phase"], "starting")
+        tunnel2.close()
+
+    def test_duplicate_save_is_idempotent_and_replacement_cancels_cleanly(self):
+        archive, digest = self.archive()
+        gate = threading.Event()
+        downloads = []
+        def slow_download(url, cancel):
+            downloads.append(url)
+            while not gate.wait(0.02):
+                if cancel.is_set():
+                    raise a.BridgeError("tunnel_setup_cancelled")
+            return archive
+        spawn, calls, processes = self.recorder()
+        tunnel = a.BridgeTunnel(self.temp.name, spawn=spawn)
+        tunnel._download = slow_download
+        with mock.patch.dict(a.BridgeTunnel.ARCHIVE_SHA256, {self.architecture: digest}):
+            tunnel.attach(41115, Path(self.temp.name, "ai-token"))
+            tunnel.configure(self.tunnel_id, self.key)
+            time.sleep(0.1)  # the worker is verifiably inside the stubbed download
+            again = tunnel.configure(self.tunnel_id, self.key)  # duplicate deliberate save
+            self.assertIn(again["phase"], {"installing", "configured", "starting"})
+            self.assertEqual(len(downloads), 1)  # no second download, no second start
+            other = "S" * 32
+            tunnel._download = lambda url, cancel: archive
+            tunnel.configure(self.tunnel_id, other)  # replacement cancels the stalled attempt
+            gate.set()
+            status = self.settle(tunnel)
+        self.assertEqual(status["phase"], "starting")
+        self.assertEqual(Path(tunnel.work, "api-key").read_text(), other)
+        self.assertLessEqual(len(calls), 2)  # only the replacement ever spawned
+        tunnel.close()
+
 class RemoteTunnelCoordinationTests(unittest.TestCase):
     """M9 S4: Main observes and saves through the same authenticated bridge."""
 
@@ -2379,6 +2587,13 @@ class RemoteTunnelCoordinationTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail("tunnel_coordination_timeout")
+
+    def test_second_save_while_save_in_flight_is_rejected(self):
+        self.core.remote_tunnel_busy = True
+        with self.assertRaises(a.ProbeError) as caught:
+            self.core.save_remote_tunnel("tunnel_" + "a" * 32, "k" * 32)
+        self.assertEqual(str(caught.exception), "tunnel_config_busy")
+        self.core.remote_tunnel_busy = False
 
     def test_probe_save_and_disconnect_clear_state(self):
         key = "k" * 32
