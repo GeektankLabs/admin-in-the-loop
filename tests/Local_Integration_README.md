@@ -1,4 +1,4 @@
-# Admin in the Loop – v0.9.3 (persönliche Testversion)
+# Admin in the Loop – v0.9.4 (persönliche Testversion)
 
 **AI assists, Admin decides.**
 
@@ -8,7 +8,7 @@ Stand des beschriebenen MVP: 30. September 2026. Die bisherige lokale Integratio
 
 ## Versionen und Versionsregel
 
-Kanonische Version: `APP_VERSION` in `admin_in_the_loop.py` (aktuell **0.9.3**); die headless Bridge zeigt dieselbe Version (`BRIDGE_SERVER_INFO`, Konsolen-Startzeile) und der GUI-Fenstertitel führt sie ebenfalls. Jeder neue ausgelieferte Programmstand erhöht mindestens den Patch-Stand (keine undokumentierten Stände); `--version` gibt die Version zeilenweise aus. Tests pinnen die Konsistenz beider Kopien.
+Kanonische Version: `APP_VERSION` in `admin_in_the_loop.py` (aktuell **0.9.4**); die headless Bridge zeigt dieselbe Version (`BRIDGE_SERVER_INFO`, Konsolen-Startzeile) und der GUI-Fenstertitel führt sie ebenfalls. Jeder neue ausgelieferte Programmstand erhöht mindestens den Patch-Stand (keine undokumentierten Stände); `--version` gibt die Version zeilenweise aus. Tests pinnen die Konsistenz beider Kopien.
 
 ## Dateien und Architektur
 
@@ -138,6 +138,8 @@ tunnel-client-runtime run \
 Platzhalter durch die eigene Konfiguration ersetzen. `ai-token` liegt im Bridge-State-Verzeichnis. Key-Dateien müssen privat sein: Verzeichnis `0700`, Dateien `0600`. Beim Remote-/Qube-Betrieb übernimmt die Bridge den Tunnel-Lifecycle selbst: Nach dem Koppeln führt der Assistent durch Tunnel-ID und Restricted Runtime Key, überträgt sie einmalig über die gepinnte authentifizierte Controller-Verbindung, die Bridge speichert sie geschützt (0600) und startet den Client einmalig; beide Eingabefelder sind lesbar (Operator 08.10.), das Key-Feld wird nach bestätigter Übertragung geleert und in Main nie dauerhaft gespeichert.
 
 Nach einer bereits gekoppelten Bridge stellt der Prüfschritt die passende gespeicherte, gepinnte Controller-Verbindung automatisch echt authentifiziert wieder her (idempotentes Confirm; ohne passende eigene Credentials bleibt es ein ehrlicher Status ohne Auth-Bypass); eine gültige vorhandene Tunnelkonfiguration überspringt das Eingabeformular, bei „verbunden“ führt der Assistent automatisch weiter zur Chat-Seite. **„Remote-Bridge verbunden · authentifiziert“ ist der erfolgreiche Controller↔Bridge-Aufbau**, nicht der Nachweis einer ChatGPT-/Provider-Verbindung. Eine Tunnel-Aussage stammt ausschließlich aus der beobachteten Bridge-Phase (Zeile oben); die frühere Blankett-Zeile „Tunnelbetrieb am Gateway“ gibt es nicht mehr. Die echte Provider-Konnektivität bleibt der oben beschriebene manuelle Round Trip; es gibt keine neue Provider-Verifikationsfunktion.
+
+**Bridge-Konsole und Installationsverantwortung (v0.9.4).** Die Bridge protokolliert secretfreie Fortschrittszeilen: Controller-Kontakt (bestätigte Kopplung mit interner ID), Tunnel-Konfiguration empfangen oder aus dem State-Verzeichnis geladen (nie mit Werten), Client gefunden (Pfad) oder nicht gefunden (gesuchte Kandidatenorte plus ausdrückliche Anleitung), Client gestartet (PID und Loopback-MCP-Ziel), jeder Phasenwechsel mit festem Code (missing/configured/starting/connected/error) sowie MCP-Verkehr: `initialize`, `tools/list`, `server/discover`, `ping`, `tools/call`, events-Methoden – beantwortet oder abgewiesen mit festem Fehlercode; niemals Bodies, Header, Token, Client-fremde Methodennamen oder hostile Pfade. Die Bridge installiert bewusst nichts übers Netz: Die Installationsverantwortung liegt beim Betreiber des Bridge-/Gateway-Standorts (offizielles Release oder Homebrew); gefunden werden zusätzlich `tunnel-client-*/tunnel-client-runtime` im Bridge-State-Verzeichnis, die PATH-Namen `tunnel-client-runtime`/`tunnel-client` sowie `/opt/homebrew/bin/tunnel-client` und `/usr/local/bin/tunnel-client`. Fehlt der Client, zeigen Konsole und authentifizierte UI denselben Code `tunnel_client_unavailable` mit Anleitung statt stiller Auslassung.
 
 Controller lokal mit derselben Datei widerrufen:
 

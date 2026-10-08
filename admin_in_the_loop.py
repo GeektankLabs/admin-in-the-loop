@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.9.4"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.9.4"
 
 
 def _load_bridge_component(namespace=None):
@@ -8547,7 +8547,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.3"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.4"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime
@@ -8648,6 +8648,12 @@ def encoded(value):
         raise BridgeError("invalid_json") from None
     check(len(raw) <= BRIDGE_BODY_LIMIT, "body_limit", 413)
     return raw
+
+
+def bridge_console(message):
+    """Operator console (0.9.4): bounded single-line, secret-free progress evidence.
+    Only fixed codes/names enter here – never bodies, headers, tokens or values."""
+    print(" ".join(str(message).split())[:300], flush=True)
 
 
 def protected_directory(path):
@@ -9993,10 +9999,11 @@ class BridgeTunnel:
             exact(value, {"version", "tunnel_id", "runtime_key"})
             self._validate(value)
         except (BridgeError, ValueError, UnicodeError):
-            self.phase, self.detail = "error", "tunnel_config_invalid"
+            self._transition("error", "tunnel_config_invalid")
             return
         self.config = {"tunnel_id": value["tunnel_id"], "runtime_key": value["runtime_key"]}
-        self.phase, self.detail = "configured", ""
+        bridge_console("Tunnel-Konfiguration aus State-Verzeichnis geladen (Tunnel-ID und Key ohne Werte)")
+        self._transition("configured")
 
     @staticmethod
     def _validate(value):
@@ -10016,7 +10023,9 @@ class BridgeTunnel:
                                                      "runtime_key": runtime_key}))
             self.config = {"tunnel_id": tunnel_id, "runtime_key": runtime_key}
             self._stop_process()  # Deliberate replace: only now does the old state go away.
-            self.phase, self.detail, self.deadline = "configured", "", None
+            self.deadline = None
+            bridge_console("Tunnel-Konfiguration empfangen und geschützt gespeichert (Tunnel-ID und Key ohne Werte)")
+            self.phase, self.detail = "configured", ""
             self._maybe_start()
         return self.status()
 
@@ -10029,12 +10038,29 @@ class BridgeTunnel:
 
     # -- lifecycle ---------------------------------------------------------
     def _locate(self):
-        candidates = [shutil.which(name) for name in self.CANDIDATES]
-        candidates += [path for path in self.FIXED_CANDIDATES if Path(path).is_file()]
-        for candidate in candidates:
+        for candidate in self._candidates():
             if candidate and self._compatible(candidate):
                 return candidate
         return None
+
+    def _candidates(self):
+        # 0.9.4: first the bridge's own state directory (self-contained installs),
+        # then PATH names, then the documented fixed locations. No network installs.
+        values = []
+        try:
+            values += [str(root / "tunnel-client-runtime")
+                       for root in sorted(self.directory.glob("tunnel-client-*"))]
+        except OSError:
+            pass
+        values += [shutil.which(name) for name in self.CANDIDATES]
+        values += [path for path in self.FIXED_CANDIDATES if Path(path).is_file()]
+        return values
+
+    def _transition(self, phase, detail=""):
+        changed = phase != self.phase
+        self.phase, self.detail = phase, detail
+        if changed:
+            bridge_console("Tunnel-Status: %s%s" % (phase, (" (%s)" % detail.split(":", 1)[0]) if detail else ""))
 
     @staticmethod
     def _environment():
@@ -10063,8 +10089,13 @@ class BridgeTunnel:
             return
         binary = self._locate()
         if binary is None:
-            self.phase, self.detail = "error", "tunnel_client_unavailable"
+            self._transition("error", "tunnel_client_unavailable")
+            bridge_console("Kein Tunnel-Client gefunden. Gesucht: State-Verzeichnis tunnel-client-*/tunnel-client-runtime,"
+                           " PATH-Namen tunnel-client-runtime/tunnel-client, Homebrew- und /usr/local/bin-Pfade."
+                           " Die Bridge installiert bewusst nichts uebers Netz: manuell am Bridge-Standort"
+                           " installieren (offizielles Release/Homebrew) und erneut speichern.")
             return
+        bridge_console("Tunnel-Client gefunden: " + binary)
         self._stop_process()
         self.tail.clear()
         work = self.directory / ("tunnel-run-" + uuid.uuid4().hex[:16])
@@ -10092,13 +10123,13 @@ class BridgeTunnel:
         except (OSError, subprocess.SubprocessError):
             self._stop_process()
             tail = self._safe_tail()
-            self.phase = "error"
-            self.detail = "tunnel_client_start_failed" + ((": " + tail) if tail else "")
+            self._transition("error", "tunnel_client_start_failed" + ((": " + tail) if tail else ""))
             return
         self.work = work
-        self.phase, self.detail = "starting", ""
         self.deadline = self.now() + self.START_DEADLINE
         self.checked_at = 0.0
+        self._transition("starting")
+        bridge_console("Tunnel-Client gestartet (pid %s, MCP %s)" % (self.process.pid, self.mcp_url))
 
     def _drain(self, stream):
         """Keep only the last kilobytes of client stderr; never persist or log it."""
@@ -10171,25 +10202,24 @@ class BridgeTunnel:
         if self.process is not None and self.process.poll() is not None:
             self._stop_process()
             tail = self._safe_tail()
-            self.phase = "error"
-            self.detail = "tunnel_process_exited" + ((": " + tail) if tail else "")
+            self._transition("error", "tunnel_process_exited" + ((": " + tail) if tail else ""))
             return
         if self.phase != "starting":
             return
         if self.deadline is not None and self.now() > self.deadline:
             self._stop_process()
-            self.phase, self.detail = "error", "tunnel_status_timeout"
+            self._transition("error", "tunnel_status_timeout")
             return
         if self.now() - self.checked_at < 0.5:
             return
         self.checked_at = self.now()
         accepted, failure = self._health()
         if accepted:
-            self.phase, self.detail = "connected", ""
+            self._transition("connected")
         elif failure in {"runtime_key_rejected", "runtime_permission_denied", "runtime_tunnel_not_found",
                          "client_health_unsupported"}:
             self._stop_process()
-            self.phase, self.detail = "error", failure
+            self._transition("error", failure)
         elif failure:
             self.detail = failure  # Transient: bounded waiting continues until the deadline.
 
@@ -10256,6 +10286,8 @@ class BridgeService:
     WEBHOOK_ATTEMPT_LIMIT = 3
     WEBHOOK_RETRY_DELAYS = (2.0, 10.0)
     WEBHOOK_JOB_LIMIT = 64
+    MCP_LOG_METHODS = ("initialize", "ping", "server/discover", "tools/list", "tools/call",
+                       "events/list", "events/subscribe", "events/unsubscribe")
 
     def __init__(self, store):
         self.store = store
@@ -10474,9 +10506,20 @@ class BridgeService:
         value = self.body(request)
         exact(value, {"version"})
         check(type(value["version"]) is int and value["version"] == 1)
-        return self.json(self.store.confirm(token))
+        confirmed = self.store.confirm(token)
+        bridge_console("Controller-Kontakt: Kopplung bestaetigt (controller %s)" % confirmed["controller_id"])
+        return self.json(confirmed)
 
     def mcp(self, request):
+        # 0.9.4 console visibility for MCP traffic: arrival/answer/rejection with
+        # fixed codes only - never bodies, headers, tokens, hosts or hostile paths.
+        try:
+            return self._mcp(request)
+        except BridgeError as failure:
+            bridge_console("mcp: abgewiesen (%s)" % failure.code)
+            raise
+
+    def _mcp(self, request):
         _, principal = self.principal(request, "AI")
         value = self.body(request)
         _, principal = self.principal(request, "AI")
@@ -10569,9 +10612,12 @@ class BridgeService:
             elif method == "events/unsubscribe" and modern:
                 result = self.unsubscribe(principal, params)
             else:
+                bridge_console("mcp: abgewiesen (method_not_found)")
                 return self.json({"jsonrpc": "2.0", "id": rid,
                                   "error": {"code": -32601, "message": "Method not found"}})
         except BridgeError as failure:
+            bridge_console("mcp: %s abgewiesen (%s)" % (method if method in self.MCP_LOG_METHODS else "rpc",
+                                                        failure.code))
             if method == "tools/call":
                 result = {"content": [{"type": "text", "text": failure.code}],
                           "structuredContent": dict({"error": failure.code}, **(failure.data or {})),
@@ -10584,6 +10630,8 @@ class BridgeService:
             else:
                 return self.json({"jsonrpc": "2.0", "id": rid,
                                   "error": {"code": -32602, "message": "Invalid parameters"}})
+        if method in self.MCP_LOG_METHODS:
+            bridge_console("mcp: %s beantwortet" % method)
         if modern:
             result["resultType"] = "complete"
             result["_meta"] = {"io.modelcontextprotocol/serverInfo": BRIDGE_SERVER_INFO}

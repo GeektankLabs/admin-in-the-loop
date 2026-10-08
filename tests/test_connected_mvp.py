@@ -1702,15 +1702,32 @@ class RemoteFixture:
                 pair_line = line()
             a.require(pair_line.startswith("PAIR CODE"), "remote_start_failed")
             self.code = pair_line.split(": ", 1)[1].strip()
+            # 0.9.4: the bridge prints secret-free progress lines later; drain the
+            # pipe continuously so the fixture can never block on a full buffer.
+            self.reader = threading.Thread(target=self._drain, daemon=True)
+            self.reader.start()
         except BaseException:
             self.close()
             raise
+
+    def _drain(self):
+        try:
+            while self.process.stdout.read(4096):
+                pass
+        except (OSError, ValueError):
+            pass
 
     def close(self):
         if self.process.poll() is None:
             self.process.terminate()
             self.process.wait(timeout=5)
-        self.process.stdout.close()
+        try:
+            self.process.stdout.close()
+        except (OSError, ValueError):
+            pass
+        reader = getattr(self, "reader", None)
+        if reader is not None:
+            reader.join(timeout=1)
 
 
 class TLSPairingTests(unittest.TestCase):
@@ -2242,6 +2259,99 @@ class BridgeTunnelTests(unittest.TestCase):
             self.assertEqual(value["phase"], "configured")
             self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/tunnel/status")["phase"], "configured")
 
+
+    def test_console_lines_are_secret_free_progress(self):
+        import contextlib
+        import io
+        spawn, calls, processes = self.recorder()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            tunnel = self.live_tunnel(spawn)
+            tunnel.configure(self.tunnel_id, self.key)
+        log = buffer.getvalue()
+        self.assertIn("Tunnel-Konfiguration empfangen", log)
+        self.assertIn("Tunnel-Client gefunden", log)
+        self.assertIn("Tunnel-Client gestartet", log)
+        self.assertIn("Tunnel-Status: starting", log)
+        self.assertNotIn(self.key, log)
+        self.assertNotIn(self.tunnel_id, log)
+        buffer2 = io.StringIO()
+        with contextlib.redirect_stdout(buffer2):
+            processes[-1].exit_code = 1
+            tunnel.checked_at = 0.0
+            tunnel.status()
+        log2 = buffer2.getvalue()
+        self.assertIn("Tunnel-Status: error (tunnel_process_exited)", log2)
+        self.assertNotIn(self.key, log2)
+        self.assertNotIn(self.tunnel_id, log2)
+        tunnel.close()
+
+    def test_console_missing_client_names_manual_install_responsibility(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory(prefix="aitl-tunnel-nobin-") as directory:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                tunnel = a.BridgeTunnel(directory)
+                tunnel.attach(41111, Path(directory, "ai-token"))
+                status = tunnel.configure("tunnel_" + "d" * 32, "K" * 32)
+            log = buffer.getvalue()
+            self.assertEqual((status["phase"], status["detail"]), ("error", "tunnel_client_unavailable"))
+            self.assertIn("Kein Tunnel-Client gefunden", log)
+            self.assertIn("manuell", log)  # klare Anleitung statt stiller Auslassung
+            self.assertNotIn("K" * 32, log)
+
+    def test_finds_state_dir_client_kit(self):
+        from test_local_setup import fake_client
+        with tempfile.TemporaryDirectory(prefix="aitl-tunnel-locate-") as directory:
+            kit = Path(directory, "tunnel-client-v0.0.15-linux-amd64")
+            kit.mkdir()
+            binary = fake_client(kit / "tunnel-client-runtime")
+            tunnel = a.BridgeTunnel(directory)
+            self.assertEqual(tunnel._locate(), str(binary))
+
+
+class ConsoleVisibilityTests(unittest.TestCase):
+    """0.9.4: the operator console shows secret-free controller/MCP progress; the
+    RemoteFixture pipe stays drained."""
+
+    def test_mcp_and_controller_console_lines_and_fixture_drain(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory(prefix="aitl-console-http-") as directory:
+            store = a.BridgeStore(directory, uuid.uuid4().hex, clock=lambda: time.time())
+            self.addCleanup(store.close)
+            controller, controller_id = store.issue("CONTROLLER")
+            ai, ai_id = store.issue("AI")
+            harness = ServiceHarness(store, controller, controller_id, ai, ai_id)
+            self.addCleanup(harness.close)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                status, _raw = request(harness.mcp_url, "POST",
+                                       body={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                             "params": {"protocolVersion": "2025-11-25",
+                                                        "capabilities": {}, "clientInfo": {}}},
+                                       headers={"X-AITL-AI-Key": ai})
+                self.assertEqual(status, 200)
+                status, _raw = request(harness.mcp_url, "POST",
+                                       body={"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}},
+                                       headers={"X-AITL-AI-Key": "0" * 64})
+                self.assertEqual(status, 401)
+                status, _raw = request(harness.mcp_url, "POST",
+                                       body={"jsonrpc": "2.0", "id": 3, "method": "unbekannt/80"},
+                                       headers={"X-AITL-AI-Key": ai})
+                self.assertEqual(status, 200)
+                status, _raw = request(harness.profile.url, "POST", path="/v1/pair/confirm",
+                                       body={"version": 1}, headers={"Authorization": "Bearer " + controller})
+                self.assertEqual(status, 200)
+            log = buffer.getvalue()
+            self.assertIn("mcp: initialize beantwortet", log)
+            self.assertIn("mcp: abgewiesen (unauthorized)", log)
+            self.assertIn("mcp: abgewiesen (method_not_found)", log)
+            self.assertNotIn("unbekannt/80", log)  # client-controlled names never reach the console
+            self.assertIn("Controller-Kontakt: Kopplung bestaetigt", log)
+            self.assertNotIn(ai, log)
+            self.assertNotIn(controller, log)
 
 class RemoteTunnelCoordinationTests(unittest.TestCase):
     """M9 S4: Main observes and saves through the same authenticated bridge."""
