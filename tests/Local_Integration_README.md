@@ -1,10 +1,14 @@
-# Admin in the Loop – v0.9.0 (persönliche Testversion)
+# Admin in the Loop – v0.9.1 (persönliche Testversion)
 
 **AI assists, Admin decides.**
 
 Command-Vorschläge und ausgewählte Terminalausgabe werden vor jeder Übergabe vom Benutzer geprüft.
 
 Stand des beschriebenen MVP: 30. September 2026. Die bisherige lokale Integration wurde um Bridge, MCP, OpenAI-Tunnelsteuerung und Remote-Kopplung erweitert. Die damals getroffenen GUI-Entscheidungen sind umgesetzt. Diese Anleitung ersetzt die frühere Offline-Anleitung. Produkt-/Konzeptentscheidungen stehen in [`doc/Admin-in-the-Loop_Konzept_V0.7.md`](../doc/Admin-in-the-Loop_Konzept_V0.7.md); alle aktive Implementierungs-, Validierungs- und Abnahmearbeit wird ausschließlich im Taskboard geführt. Diese Anleitung und die historischen Status-/Vorschlagsdateien sind keine parallelen Todo-Listen.
+
+## Versionen und Versionsregel
+
+Kanonische Version: `APP_VERSION` in `admin_in_the_loop.py` (aktuell **0.9.1**); die headless Bridge zeigt dieselbe Version (`BRIDGE_SERVER_INFO`, Konsolen-Startzeile) und der GUI-Fenstertitel führt sie ebenfalls. Jeder neue ausgelieferte Programmstand erhöht mindestens den Patch-Stand (keine undokumentierten Stände); `--version` gibt die Version zeilenweise aus. Tests pinnen die Konsistenz beider Kopien.
 
 ## Dateien und Architektur
 

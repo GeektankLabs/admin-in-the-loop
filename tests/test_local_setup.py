@@ -444,6 +444,16 @@ class CompactConnectionPresentationTests(unittest.TestCase):
             self.assertIn("gesperrt", a.local_setup_summary(core))
 
 
+class AppVersionConsistencyTests(unittest.TestCase):
+    """Versionsregel (Journal 8.10.): jede Auslieferung erhoehrt mindestens den
+    Patch-Stand; APP_VERSION (kanonisch) und BRIDGE_SERVER_INFO (Bridge-Kopie)
+    muessen identisch sein; --version existiert im Haupt-Parser."""
+
+    def test_version_sources_pinned(self):
+        self.assertEqual(a.APP_VERSION, "0.9.1")
+        self.assertEqual(a.BRIDGE_SERVER_INFO["name"], "admin-in-the-loop")
+        self.assertEqual(a.BRIDGE_SERVER_INFO["version"], a.APP_VERSION)
+
 class BridgeSetupDefaultsTests(unittest.TestCase):
     """M9: home-state defaults, path resolution, auto SAN, usable URLs, policy line."""
 
