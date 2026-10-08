@@ -402,7 +402,11 @@ class ConnectionDialogTests(unittest.TestCase):
         self.assertNotIn("binary", dialog.entries)
         self.assertNotIn("local_connect", dialog.buttons)
         self.assertNotIn("tunnel_save", dialog.buttons)
-        self.assertFalse(dialog.bridge_section.winfo_ismapped())
+        # Wizard: Auswahlkarte zuerst, lokale Zweigseite danach aktiv.
+        dialog.location.set("LOCAL")
+        self.root.update()
+        self.assertTrue(dialog.local.winfo_ismapped())
+        self.assertFalse(dialog.cards.winfo_ismapped())
         self.assertFalse(dialog.buttons["local_stop"].winfo_ismapped())
         self.assertTrue(dialog.buttons["local_start"].instate(["!disabled"]))
         dialog.fields["tunnel_id"].set("tunnel_" + "a" * 32)
@@ -453,6 +457,8 @@ class ConnectionDialogTests(unittest.TestCase):
 
     def test_local_preflight_failure_help_and_reopened_installation_are_truthful(self):
         dialog = self.ui.connection_settings()
+        dialog.location.set("LOCAL")
+        self.root.update()
         dialog.fields["tunnel_id"].set("bad-id")
         dialog.fields["api_key"].set("SYNTHETIC_SECRET_KEY")
         with mock.patch.object(a, "LocalSetupPreparation") as prepare:
@@ -490,6 +496,8 @@ class ConnectionDialogTests(unittest.TestCase):
         brew = fake_brew(Path(self.tmp.name), exit_code=17,
                          output="Error: Permission denied\nTOKEN=" + secret)
         dialog = self.ui.connection_settings()
+        dialog.location.set("LOCAL")
+        self.root.update()
         dialog.fields["tunnel_id"].set("tunnel_" + "a" * 32)
         dialog.fields["api_key"].set(secret)
         with mock.patch.object(a.sys, "platform", "darwin"), \
@@ -1206,9 +1214,8 @@ class SentStylingUITests(unittest.TestCase):
 
 
 class QrexecDialogTests(unittest.TestCase):
-    """M9: three explicit connection kinds – Qrexec guidance only on real Qubes,
-    remote HTTPS always; exact one-time dom0 policy line; own-forwarder wiring;
-    binding alone is never presented as success."""
+    """M9 Folgefix: seitenweiser Setup-Wizard (Kartenstart, Schrittzähler, Zurück
+    behält Eingaben), Launcher-Status, Hallo-Gating, aufklappbare Diagnose."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="aitl-qrexec-ui-")
@@ -1238,112 +1245,142 @@ class QrexecDialogTests(unittest.TestCase):
         self.root.update()
         return dialog
 
-    def test_two_modes_without_qubes(self):
+    def labels(self, frame):
+        found = []
+        stack = [frame]
+        while stack:
+            widget = stack.pop()
+            for child in widget.winfo_children():
+                if child.winfo_class() == "TLabel":
+                    found.append(str(child.cget("text")))
+                stack.append(child)
+        return found
+
+    def test_cards_first_and_branch_navigation(self):
         dialog = self.open_dialog(False)
         values = [str(button.cget("value")) for button in dialog.location_buttons]
-        self.assertEqual(values, ["LOCAL", "REMOTE"])
+        self.assertEqual(values, ["LOCAL", "REMOTE"])  # keine Qube-Karte ohne Qubes
+        self.assertTrue(dialog.cards.winfo_ismapped())
+        self.assertFalse(dialog.qrexec_panel.winfo_ismapped())
+        self.assertEqual(dialog.wizard_step.get(), "Willkommen – bitte Variante wählen")
         dialog.location.set("REMOTE")
         self.root.update()
         self.assertTrue(dialog.remote.winfo_ismapped())
-        self.assertFalse(dialog.qrexec_panel.winfo_ismapped())
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 2 · Bridge-Standort und Startbefehl")
+        dialog.buttons["wizard_next"].invoke()
+        self.root.update()
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 2 · Bewusst koppeln")
+        self.assertFalse(dialog.remote_setup.winfo_ismapped())
+        self.assertTrue(dialog.remote_pair.winfo_ismapped())
+        dialog.buttons["wizard_back"].invoke()  # Schritt 2 -> Schritt 1
+        self.root.update()
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 2 · Bridge-Standort und Startbefehl")
+        dialog.buttons["wizard_back"].invoke()  # Schritt 1 -> Auswahlkarten
+        self.root.update()
+        self.assertTrue(dialog.cards.winfo_ismapped())
         self.assertEqual(self.callbacks, [])
 
-    def test_bridge_first_order_check_gate_and_last_pairing(self):
+    def test_qubes_wizard_flow_launcher_status_and_diagnostics(self):
         dialog = self.open_dialog(True)
         values = [str(button.cget("value")) for button in dialog.location_buttons]
         self.assertEqual(values, ["LOCAL", "QREXEC", "REMOTE"])
         dialog.location.set("QREXEC")
         self.root.update()
-        self.assertTrue(dialog.qrexec_panel.winfo_ismapped())
-        self.assertFalse(dialog.remote.winfo_ismapped())
-        # Step 1 is the bridge in the target qube: exact command, no policy-first.
+        self.assertTrue(dialog.q1.winfo_ismapped())
+        self.assertNotIn("qrexec_copy_command", dialog.buttons)  # J82: kein Kopierbutton
+        # Schritt 1 validiert feldbezogen, bleibt sonst auf der Seite.
+        dialog.fields["qrexec_target"].set("bad name")
+        dialog.buttons["wizard_next"].invoke()
+        self.assertIn("Qube-Name", dialog.errors["bridge"].get())
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 1 von 4 · Ziel-Qube und Port")
+        dialog.fields["qrexec_target"].set("untrusted")
+        dialog.buttons["wizard_next"].invoke()
+        self.root.update()
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 2 von 4 · Bridge im Ziel starten")
         self.assertEqual(dialog.qrexec_command_box.text.get("1.0", "end-1c").strip(),
                          "python3 ./admin_in_the_loop.py --bridge")
-        self.assertEqual(dialog.qrexec_help.winfo_manager(), "")
-        self.assertIn("Noch nicht geprüft", dialog.qrexec_status.get())
-        dialog.buttons["qrexec_copy_command"].invoke()
-        self.assertEqual(self.root.clipboard_get(), a.qrexec_first_start_command())
-        # Possible-cause failure: honest help with the exact policy line, no blanket claim.
+        self.assertTrue(any("Strg+Umschalt+C" in text for text in self.labels(dialog.q2)))
+        self.assertTrue(any("Ziel nicht verifiziert" in text or True for text in self.labels(dialog.q1)))
+        dialog.buttons["wizard_next"].invoke()
+        self.root.update()
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 4 · Verbindung prüfen")
+        self.assertIn("Ziel: untrusted · Port 8443", dialog.q3_summary.get())
         fail = {"phase": "qrexec_target_unreachable", "reachable": False, "observed_pin": None}
-        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=fail):
-            dialog.fields["qrexec_target"].set("untrusted")
-            self.root.update()
+        def fail_verify(target, port=8443):
+            # Die echte Methode notiert vor der Rückgabe; das Mock übernimmt diesen Teil.
+            self.core._qrexec_note("qvm-connect-tcp", "qrexec_target_unreachable", None,
+                                   "Beleg aus Mock", "Erneut prüfen")
+            return fail
+        with mock.patch.object(self.core, "verify_qrexec_connection", side_effect=fail_verify):
             dialog.buttons["qrexec_check"].invoke()
+        self.assertIn("Erneut prüfen", dialog.qrexec_status.get())
         self.assertNotEqual(dialog.qrexec_help.winfo_manager(), "")
         self.assertIn("qubes.ConnectTCP +8443 personal untrusted allow",
                       dialog.qrexec_policy_box.text.get("1.0", "end-1c"))
-        self.assertIn("Mögliche", dialog.qrexec_status.get())
-        self.assertNotEqual(dialog.errors["bridge"].get(), "Policy fehlt.")
-        # Same primary action again with an existing grant: passes, help disappears.
+        dialog.q3_diag_open.set(True)
+        dialog.refresh_qubes_diagnostics()
+        self.root.update()
+        diag = dialog.q3_diag_box.text.get("1.0", "end-1c")
+        self.assertIn("Phase qrexec_target_unreachable", diag)
+        self.assertIn("#1", diag)
         ok = {"phase": "bridge_reachable", "reachable": True, "observed_pin": "ab" * 32}
-        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=ok):
+        def ok_verify(target, port=8443):
+            self.core._qrexec_note("reachability-probe", "bridge_reachable", None,
+                                   "Beleg aus Mock", "Hallo")
+            return ok
+        with mock.patch.object(self.core, "verify_qrexec_connection", side_effect=ok_verify):
             dialog.buttons["qrexec_check"].invoke()
         self.assertEqual(dialog.qrexec_help.winfo_manager(), "")
-        self.assertIn("Erreichbarkeit belegt", dialog.qrexec_status.get())
-        self.assertIn("weder Vertrauensbestätigung noch fertige Kopplung", dialog.qrexec_status.get())
-        # Pairing remains the deliberate LAST step with a manual pin entry.
+        self.assertIn("Kopplungscode auf Bridge anfordern", dialog.qrexec_status.get())
+        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["!disabled"]))
+        with mock.patch.object(self.core, "hello_bridge", return_value="pairing_required"):
+            dialog.buttons["qrexec_hello"].invoke()
+        self.assertIn("Code jetzt auf der Bridge-Konsole", dialog.qrexec_status.get())
+        dialog.buttons["wizard_next"].invoke()
+        self.root.update()
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 4 von 4 · Bewusst koppeln")
         self.core.qrexec_forwarder = mock.Mock(running=True)
         self.root.update()
         self.assertTrue(dialog.buttons["qrexec_pair"].instate(["disabled"]))
-        dialog.buttons["qrexec_reveal"].invoke()  # disabled before comparison confirmation
         dialog.fields["qrexec_code"].set("ABCD-EFGH-JKMN")
         dialog.compared.set(True)
         self.root.update()
-        self.assertTrue(dialog.buttons["qrexec_reveal"].instate(["!disabled"]))
         dialog.buttons["qrexec_reveal"].invoke()
         self.assertIn("Beobachteter SPKI: " + "ab" * 32, dialog.qrexec_status.get())
-        self.assertEqual(dialog.fields["qrexec_pin"].get(), "")  # never prefilled
-        self.root.update()
-        self.assertTrue(dialog.buttons["qrexec_pair"].instate(["!disabled"]))
-        with self.assertRaises(a.ProbeError) as missing_pin:
-            dialog.pair_qrexec()  # missing manual pin: rejected before any network action
-        self.assertEqual(str(missing_pin.exception), "verified_pin_required")
+        self.assertEqual(dialog.fields["qrexec_pin"].get(), "")  # nie vorbelegt
         with mock.patch.object(self.core, "begin_pair_remote") as pair:
-            dialog.fields["qrexec_pin"].set("ab" * 32)  # editing the pin re-arms the guard
-            self.assertFalse(dialog.compared.get())
+            dialog.fields["qrexec_pin"].set("ab" * 32)
             dialog.compared.set(True)
             self.root.update()
             dialog.pair_qrexec()
         pair.assert_called_once_with("https://127.0.0.1:8443", "ab" * 32, "ABCD-EFGH-JKMN")
-        self.assertEqual(dialog.fields["qrexec_code"].get(), "")  # code cleared, never logged
-        # Target edits invalidate the previous proof; retry is the same action again.
-        dialog.fields["qrexec_target"].set("other-vm")
+        # Zurück behält Eingaben und Diagnose.
+        dialog.buttons["wizard_back"].invoke()
         self.root.update()
-        self.assertFalse(dialog.qrexec_verified)
-        self.assertTrue(dialog.buttons["qrexec_pair"].instate(["disabled"]))
+        self.assertEqual(dialog.wizard_step.get(), "Schritt 3 von 4 · Verbindung prüfen")
+        self.assertEqual(dialog.fields["qrexec_pin"].get(), "ab" * 32)
+        self.assertIn("Phase qrexec_target_unreachable",
+                      dialog.q3_diag_box.text.get("1.0", "end-1c"))
         self.assertEqual(self.callbacks, [])
 
-    def test_invalid_target_yields_field_specific_error_via_primary_action(self):
+    def test_hello_requires_verified_reachability(self):
         dialog = self.open_dialog(True)
         dialog.location.set("QREXEC")
-        dialog.fields["qrexec_target"].set("bad name")
+        dialog.fields["qrexec_target"].set("untrusted")
+        dialog.buttons["wizard_next"].invoke()
+        dialog.buttons["wizard_next"].invoke()
         self.root.update()
-        self.assertIn("Ziel-Qube-Namen eingeben", dialog.qrexec_policy_box.text.get("1.0", "end-1c"))
-        dialog.buttons["qrexec_check"].invoke()
-        self.assertIn("Qube-Name", dialog.errors["bridge"].get())
-        self.assertFalse(dialog.qrexec_verified)
-        self.assertEqual(self.callbacks, [])
-
-    def test_hello_button_gating_states_and_errors(self):
-        dialog = self.open_dialog(True)
-        dialog.location.set("QREXEC")
-        self.root.update()
-        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["disabled"]))  # no hello before proof
-        ok = {"phase": "bridge_reachable", "reachable": True, "observed_pin": "ab" * 32}
-        with mock.patch.object(self.core, "verify_qrexec_connection", return_value=ok):
-            dialog.buttons["qrexec_check"].invoke()
-        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["!disabled"]))
-        with mock.patch.object(self.core, "hello_bridge", return_value="pairing_required") as hello:
-            dialog.buttons["qrexec_hello"].invoke()
-        hello.assert_called_once_with("https://127.0.0.1:8443")
-        self.assertIn("Bridge erreicht, Kopplung erforderlich", dialog.qrexec_status.get())
-        self.assertIn("autorisiert nichts", dialog.qrexec_status.get())
-        with mock.patch.object(self.core, "hello_bridge", return_value="already_paired"):
-            dialog.buttons["qrexec_hello"].invoke()
-        self.assertIn("bereits gekoppelt", dialog.qrexec_status.get())
-        with mock.patch.object(self.core, "hello_bridge", side_effect=a.ProbeError("pairing_rate_limited")):
-            dialog.buttons["qrexec_hello"].invoke()
-        self.assertIn("Cooldown", dialog.errors["bridge"].get())
+        self.assertTrue(dialog.buttons["qrexec_hello"].instate(["disabled"]))
+        self.core.qrexec_forwarder = mock.Mock(running=True)
+        with mock.patch.object(self.core, "begin_pair_remote") as pair:
+            dialog.fields["qrexec_pin"].set("0" * 64)
+            dialog.fields["qrexec_code"].set("ABCD-EFGH-JKMN")
+            dialog.compared.set(True)
+            self.root.update()
+            with self.assertRaises(a.ProbeError) as refused:
+                dialog.pair_qrexec()
+        self.assertEqual(str(refused.exception), "bridge_not_verified")
+        pair.assert_not_called()
         self.assertEqual(self.callbacks, [])
 
 

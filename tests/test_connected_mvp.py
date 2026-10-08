@@ -3345,85 +3345,162 @@ class RiskSentPreservationTests(unittest.TestCase):
 
 
 class QrexecForwarderTests(unittest.TestCase):
-    """M9: Main manages ONLY its own qvm-connect-tcp forwarder; honest phases;
-    foreign processes are never adopted or killed; no double instances."""
+    """M9 Folgefix: qvm-connect-tcp ist ein Launcher (Skript exitet, socat/Helfer der
+    eigene Gruppe behält den Port). Tests nutzen vertragsgetreue Launcher-Fakes
+    (Helfer-Dateiname enthält das Identitätsmarker 'qvm-connect-tcp') statt der
+    früheren Foreground-Annahme; fremde Listener werden nie übernommen/getötet."""
+
+    LAUNCHER = (
+        "#!/bin/bash --\n"
+        "set -e\n"
+        "LOCALPORT=\"$(echo \"$1\" | cut -d ':' -f1)\"\n"
+        "TARGET=\"$(echo \"$1\" | cut -d ':' -f2)\"\n"
+        "PORT=\"$(echo \"$1\" | cut -d ':' -f3)\"\n"
+        "DIR=\"$(dirname \"$0\")\"\n"
+        "if [ \"$TARGET\" = failqube ]; then echo \"qvm-connect-tcp: denied by policy\" >&2; exit 3; fi\n"
+        "echo \"Binding TCP '$TARGET:$PORT' to 'localhost:$LOCALPORT'...\"\n"
+        "if [ \"$TARGET\" = silentqube ]; then echo \"bind failed: Address already in use by test\" >&2; exit 0; fi\n"
+        "\"$DIR/qvm-connect-tcp-listener\" \"$LOCALPORT\" \"$TARGET\" \"$PORT\" >/dev/null 2>&1 &\n")
+    HELPER = (
+        "#!" + str(Path(sys.executable).resolve()) + "\n"
+        "import os, socket, sys, time\n"
+        "local, target, remote = sys.argv[1:4]\n"
+        "if target == 'slowqube':\n"
+        "    time.sleep(30)\n"
+        "os._exit(0)\n")
+    LISTENER = (
+        "#!" + str(Path(sys.executable).resolve()) + "\n"
+        "import os, socket, sys\n"
+        "spec = __import__('json').loads(os.environ.get('AITL_TEST_SPEC') or '{}')\n"
+        "local, target, remote = sys.argv[1:4]\n"
+        "mode = spec.get(target, 'listen')\n"
+        "srv = socket.socket()\n"
+        "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "srv.bind(('127.0.0.1', int(local)))\n"
+        "srv.listen(5)\n"
+        "import threading\n"
+        "def serve_forever():\n"
+        "    while True:\n"
+        "        conn, _ = srv.accept()\n"
+        "        if mode == 'deny':\n"
+        "            conn.close(); continue\n"
+        "        if mode == 'plain':\n"
+        "            conn.sendall(b'NOPE NOT TLS\\r\\n'); conn.close(); continue\n"
+        "        up = socket.socket(); up.settimeout(3)\n"
+        "        try:\n"
+        "            up.connect(('127.0.0.1', int(spec.get('remote', remote))))\n"
+        "        except OSError:\n"
+        "            conn.close(); continue\n"
+        "        def pump(a, b):\n"
+        "            try:\n"
+        "                while True:\n"
+        "                    data = a.recv(8192)\n"
+        "                    if not data: break\n"
+        "                    b.sendall(data)\n"
+        "            except OSError:\n"
+        "                pass\n"
+        "            for side in (a, b):\n"
+        "                try: side.close()\n"
+        "                except OSError: pass\n"
+        "        threading.Thread(target=pump, args=(conn, up), daemon=True).start()\n"
+        "        threading.Thread(target=pump, args=(up, conn), daemon=True).start()\n"
+        "serve_forever()\n")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="aitl-qrexec-")
         self.addCleanup(self.temp.cleanup)
-        binary = Path(self.temp.name, "qvm-connect-tcp")
-        binary.write_text("#!" + str(Path(sys.executable).resolve()) + "\n" + (
-            "import socket, sys, time\n"
-            "local, target, remote = sys.argv[1].split(':')\n"
-            "if target == 'failqube':\n"
-            "    sys.exit(3)\n"
-            "srv = socket.socket()\n"
-            "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-            "srv.bind(('127.0.0.1', int(local)))\n"
-            "srv.listen(5)\n"
-            "while True:\n"
-            "    time.sleep(0.5)\n"))
-        binary.chmod(0o700)
-        patcher = mock.patch.object(a.shutil, "which", return_value=str(binary))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.directory = Path(self.temp.name)
+        launcher = self.directory / "qvm-connect-tcp"
+        helper = self.directory / "qvm-connect-tcp-listener"
+        launcher.write_text(self.LAUNCHER)
+        helper.write_text(self.LISTENER)
+        launcher.chmod(0o755); helper.chmod(0o755)
+        patcher = mock.patch.object(a.shutil, "which", return_value=str(launcher))
+        patcher.start(); self.addCleanup(patcher.stop)
+        self.launcher = launcher
 
     def free_port(self):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             return probe.getsockname()[1]
 
-    def test_start_listener_status_stop(self):
+    def listener(self, port):
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            return probe.connect_ex(("127.0.0.1", port)) == 0
+
+    def test_launcher_success_running_status_stop(self):
         forwarder = a.QrexecForwarder()
         self.addCleanup(forwarder.stop)
         port = self.free_port()
-        self.assertEqual(forwarder.status(), {"forwarder_running": False, "local_listener": False,
-                                              "target": None, "port": None})
+        self.assertFalse(forwarder.running)
         forwarder.start("target-vm", port)
+        # Launcher ist evtl. schon exitet – Besitz folgt aus unserer eigenen Gruppe.
         self.assertTrue(forwarder.running)
         status = forwarder.status()
-        self.assertTrue(status["forwarder_running"])
-        self.assertTrue(status["local_listener"])  # listener present – still no policy proof
+        self.assertTrue(status["forwarder_running"] and status["local_listener"] and status["owned"])
         self.assertEqual((status["target"], status["port"]), ("target-vm", port))
+        pgid = forwarder.pgid
         forwarder.stop()
         self.assertFalse(forwarder.running)
+        self.assertFalse(self.listener(port))
 
     def test_single_instance_and_target_switch(self):
         forwarder = a.QrexecForwarder()
         self.addCleanup(forwarder.stop)
         port = self.free_port()
         forwarder.start("target-vm", port)
-        first = forwarder.process
-        forwarder.start("target-vm", port)  # identical request: no duplicate process
-        self.assertIs(forwarder.process, first)
-        second_port = self.free_port()
-        forwarder.start("other-vm", second_port)
-        self.assertIsNot(forwarder.process, first)
+        first_pgid = forwarder.pgid
+        forwarder.start("target-vm", port)
+        self.assertEqual(forwarder.pgid, first_pgid)  # identical request: same group, no duplicate
+        second = self.free_port()
+        forwarder.start("other-vm", second)
+        self.assertNotEqual(forwarder.pgid, first_pgid)
         self.assertEqual(forwarder.status()["target"], "other-vm")
-        self.assertIsNotNone(first.poll())  # the old OWN process was shut down cleanly
 
-    def test_immediate_exit_is_reported_honestly(self):
+    def test_evidenced_script_failure_carries_exit_and_stderr(self):
         forwarder = a.QrexecForwarder()
         self.addCleanup(forwarder.stop)
         with self.assertRaisesRegex(a.ProbeError, "qrexec_forwarder_failed"):
             forwarder.start("failqube", self.free_port())
         self.assertFalse(forwarder.running)
+        result = forwarder.last_result
+        self.assertEqual(result["exit"], 3)
+        self.assertIn("denied by policy", result["detail"])  # bounded sanitized tail
 
-    def test_foreign_listener_is_never_adopted_or_killed(self):
+    def test_exit_zero_without_listener_is_evidenced_not_success(self):
         forwarder = a.QrexecForwarder()
         self.addCleanup(forwarder.stop)
+        with self.assertRaisesRegex(a.ProbeError, "qrexec_launch_no_listener"):
+            forwarder.start("silentqube", self.free_port())
+        self.assertFalse(forwarder.running)
+        self.assertIn("Address already in use by test", forwarder.last_result["detail"])
+
+    def test_foreign_listener_is_never_adopted_or_killed(self):
         foreign = socket.socket()
         foreign.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         foreign.bind(("127.0.0.1", 0))
         foreign.listen(1)
         self.addCleanup(foreign.close)
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
         port = foreign.getsockname()[1]
         with self.assertRaisesRegex(a.ProbeError, "qrexec_port_conflict"):
             forwarder.start("target-vm", port)
         self.assertFalse(forwarder.running)
-        with socket.socket() as probe:
-            probe.settimeout(1)
-            self.assertEqual(probe.connect_ex(("127.0.0.1", port)), 0)  # foreign listener untouched
+        self.assertEqual(self.listener(port), True)  # foreign untouched
+
+    def test_identity_guard_never_signals_foreign_group(self):
+        # Simulate PID/PGID reuse: recorded group belongs to an unrelated process.
+        dummy = subprocess.Popen(["sleep", "30"], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: dummy.poll() is None and dummy.kill())
+        forwarder = a.QrexecForwarder()
+        forwarder.pgid = os.getpgid(dummy.pid)
+        forwarder.port = self.free_port()
+        self.assertFalse(forwarder.owned())
+        forwarder.stop()
+        self.assertIsNone(dummy.poll())  # foreign process still alive, never signalled
 
     def test_missing_tool_and_invalid_names(self):
         forwarder = a.QrexecForwarder()
@@ -3764,9 +3841,20 @@ class QrexecBridgeFirstTests(unittest.TestCase):
     failures stay separate from possible causes; pairing stays the last step and
     the 2-minute code limit only allows explicit local regeneration."""
 
-    FAKE_FORWARDER = (
-        "import socket, sys, threading\n"
-        "local, target, remote = sys.argv[1].split(':')\n"
+    LAUNCHER = (
+        "#!/bin/bash --\n"
+        "set -e\n"
+        "LOCALPORT=\"$(echo \"$1\" | cut -d ':' -f1)\"\n"
+        "TARGET=\"$(echo \"$1\" | cut -d ':' -f2)\"\n"
+        "PORT=\"$(echo \"$1\" | cut -d ':' -f3)\"\n"
+        "echo \"Binding TCP '$TARGET:$PORT' to 'localhost:$LOCALPORT'...\"\n"
+        "\"$(dirname \"$0\")/qvm-connect-tcp-forwarder\" \"$LOCALPORT\" \"$TARGET\" \"$PORT\" "
+        ">/dev/null 2>&1 &\n")
+    PROXY = (
+        "#!" + str(Path(sys.executable).resolve()) + "\n"
+        "import os, socket, sys, threading\n"
+        "local, target, remote = sys.argv[1:4]\n"
+        "up_port = int(os.environ.get('AITL_TEST_REMOTE_PORT') or remote)\n"
         "srv = socket.socket()\n"
         "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
         "srv.bind(('127.0.0.1', int(local)))\n"
@@ -3795,7 +3883,6 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         "        conn.sendall(b'NOPE NOT TLS\\r\\n')\n"
         "        conn.close()\n"
         "        continue\n"
-        "    up_port = int(__import__('os').environ.get('AITL_TEST_REMOTE_PORT') or remote)\n"
         "    upstream = socket.socket()\n"
         "    upstream.settimeout(3)\n"
         "    try:\n"
@@ -3805,14 +3892,15 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         "        continue\n"
         "    threading.Thread(target=pump, args=(conn, upstream), daemon=True).start()\n"
         "    threading.Thread(target=pump, args=(upstream, conn), daemon=True).start()\n")
-
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="aitl-bridgefirst-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         binary = self.base / "qvm-connect-tcp"
-        binary.write_text("#!" + str(Path(sys.executable).resolve()) + "\n" + self.FAKE_FORWARDER)
-        binary.chmod(0o700)
+        proxy = self.base / "qvm-connect-tcp-forwarder"
+        binary.write_text(self.LAUNCHER)
+        proxy.write_text(self.PROXY)
+        binary.chmod(0o755); proxy.chmod(0o755)
         patcher = mock.patch.object(a.shutil, "which", return_value=str(binary))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -3846,11 +3934,12 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         self.assertEqual(result["observed_pin"], self.bridge.pin)  # independent comparison source
         self.assertEqual(core.qrexec, {"target": "fwdqube", "port": port})
         self.assertEqual(core.connection_store.load_connection()["qrexec"], {"target": "fwdqube", "port": port})
-        first_pid = core.qrexec_forwarder.process.pid
+        first_pgid = core.qrexec_forwarder.pgid
+        self.assertTrue(core.qrexec_forwarder.running)  # launcher exitete, unsere Gruppe besitzt
         with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
             again = core.verify_qrexec_connection("fwdqube", port)  # "Erneut prüfen": idempotent
         self.assertTrue(again["reachable"])
-        self.assertEqual(core.qrexec_forwarder.process.pid, first_pid)  # no double forwarder
+        self.assertEqual(core.qrexec_forwarder.pgid, first_pgid)  # no double forwarder group
 
     def test_deny_down_plain_are_evidenced_separately_not_blanket_policy(self):
         text = a.ConnectionDialog.error_text
