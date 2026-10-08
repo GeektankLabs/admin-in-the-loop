@@ -192,7 +192,13 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(a.BridgeError):
             self.store.confirm(claim["token"])
         code = self.store.open_pair()
-        self.now += 121
+        # Pairing-code window is 600s (Journal100); the separate PAIR_PENDING token
+        # lifetime above stays 120s. Boundary: still claimable mid-window, rejected
+        # past 600s.
+        self.now += 599
+        with self.assertRaises(a.BridgeError):
+            self.store.claim({"code": "9999-9999-9999", "request_id": uuid.uuid4().hex})
+        self.now += 3  # 602s elapsed total for this window
         with self.assertRaises(a.BridgeError):
             self.store.claim({"code": code, "request_id": uuid.uuid4().hex})
 
@@ -3677,7 +3683,7 @@ class BridgeStandaloneSetupTests(unittest.TestCase):
                     code_line = line
                     break
             self.assertIsNotNone(code_line)
-            self.assertIn("(2 minutes)", code_line)  # limits unchanged, never extended
+            self.assertIn("(10 minutes)", code_line)  # window per Journal100; attempt limits unchanged
             hint = self.read_line(paired_process, 4)
             self.assertIn("--pair", hint or "")  # explicit regeneration guidance only
             url = "https://127.0.0.1:%d" % info2["port"]
@@ -3722,11 +3728,21 @@ class PairingHelloContractTests(unittest.TestCase):
             state2, code2 = store.hello_pair()
             self.assertEqual((state2, code2), ("pairing_required", None))
             self.assertEqual(store.pair["deadline"], deadline)  # neither rotated nor extended
-            store.clock = lambda: time.time() + 121  # window expired; claim path limits untouched
+            # Journal100 window: still valid between 2 and 10 minutes...
+            store.clock = lambda: time.time() + 300
             state3, code3 = store.hello_pair()
-            self.assertEqual(state3, "pairing_required")
-            self.assertIsNotNone(code3)
-            self.assertNotEqual(code3, code)
+            self.assertEqual((state3, code3), ("pairing_required", None))  # dedup, no rotation
+            self.assertEqual(store.pair["deadline"], deadline)  # code valid until 600s elapsed
+            # Mid-window a fresh claim would still succeed; it is not consumed here,
+            # because claiming would end the window (single use) and test nothing new.
+            # ...expired exactly past the 10-minute boundary, with conscious regeneration.
+            store.clock = lambda: time.time() + 601
+            with self.assertRaises(a.BridgeError):
+                store.claim({"code": code, "request_id": uuid.uuid4().hex})
+            state4, code4 = store.hello_pair()
+            self.assertEqual(state4, "pairing_required")
+            self.assertIsNotNone(code4)
+            self.assertNotEqual(code4, code)
             self.assertGreater(store.pair["deadline"], deadline)
 
     def test_hello_contract_strict_and_secret_free(self):
@@ -3989,10 +4005,10 @@ class QrexecBridgeFirstTests(unittest.TestCase):
             store = a.BridgeStore(Path(directory), uuid.uuid4().hex)
             self.addCleanup(store.close)
             code = store.open_pair()
-            store.clock = lambda: time.time() + 121  # 2-minute window elapsed
+            store.clock = lambda: time.time() + 601  # 10-minute window elapsed
             with self.assertRaises(a.BridgeError):
                 store.claim({"code": code, "request_id": uuid.uuid4().hex})
-            # Explicit local regeneration is allowed; limits stay 2 minutes/5 failures.
+            # Explicit local regeneration is allowed; limits stay 10 minutes/5 failures.
             fresh = store.open_pair()
             store.clock = time.time
             claim = store.claim({"code": fresh, "request_id": uuid.uuid4().hex})

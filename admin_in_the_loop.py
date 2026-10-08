@@ -5608,7 +5608,7 @@ class ConnectionDialog:
                 (5, "remote_bind", "Bind-IP (Remote)", "0.0.0.0")):
             self.entry(self.remote_setup, row, key, title, value)
         self.label(self.remote_setup, 6, "TLS-Name und Port folgen der HTTPS-Adresse. Der Gateway-Start kann mit --pair ein "
-                   "zweiminütiges Pairing-Fenster öffnen; sonst erscheint der Code erst nach ausdrücklichem Hallo. Controller "
+                   "zehnminütiges Pairing-Fenster öffnen; sonst erscheint der Code erst nach ausdrücklichem Hallo. Controller "
                    "→ Gateway auf diesem Port erlauben; kein eingehender Controller-Port.")
         self.remote_command_box = ScrollableText(self.remote_setup, readonly=True, height=4)
         self.remote_command_box.frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=6)
@@ -5617,7 +5617,7 @@ class ConnectionDialog:
         self.label(self.remote_pair, 0, "„Verbindung prüfen & Code anfordern“ belegt die echte Erreichbarkeit des "
                    "Gateways (TLS plus erwartete Verweigerung des authentifizierten Endpunkts) und fordert danach "
                    "den Kopplungscode auf der Gateway-Bridge an (Hallo). Der Code erscheint nur auf der "
-                   "Gateway-Konsole (zwei Minuten, einmalig); Erreichbarkeit allein ist keine Kopplung.")
+                   "Gateway-Konsole (zehn Minuten, einmalig); Erreichbarkeit allein ist keine Kopplung.")
         self.button(self.remote_pair, 1, "remote_check", "Verbindung prüfen & Code anfordern", "bridge",
                     self.verify_remote)
         self.remote_status = self.tk.StringVar(master=self.window, value="Noch nicht geprüft.")
@@ -5703,7 +5703,7 @@ class ConnectionDialog:
         self.q3_diag_box.frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=4)
         self.q3_diag_box.frame.grid_remove()
         self.label(self.q4, 0, "Bewusst koppeln – Verbindung geprüft und Code mit demselben Klick angefordert. Der "
-                   "Code erscheint NUR auf der Bridge-Konsole im Ziel-Qube (zwei Minuten, einmalig, max. fünf "
+                   "Code erscheint NUR auf der Bridge-Konsole im Ziel-Qube (zehn Minuten, einmalig, max. fünf "
                    "Fehlversuche); dort ablesen und hier eingeben – der Code ist das einzige Pflichtfeld.")
         self.label(self.q4, 1, "Zertifikat-Fingerprint (SPKI SHA-256, nicht editierbar, markierbar): vor dem "
                    "Koppeln VOLLSTÄNDIG mit der SPKI-Zeile der Bridge-Konsole im Ziel-Qube vergleichen. "
@@ -5917,7 +5917,7 @@ class ConnectionDialog:
             "invalid_qube_name": "Qube-Name: Buchstaben/Ziffern/._-, maximal 63 Zeichen, ohne Leerzeichen.",
             "invalid_port": "Port 1–65535 eingeben.",
             "state_dir_required": "State-Verzeichnis darf nicht leer sein.",
-            "network_http_403": "Kopplung nicht möglich. Code und Gateway-Fenster prüfen (zwei Minuten, maximal fünf Fehlversuche).",
+            "network_http_403": "Kopplung nicht möglich. Code und Gateway-Fenster prüfen (zehn Minuten, maximal fünf Fehlversuche).",
             "network_http_401": "Bridge-Zugang nicht bestätigt oder widerrufen; gespeicherte Verbindung prüfen bzw. neu koppeln.",
             "network_unavailable": "Gateway/Bridge nicht erreichbar. Adresse, Port und Netzwerk prüfen. Falls bereits gespeichert: gespeicherte Verbindung öffnen.",
             "bridge_start_failed": "Lokale Bridge konnte nicht starten. Netzwerk, Laufzeit und verwendetes Python prüfen.",
@@ -6322,7 +6322,7 @@ class ConnectionDialog:
             self.refresh_qubes_diagnostics()
             return
         self.qrexec_status.set("Code-Anforderung bestätigt: Kopplungscode jetzt auf der Bridge-Konsole im "
-                               "Ziel-Qube ablesen (zwei Minuten, einmalig); den angezeigten Fingerprint dort "
+                               "Ziel-Qube ablesen (zehn Minuten, einmalig); den angezeigten Fingerprint dort "
                                "vollständig vergleichen. Die Kopplungsseite ist der nächste Schritt.")
         self.wizard_goto(3)
 
@@ -6370,7 +6370,7 @@ class ConnectionDialog:
         require(self.qrexec_verified and self.qrexec_observed_pin, "bridge_not_verified")
         state = self.core.hello_bridge("https://127.0.0.1:%d" % self.qrexec_port())
         self.qrexec_status.set("Code-Anforderung erneuert: aktuellen Code auf der Bridge-Konsole im "
-                               "Ziel-Qube ablesen (zwei Minuten, einmalig)." if state == "pairing_required"
+                               "Ziel-Qube ablesen (zehn Minuten, einmalig)." if state == "pairing_required"
                                else "Diese Bridge ist bereits gekoppelt – kein neuer Code nötig.")
         self.refresh_qubes_diagnostics()
 
@@ -8200,6 +8200,10 @@ BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
 BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.0"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+# M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
+# attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime
+# are untouched by this window.
+BRIDGE_PAIR_WINDOW = 600
 BRIDGE_CHAT_ALPHABET = "23456789ACFHJKMNPQRTVWXY"
 BRIDGE_CHAT_LIFETIME = 24 * 3600
 BRIDGE_CHAT_BACKOFF = (1, 2, 4, 8, 16, 32, 60, 60)
@@ -8781,7 +8785,7 @@ class BridgeStore:
     def open_pair(self):
         code = "".join(secrets.choice(BRIDGE_BASE32) for _ in range(12))
         self.pair = {"hash": hashlib.sha256(code.encode()).digest(),
-                     "deadline": self.clock() + 120, "failures": 0}
+                     "deadline": self.clock() + BRIDGE_PAIR_WINDOW, "failures": 0}
         return "-".join(code[i:i + 4] for i in range(0, 12, 4))
 
     def claim(self, value):
@@ -9782,7 +9786,7 @@ class BridgeService:
         check(type(value["version"]) is int and value["version"] == 1)
         state, code = self.store.hello_pair()
         if code is not None:
-            print("PAIR CODE (2 minutes): " + code, flush=True)
+            print("PAIR CODE (%d minutes): " % (BRIDGE_PAIR_WINDOW // 60) + code, flush=True)
             print("Bewusste Neuerzeugung bei Ablauf: erneutes Hallo oder --pair-Neustart.", flush=True)
         return self.json({"version": 1, "state": state})
 
@@ -10286,7 +10290,8 @@ def bridge_serve(store, bind="127.0.0.1", port=0, names=(), ready_fd=None, boots
             if pin:
                 print("SPKI SHA-256: " + pin, flush=True)
             if pair:
-                print("PAIR CODE (2 minutes): " + store.open_pair(), flush=True)
+                print("PAIR CODE (%d minutes): " % (BRIDGE_PAIR_WINDOW // 60)
+                      + store.open_pair(), flush=True)
                 # M9 Folgeanpassung: Limits bleiben 2 Minuten/max. fünf Fehlversuche; eine lange
                 # Einrichtung endet mit bewusster lokaler Neuerzeugung, nie mit Verlängerung.
                 print("Bewusste Neuerzeugung bei Ablauf: die Bridge mit --pair neu starten.", flush=True)
