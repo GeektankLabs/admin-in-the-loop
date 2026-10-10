@@ -1,8 +1,30 @@
-# Neustart-Handoff Admin-in-the-Loop — 2026-10-10T08:38:55Z (vervollständigt 08:51:56Z)
+# Neustart-Handoff Admin-in-the-Loop — 2026-10-10T08:38:55Z (vervollständigt 08:51:56Z; Nachtrag Worktier-Sicherung 11:05Z)
 
 Zweck: dauerhafter Wiedereinstieg nach Nutzer-VM-Neustart. Nur Dokumentation/Sicherung;
 keine Produktarbeit, Tests, Installation, Cleanup-Fortsetzung, Push, Release, Neustart,
 keine neuen Worker, Monitor nicht verändert.
+
+## 0. Worktree-Abbau-Nachtrag (2026-10-10 ~11:05Z, maßgeblich)
+- Nutzer kündigt an: beim AITL-Neustart werden Worktrees automatisch abgebaut
+  (betrifft `.worktrees/i18n` samt `.git/worktrees/i18n`-Metadaten; HostRepoRoot
+  und GitCommonDir `HostRepoRoot/.git` bleiben bestehen). Die tatsächliche
+  Cleanup-Regel ist aus der VM nicht lesbar → Refs/Rootdateien als überlebens-
+  fähig annehmen, aber NICHT als bewiesen behandeln.
+- Englisch-Commits sind bereits auf echter lokaler Branchref
+  `refs/heads/task/i18n-english-qubes-first` = `d6b884394af35f23c424cbd1cf03716b2a661691`
+  im GitCommonDir (kein Worktree nötig; Nutzerwunsch „echter lokaler Branch“
+  damit erfüllt, belegt via for-each-ref und Bundle-Fetch).
+- Worktree-unabhängige Sicherung: `planning/restart-saves/2026-10-10-0833/`
+  mit `aitl-restart-bundle-20261010.bundle` (git bundle verify OK, 10 Refs,
+  vollständige Historie), `management-before-save.tar.gz` (37 Docs),
+  `untracked-extra-20261010.tar.gz` (5 MCP-Binding-Dateien), Manifest mit
+  SHA-256, Restore-Befehlen und Exclusions: `MANIFEST.md`.
+- Restrisiko/Lücke: falls der Cleanup mehr als den Worktreeverzeichnisinhalt
+  entfernt (z. B. Refs oder Rootdateien), ist das hier gesicherte
+  `planning/restart-saves/2026-10-10-0833/` die einzige Quelle; außerhalb des
+  Projektroots existiert keine Kopie. Persistenz jenseits des Projektroots ist
+  explizit NICHT belegt.
+
 
 ## 1. Git-Inventar (frisch 08:33:30Z, read-only)
 - Repo: `/Users/admin/Documents/github/admin-in-the-loop`, Branch `main` =
