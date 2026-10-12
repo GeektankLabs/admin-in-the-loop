@@ -8032,7 +8032,9 @@ class ReviewUI:
             message += " | Übertragung des vorherigen Befehls ungewiss"
         if bridge.certificate_warning:
             message += " | Bridge-Zertifikat läuft in weniger als 30 Tagen ab"
-        self.review_status.set(message)
+        pause_status = ("Pausiert · Neue Freigaben gesperrt\nBereits laufende Commands laufen weiter"
+                        if snapshot.paused else "Aktiv · Freigaben nicht pausiert")
+        self.review_status.set(pause_status + ("\n" + message if message else ""))
         self._render_command_risk(snapshot, command)
         self._render_payload_details(snapshot)
         self.last_snapshot = snapshot
