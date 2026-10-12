@@ -2,8 +2,8 @@
 
 Stand: 30. September 2026.
 
-Das Archiv enthält zusätzlich `skills/admin-in-the-loop-orchestrator/SKILL.md`.
-Diese Fassung wurde für die Übergabe anhand der MCP-Schnittstelle in `aitl_bridge.py`
+Das Archiv enthielt zusätzlich `skills/admin-in-the-loop-orchestrator/SKILL.md` (historischer Pfad; heute `skill/SKILL.md`).
+Diese Fassung wurde für die Übergabe anhand der MCP-Schnittstelle im damaligen `aitl_bridge.py` (Bridge-Funktionalität heute in `admin_in_the_loop.py` konsolidiert)
 und der aktuellen MVP-0.8-Anleitung neu erstellt. Die zuvor als erstellt/validiert
 beschriebene Originaldatei wurde nicht wiedergefunden; diese Beilage ist daher keine
 nachgewiesene Kopie davon.

@@ -1,5 +1,5 @@
 """Tk/xterm smoke test under a virtual display; no external Python test library.
-Run: xvfb-run -a python3 tests/gui_smoke_test.py
+Run from repo root: xvfb-run -a -s '-screen 0 1920x1080x24' python3 tests/gui_smoke_test.py
 This is not a macOS or manual desktop acceptance test.
 """
 import os
