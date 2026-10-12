@@ -7933,10 +7933,10 @@ class ReviewUI:
 
     def render(self):
         snapshot = self.core.snapshot()
-        self.terminal_status.set({"CONNECTED": "Terminal verbunden\nBash · lokale Sitzung",
+        self.terminal_status.set({"CONNECTED": "Terminal verbunden\nBash · lokale Sitzung\nApp schließen beendet diese Shell nicht",
                                   "WAITING_FOR_TERMINAL": "Nicht verbunden\nTerminal kann geöffnet werden",
                                   "STARTING_SHELL": "Terminal verbindet\nShell startet",
-                                  "DISCONNECTED": "Terminal getrennt\nErneutes Öffnen möglich"}[snapshot.connection])
+                                  "DISCONNECTED": "Terminal getrennt\nUrsache: Shell beendet oder Verbindung verloren\nErneutes Öffnen möglich"}[snapshot.connection])
         connected = snapshot.connection == "CONNECTED"
         if connected:
             self.terminal_button.grid_remove()

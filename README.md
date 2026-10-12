@@ -60,6 +60,29 @@ Der bewusst geteilte Chat-Code ist eine Bearer-Bindung, keine vom Provider
 kryptografisch bestätigte Chat-ID. Details und Remote-TLS-/Pinning-Verhalten
 stehen im [Sicherheitsmodell der Betriebsanleitung](tests/Local_Integration_README.md#sicherheitsmodell-und-präzisierte-grenzen).
 
+## Terminal-Lebenszyklus: Detach gegenüber Ende
+
+Das Controllerfenster und das Terminalfenster sind getrennte Systeme. Der Status
+im Controller kann die konkrete Ursache eines Endes nicht immer unterscheiden.
+
+- **Controllerfenster schließen (Detach):** Der Controller meldet dem Helfer ein
+  sauberes Detach und beendet nur die Output-Erfassung. Die Shell im
+  Terminalfenster und laufende Commands laufen weiter; das Fenster bleibt voll
+  manuell bedienbar und wird nie wieder erfasst. Ein erneutes „Terminal öffnen“
+  startet ein neues Terminal samt Helfer.
+- **Terminalfenster schließen:** Der Helfer erhält SIGHUP und beendet sich; beim
+  Aufräumen versucht er, die Shell und die aktuelle Vordergrund-Prozessgruppe
+  gestaffelt zu beenden (SIGHUP, dann SIGTERM, dann SIGKILL). Prozesse, die sich
+  selbst abgekoppelt haben (z. B. per nohup/setsid/disown), werden von diesen
+  Signalen nicht erfasst; ob sie weiterlaufen, hängt von ihrer eigenen Abkopplung
+  ab.
+- **Shell-Ende (`exit`, EOF):** Der Helfer meldet dem Controller das Ende und
+  beendet sich.
+
+Nach einem Ende (Detach oder Shell-/Terminal-Ende) zeigt der Status „Terminal
+getrennt“; er behauptet keine bestimmte Ursache, weil der Controller sie nicht
+sicher kennt.
+
 ## Voraussetzungen
 
 | Bereich | Voraussetzungen |
