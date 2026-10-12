@@ -79,9 +79,10 @@ im Controller kann die konkrete Ursache eines Endes nicht immer unterscheiden.
 - **Shell-Ende (`exit`, EOF):** Der Helfer meldet dem Controller das Ende und
   beendet sich.
 
-Nach einem Ende (Detach oder Shell-/Terminal-Ende) zeigt der Status „Terminal
-getrennt“; er behauptet keine bestimmte Ursache, weil der Controller sie nicht
-sicher kennt.
+Bleibt das Controllerfenster offen, zeigt der Status nach Shell-Ende oder
+Verbindungsverlust „Terminal getrennt“; er behauptet keine bestimmte Ursache, weil
+der Controller sie nicht sicher kennt. Beim Schließen des Controllerfensters
+(Detach) endet die Anwendung selbst – es bleibt kein Controller-Status sichtbar.
 
 ## Voraussetzungen
 
