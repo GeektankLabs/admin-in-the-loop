@@ -123,6 +123,20 @@ class ConnectionUXTests(unittest.TestCase):
         self.dialog.render_connection_layers(self.core.bridge_snapshot())
         self.assertNotIn("Code bereit", self.dialog.layer_labels["Chat"].cget("text"))
 
+    def test_retry_button_keeps_repeated_failure_visible_in_dialog_and_sidebar(self):
+        profile = a.ConnectionProfile("https://127.0.0.1:8443", "a"*64, "b"*32, "c"*32, "d"*64)
+        self.core.connection_store.save_connection(profile)
+        self.dialog.window.destroy()
+        self.dialog = self.ui.connection_settings()
+        with mock.patch.object(self.core, "connect_profile", side_effect=a.ProbeError("network_unavailable")):
+            for attempt in (1, 2):
+                self.dialog.buttons["recovery_retry"].invoke()
+                self.root.update()
+                self.assertTrue(self.dialog.recovery_panel.winfo_ismapped())
+                self.assertIn("Versuch %d: fehlgeschlagen" % attempt, self.dialog.recovery_notice.get())
+                self.assertIn("Gateway/Bridge nicht erreichbar", self.dialog.recovery_notice.get())
+                self.assertIn("Versuch %d: fehlgeschlagen" % attempt, self.ui.ai_status.get())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

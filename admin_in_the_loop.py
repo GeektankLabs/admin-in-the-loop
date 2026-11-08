@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.23"
+APP_VERSION = "0.9.24"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.23"
+APP_VERSION = "0.9.24"
 
 
 def _load_bridge_component(namespace=None):
@@ -4400,6 +4400,7 @@ class AppCore:
         self.recovery_preparation = None
         self.recovery_profile = None
         self.recovery_started = False
+        self.recovery_attempt = 0
         self.recovery_state = "IDLE"
         self.recovery_error = None
         self.recovery_chat_recipient = None
@@ -4689,8 +4690,12 @@ class AppCore:
         self.recovery_started = True
         self.recovery_error = None
         saved = self.saved_connection
-        if not saved:
+        if not saved or not (saved.get("profile") or saved.get("tunnel")):
             return
+        self.recovery_attempt += 1
+        self.recovery_state = "CONNECTING"
+        self.bridge_error = None
+        self.local_setup_error = None
         try:
             if saved.get("profile"):
                 if saved.get("qrexec"):
@@ -4771,7 +4776,9 @@ class AppCore:
         self.rotate_chat_binding()
 
     def retry_connection_recovery(self):
-        require(self.recovery_preparation is None, "setup_busy")
+        require(self.recovery_preparation is None and self.bridge_state not in {"CONNECTING", "PAIRING"}, "setup_busy")
+        require(self.saved_connection and (self.saved_connection.get("profile")
+                or self.saved_connection.get("tunnel")), "no_saved_remote_connection")
         self.disconnect_bridge()
         self.recovery_started = False
         self.begin_connection_recovery()
@@ -6166,6 +6173,19 @@ def chat_binding_can_renew(bridge):
             or binding["server_time"] + elapsed >= binding["expires_at"])
 
 
+def recovery_attempt_status(core):
+    if not core.recovery_attempt:
+        return ""
+    phases = {"PREPARING": "Weiterleitung wird vorbereitet",
+              "CONNECTING": "Bridge-Verbindung wird aufgebaut",
+              "NEEDS_ATTENTION": "fehlgeschlagen",
+              "RESTORED": "Bridge authentifiziert verbunden", "STOPPED": "beendet"}
+    phase = phases.get(core.recovery_state, "noch offen")
+    if core.recovery_state == "CONNECTING" and core.bridge_state == "RETRYING":
+        phase = "Verbindung unterbrochen; erneuter Verbindungsversuch läuft"
+    return "Wiederherstellung · Versuch %d: %s" % (core.recovery_attempt, phase)
+
+
 def local_setup_summary(core):
     stages = {"PREPARING": "Client wird gesucht…", "INSTALLING": "Offizieller Client wird installiert…",
               "STARTING": "Lokale Verbindung wird vorbereitet…", "CONNECTING": "Lokale Verbindung wird aufgebaut…",
@@ -6206,7 +6226,6 @@ class ConnectionDialog:
         self.auto_chat_key = None
         self.auto_local_key = None
         self.was_tunnel_busy = False
-        self.auto_takeover_key = None
         self.probe_suppressed = None
         self.fields, self.entries, self.buttons, self.labels = {}, {}, {}, []
         self.errors = {name: self.tk.StringVar(master=self.window) for name in ("bridge", "tunnel")}
@@ -6641,7 +6660,7 @@ class ConnectionDialog:
         self.recovery_notice = self.tk.StringVar(master=self.window)
         self.label(self.recovery_panel, 0, variable=self.recovery_notice)
         self.button(self.recovery_panel, 1, "recovery_retry", "Gespeicherte Verbindung erneut starten", "bridge",
-                    self.core.retry_connection_recovery)
+                    self.retry_recovery)
         self.button(self.recovery_panel, 2, "recovery_setup", "Einrichtung / Startanleitung öffnen", "bridge", self.open_recovery_setup)
         self.label(self.recovery_panel, 3, variable=self.errors["bridge"])
         for key in ("qrexec_check", "qrexec_pair", "pair", "save_qrexec_tunnel", "save_remote_tunnel", "local_start"):
@@ -6665,6 +6684,13 @@ class ConnectionDialog:
         mode = "QREXEC" if saved.get("qrexec") and self.qubes else "REMOTE" if saved.get("profile") else "LOCAL"
         self.location.set(mode)
         self.wizard_goto(1 if mode == "QREXEC" else 0)
+
+    def retry_recovery(self):
+        # Repaint before synchronous preparation/cleanup; a fast repeated error
+        # remains distinguishable afterwards through the attempt number.
+        self.recovery_notice.set("Gespeicherte Verbindung wird erneut gestartet …")
+        self.window.update_idletasks()
+        self.core.retry_connection_recovery()
 
     def render_connection_layers(self, bridge):
         saved = self.core.saved_connection or {}
@@ -6701,6 +6727,9 @@ class ConnectionDialog:
             notice = "Der Bridge-Standort ist gespeichert, aber noch nicht gekoppelt. Über die Startanleitung fortfahren."
         else:
             notice = "Eine lokale Einrichtung ist gespeichert. Die App kann Bridge und Tunnel mit diesen Werten erneut starten."
+        attempt_status = recovery_attempt_status(self.core)
+        if attempt_status:
+            notice = attempt_status + "\n" + notice
         error = self.core.recovery_error or bridge.last_error or self.core.local_setup_error
         if error:
             notice += "\n" + self.error_text(error)
@@ -7394,32 +7423,32 @@ class ConnectionDialog:
         Statusvalidierung). Ohne passende eigene Credentials bleibt es ein
         ehrlicher Status ohne Fortschritt – niemals ein Auth-Bypass und keine
         automatische Neukopplung."""
-        if self.core.bridge_state != "DISCONNECTED":
-            return ("Bridgeverbindung besteht bereits oder wird aufgebaut; nichts wird erneut angestoßen. "
+        if self.core.bridge_state == "CONNECTED":
+            return "Die gespeicherte Bridge ist bereits authentifiziert verbunden."
+        if (self.core.bridge_state in {"CONNECTING", "PAIRING", "RETRYING"}
+                or self.core.recovery_preparation is not None):
+            return ("Die Bridge-Verbindung wird bereits aufgebaut; Ergebnis abwarten. "
                     "Der Assistent fährt bei Erfolg automatisch fort.")
         self.refresh_saved()
         location = self.location.get()
         if location == "QREXEC":
-            matches, open_saved = self.saved_qrexec_matches(), self.open_saved_qrexec
+            matches = self.saved_qrexec_matches()
         elif location == "REMOTE":
-            matches, open_saved = self.saved_matches(), self.open_saved
+            matches = self.saved_matches()
         else:
-            matches, open_saved = False, None
+            matches = False
         if not matches:
             return ("Die Bridge meldet eine bestehende Kopplung, aber auf diesem Rechner ist keine passende "
                     "gespeicherte Controller-Verbindung. Ohne eigene Credentials wird nichts übernommen – "
                     "bewusst neu koppeln (ersetzt die aktive Freigabe) ist der einzige Weg.")
-        saved = self.core.saved_connection["profile"]
-        key = (location, saved["url"], saved.get("controller_id"))
-        if self.auto_takeover_key == key:
-            return ("Wiederherstellung wurde für diese gespeicherte Verbindung bereits angestoßen – "
-                    "Ergebnis abwarten; kein erneuter Verbindungsversuch.")
-        self.auto_takeover_key = key
+        # Active states suppress duplicate clicks. A failed asynchronous attempt
+        # must not leave a permanent per-dialog lock on this saved recipient.
         try:
-            open_saved()
+            self.core.retry_connection_recovery()
         except ProbeError as exc:
-            self.auto_takeover_key = None  # bewusster Retry über dieselbe Prüfaction bleibt möglich
             return "Wiederherstellung fehlgeschlagen: " + self.error_text(str(exc))
+        if self.core.recovery_state == "NEEDS_ATTENTION":
+            return "Wiederherstellung fehlgeschlagen: " + self.error_text(self.core.recovery_error)
         return ("Bereits gekoppelt – die gespeicherte, gepinnte Controller-Verbindung wird wiederhergestellt "
                 "und echt authentifiziert; bei Erfolg führt der Assistent automatisch weiter.")
 
@@ -9279,6 +9308,8 @@ class ReviewUI:
         self.ai_status.set(local_setup_summary(self.core) if self.core.local_setup_state != "IDLE" else
                            "Gespeicherte Bridge\nWeiterleitung wird vorbereitet" if self.core.recovery_state == "PREPARING" else
                            "Gespeicherte Bridge\nWiederherstellung prüfen" if self.core.recovery_state == "NEEDS_ATTENTION" else connection_summary(bridge))
+        if self.core.recovery_attempt and self.core.recovery_state in {"PREPARING", "CONNECTING", "NEEDS_ATTENTION"}:
+            self.ai_status.set(recovery_attempt_status(self.core))
         chat_code, chat_status, can_copy = chat_binding_presentation(bridge)
         self.chat_code.set(chat_code)
         if self.core.chat_binding_notice:
@@ -9985,7 +10016,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.23"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.24"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.24 — Wiederherstellung sichtbar erneut starten
+
+- Jeder Wiederherstellungsversuch zeigt eine neue Versuchsnummer und seinen
+  Zustand, auch wenn derselbe Fehler sofort wieder auftritt. Der Startklick
+  zeigt vor der Vorbereitung eine unmittelbare Rückmeldung.
+- „Verbindung prüfen“ darf eine passende gespeicherte Verbindung nach einem
+  fehlgeschlagenen Versuch erneut authentifiziert öffnen. `BLOCKED` wird nicht
+  mehr als laufender Verbindungsaufbau behandelt; aktive Versuche bleiben geschützt.
+- Enthält die direkte Chat-Code-Erneuerung in der AI/MCP-Leiste, die sichtbare
+  Fehleranzeige im Wiederherstellungsbereich und präzisierte Bridge-/MCP-Logs
+  aus dem vorherigen Main-Stand. UI und eingebettete Bridge melden beide 0.9.24.
+
 ## 0.9.23 — Zusätzliche Titelzeile entfernen
 
 - Die zusätzliche Überschrift „Admin in the Loop“ innerhalb des Hauptfensters

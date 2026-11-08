@@ -16,7 +16,13 @@ weitergegeben. Das Terminal bleibt unabhängig manuell bedienbar.
 
 ## Aktuelle persönliche Testversion
 
-**Aktuelle persönliche Testversion: v0.9.23 ohne zusätzliche Titelzeile innerhalb der Oberfläche.**
+**Aktuelle persönliche Testversion auf `geco91/main`: v0.9.24.**
+Wiederherstellungsversuche zeigen eine Versuchsnummer und ihren Zustand;
+„Verbindung prüfen“ kann nach einem fehlgeschlagenen Versuch erneut verbinden.
+UI und Bridge melden beide 0.9.24. Bestehende Einzeldatei-Installationen mit
+`python3 admin_in_the_loop.py update geco91` aktualisieren und die jeweilige App
+bzw. Bridge anschließend selbst neu starten. Die folgenden Downloadlinks
+verweisen weiterhin auf den getaggten Stand v0.9.23.
 Links im Terminalbereich wird die Rückgabeprüfung eingestellt, rechts im AI-Bereich
 die Befehlsprüfung. Die Mitte bleibt für Code/Ausgabe und die passenden Prüfreiter
 mit Ampel und Befundzahl frei. [Echte Beispielansichten](doc/REVIEW_LAYOUT.md).

@@ -56,6 +56,102 @@ class RecoveryTests(unittest.TestCase):
         core.chat_binding_received_at = time.monotonic()
         return store, controller
 
+    def recovery_dialog(self):
+        """Exercise existing callbacks and presentation with controlled widget boundaries."""
+        profile = a.ConnectionProfile("https://127.0.0.1:8443", "a"*64, "b"*32, "c"*32, "d"*64)
+        self.core.saved_connection = {"profile": vars(profile), "tunnel": None, "qrexec": None}
+        dialog = a.ConnectionDialog.__new__(a.ConnectionDialog)
+        dialog.core, dialog.busy = self.core, False
+        dialog.window, dialog.ui, dialog.ttk = mock.Mock(), mock.Mock(), mock.Mock()
+        dialog.pairing = lambda: False
+        dialog.errors = {"bridge": mock.Mock()}
+        dialog.location = mock.Mock(get=mock.Mock(return_value="REMOTE"))
+        dialog.connection_path, dialog.recovery_notice = mock.Mock(), mock.Mock()
+        dialog.recovery_panel, dialog.recovery_overview = mock.Mock(), True
+        dialog.layer_labels = {}
+        dialog.saved_qrexec_matches = lambda: False
+        dialog.saved_matches = lambda: True
+        dialog.refresh_saved = mock.Mock()
+        dialog.buttons = {key: mock.Mock() for key in ("qrexec_stop", "qrexec_saved_connect",
+                          "saved_connect", "tunnel_cancel_remote", "tunnel_cancel_qrexec")}
+        dialog.render = lambda: dialog.render_connection_layers(self.core.bridge_snapshot())
+        return dialog
+
+    def test_retry_button_repaints_and_distinguishes_identical_immediate_failures(self):
+        dialog = self.recovery_dialog()
+        self.core.recovery_state, self.core.recovery_error = "NEEDS_ATTENTION", "network_unavailable"
+        dialog.button(dialog.recovery_panel, 1, "recovery_retry", "Retry", "bridge", dialog.retry_recovery)
+        callback = dialog.ttk.Button.call_args.kwargs["command"]
+        def fail(_profile):
+            self.assertIn("wird erneut gestartet", dialog.recovery_notice.set.call_args.args[0])
+            dialog.window.update_idletasks.assert_called()
+            self.assertIsNone(self.core.bridge_error)
+            raise a.ProbeError("network_unavailable")
+        with mock.patch.object(self.core, "connect_profile", side_effect=fail) as connect:
+            notices = []
+            for attempt in (1, 2):
+                callback()
+                notice = dialog.recovery_notice.set.call_args.args[0]
+                self.assertIn("Versuch %d: fehlgeschlagen" % attempt, notice)
+                self.assertIn("Gateway/Bridge nicht erreichbar", notice)
+                self.assertEqual(self.core.recovery_attempt, attempt)
+                notices.append(notice)
+            self.assertEqual(connect.call_count, 2)
+            self.assertNotEqual(*notices)
+        dialog.recovery_panel.grid.assert_called()
+
+    def test_retry_requires_saved_configuration_and_does_not_interrupt_connecting(self):
+        with self.assertRaisesRegex(a.ProbeError, "no_saved_remote_connection"):
+            self.core.retry_connection_recovery()
+        self.recovery_dialog()
+        self.core.bridge_state = "CONNECTING"
+        with mock.patch.object(self.core, "disconnect_bridge") as disconnect:
+            with self.assertRaisesRegex(a.ProbeError, "setup_busy"):
+                self.core.retry_connection_recovery()
+            disconnect.assert_not_called()
+        self.assertEqual(self.core.recovery_attempt, 0)
+
+    def test_already_paired_retries_blocked_and_later_disconnected_attempts(self):
+        dialog = self.recovery_dialog()
+        def start():
+            self.core.bridge_state = "CONNECTING"
+        with mock.patch.object(self.core, "retry_connection_recovery", side_effect=start) as retry:
+            for state in ("BLOCKED", "BLOCKED", "DISCONNECTED"):
+                self.core.bridge_state = state
+                self.assertIn("wiederhergestellt", dialog.auto_takeover_paired())
+                self.assertEqual(self.core.bridge_state, "CONNECTING")
+                self.assertIn("bereits aufgebaut", dialog.auto_takeover_paired())
+            self.assertEqual(retry.call_count, 3)
+            self.core.bridge_state = "BLOCKED"
+            dialog.saved_matches = lambda: False
+            self.assertIn("keine passende", dialog.auto_takeover_paired())
+            self.assertEqual(retry.call_count, 3)
+
+    def test_already_paired_preserves_active_attempts_and_allows_retry_after_direct_failure(self):
+        dialog = self.recovery_dialog()
+        with mock.patch.object(self.core, "retry_connection_recovery",
+                               side_effect=a.ProbeError("network_unavailable")) as retry:
+            for state in ("CONNECTED", "CONNECTING", "PAIRING", "RETRYING"):
+                self.core.bridge_state = state
+                dialog.auto_takeover_paired()
+            self.core.bridge_state = "DISCONNECTED"
+            self.core.recovery_preparation = mock.Mock()
+            dialog.auto_takeover_paired()
+            self.core.recovery_preparation = None
+            retry.assert_not_called()
+            for _ in range(2):
+                self.assertIn("Wiederherstellung fehlgeschlagen", dialog.auto_takeover_paired())
+            self.assertEqual(retry.call_count, 2)
+
+    def test_already_paired_reports_internally_caught_failures_as_new_attempts(self):
+        dialog = self.recovery_dialog()
+        self.core.bridge_state = "BLOCKED"
+        with mock.patch.object(self.core, "connect_profile", side_effect=a.ProbeError("network_unavailable")):
+            for attempt in (1, 2):
+                self.assertIn("Wiederherstellung fehlgeschlagen", dialog.auto_takeover_paired())
+                self.assertEqual(self.core.recovery_attempt, attempt)
+                self.assertEqual(self.core.recovery_state, "NEEDS_ATTENTION")
+
     def test_expired_startup_code_rotates_once_and_is_visible_without_dialog(self):
         store, controller = self.restored_chat()
         core = self.core
@@ -229,6 +325,16 @@ class RecoveryTests(unittest.TestCase):
             until(recovered, lambda: recovered.bridge_state == "BLOCKED")
             self.assertEqual(recovered.recovery_state, "NEEDS_ATTENTION")
             self.assertEqual(recovered.bridge_profile.pin, "0"*64)
+            dialog = a.ConnectionDialog.__new__(a.ConnectionDialog)
+            dialog.core = recovered
+            dialog.location = mock.Mock(get=mock.Mock(return_value="REMOTE"))
+            dialog.fields = {"url": mock.Mock(get=mock.Mock(return_value=fixture.url))}
+            for _ in range(2):
+                worker_id = recovered.worker_id
+                self.assertIn("wiederhergestellt", dialog.auto_takeover_paired())
+                self.assertGreater(recovered.worker_id, worker_id)
+                until(recovered, lambda: recovered.bridge_state == "BLOCKED")
+                self.assertEqual(recovered.bridge_profile.pin, "0"*64)
             pair.assert_not_called()
 
     def test_saved_local_setup_reuses_values_without_requiring_form_entry(self):
