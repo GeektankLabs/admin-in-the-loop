@@ -139,6 +139,44 @@ class RecoveryTests(unittest.TestCase):
         self.core.disconnect_bridge()
         self.assertIsNone(self.core.recovery_chat_recipient)
 
+    def test_sidebar_renewal_reuses_rotation_and_blocks_repeat_click(self):
+        store, controller = self.restored_chat()
+        ui = a.ReviewUI.__new__(a.ReviewUI)
+        ui.core, ui.root = self.core, mock.Mock()
+        ui.messagebox, ui.render = mock.Mock(), mock.Mock()
+        self.assertTrue(a.chat_binding_can_renew(self.core.bridge_snapshot()))
+        ui.chat_binding_action()
+        self.assertFalse(a.chat_binding_can_renew(self.core.bridge_snapshot()))
+        ui.chat_binding_action()
+        self.core.bridge_worker.post.assert_called_once()
+        ui.messagebox.showerror.assert_called_once()
+        name, (request, generation) = self.core.bridge_worker.post.call_args.args
+        self.assertEqual(name, "rotate_chat_binding")
+        result = store.rotate_chat_binding(request, generation, controller)
+        self.core.bridge_worker.events.put((self.core.worker_id, "chat_binding", result))
+        self.core._pump_bridge()
+        ui.chat_binding_action()
+        ui.root.clipboard_append.assert_called_once_with(a.chat_binding_presentation(self.core.bridge_snapshot())[0])
+        self.core.bridge_worker.post.assert_called_once()
+
+    def test_sidebar_renewal_requires_connected_fresh_unrestricted_binding(self):
+        self.restored_chat()
+        core = self.core
+        for attr, value in (("bridge_state", "DISCONNECTED"), ("bridge_state", "CONNECTING"),
+                            ("bridge_state", "RETRYING"), ("chat_binding", None),
+                            ("chat_binding_received_at", time.monotonic() - 7),
+                            ("chat_binding_busy", True)):
+            with self.subTest(attr=attr, value=value), mock.patch.object(core, attr, value):
+                self.assertFalse(a.chat_binding_can_renew(core.bridge_snapshot()))
+        for status in ("LOCKED", "BACKOFF"):
+            with mock.patch.dict(core.chat_binding, status=status):
+                self.assertFalse(a.chat_binding_can_renew(core.bridge_snapshot()))
+        with mock.patch.dict(core.chat_binding, status="VALID", code="ABCDEFGH",
+                             expires_at=core.chat_binding["server_time"] + 1):
+            self.assertFalse(a.chat_binding_can_renew(core.bridge_snapshot()))
+            core.chat_binding_received_at = time.monotonic() - 2
+            self.assertTrue(a.chat_binding_can_renew(core.bridge_snapshot()))
+
     def test_no_saved_configuration_and_manual_connection_are_left_alone(self):
         with mock.patch.object(self.core, "connect_profile") as connect:
             self.core.begin_connection_recovery()

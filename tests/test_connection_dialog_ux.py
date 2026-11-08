@@ -88,6 +88,16 @@ class ConnectionUXTests(unittest.TestCase):
             self.root.update()
             self.assertTrue(dialog.recovery_panel.winfo_ismapped())
             self.assertIn("bereits eingerichtet", dialog.recovery_notice.get())
+            with mock.patch.object(dialog.core, "retry_connection_recovery",
+                                   side_effect=a.ProbeError("setup_busy")):
+                dialog.run("bridge", dialog.core.retry_connection_recovery)
+            self.root.update()
+            error_labels = [widget for widget in dialog.recovery_panel.winfo_children()
+                            if "textvariable" in widget.keys()
+                            and str(widget.cget("textvariable")) == str(dialog.errors["bridge"])]
+            self.assertTrue(error_labels)
+            self.assertTrue(error_labels[0].winfo_ismapped())
+            self.assertIn("Einrichtung läuft", dialog.errors["bridge"].get())
             dialog.buttons["recovery_setup"].invoke()
             self.assertEqual(dialog.fields["qrexec_target"].get(), "ai-bridge")
             self.assertEqual(dialog.wizard_index, 1)

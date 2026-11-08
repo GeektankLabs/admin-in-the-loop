@@ -6140,7 +6140,7 @@ def chat_binding_presentation(bridge):
         return "", "Chat-Code-Status wird erneut geprüft", False
     now = binding["server_time"] + elapsed
     if now >= binding["expires_at"] or binding["status"] == "EXPIRED":
-        return "", "Abgelaufen · im Verbindungsdialog neuen Code erzeugen", False
+        return "", "Abgelaufen · Chat-Code erneuern", False
     code = binding["code"]
     visible_code = code[:4] + "-" + code[4:] if type(code) is str else ""
     if binding["status"] == "LOCKED":
@@ -6151,6 +6151,19 @@ def chat_binding_presentation(bridge):
         seconds = max(1, int(binding["retry_at"] - now + .999))
         return visible_code, "Wartezeit nach Fehlversuchen · noch %ds" % seconds, False
     return visible_code, "", True
+
+
+def chat_binding_can_renew(bridge):
+    """Require fresh binding metadata; a hidden/stale code is not an expired code."""
+    if (bridge.state != "CONNECTED" or bridge.chat_binding_busy
+            or bridge.chat_binding is None or bridge.chat_binding_received_at is None):
+        return False
+    elapsed = max(0.0, time.monotonic() - bridge.chat_binding_received_at)
+    if elapsed > 6 or bridge.chat_binding["status"] in {"LOCKED", "BACKOFF"}:
+        return False
+    binding = bridge.chat_binding
+    return (binding["status"] == "EXPIRED" or not binding["code"]
+            or binding["server_time"] + elapsed >= binding["expires_at"])
 
 
 def local_setup_summary(core):
@@ -6630,6 +6643,7 @@ class ConnectionDialog:
         self.button(self.recovery_panel, 1, "recovery_retry", "Gespeicherte Verbindung erneut starten", "bridge",
                     self.core.retry_connection_recovery)
         self.button(self.recovery_panel, 2, "recovery_setup", "Einrichtung / Startanleitung öffnen", "bridge", self.open_recovery_setup)
+        self.label(self.recovery_panel, 3, variable=self.errors["bridge"])
         for key in ("qrexec_check", "qrexec_pair", "pair", "save_qrexec_tunnel", "save_remote_tunnel", "local_start"):
             if key in self.buttons:
                 self.buttons[key].configure(style="Connection.Primary.TButton")
@@ -8151,7 +8165,7 @@ class ReviewUI:
         self.chat_code_status_label = ttk.Label(right_space, textvariable=self.chat_code_status,
                                                anchor="center", justify="center", wraplength=230)
         self.chat_code_status_label.pack(fill="x", pady=(0, 4))
-        self.chat_code_copy = ttk.Button(right_space, text="Chat-Code kopieren", command=self.copy_chat_binding)
+        self.chat_code_copy = ttk.Button(right_space, text="Chat-Code kopieren", command=self.chat_binding_action)
         self.chat_code_copy.pack(fill="x")
         self.readiness = tk.Label(right, text="", wraplength=170, justify="center", padx=8, pady=10)
         self.readiness.grid(row=2, column=0, sticky="ew", pady=(12, 4))
@@ -8279,6 +8293,14 @@ class ReviewUI:
         require(can_copy and bool(code), "chat_binding_unavailable")
         self.root.clipboard_clear()
         self.root.clipboard_append(code)
+
+    def chat_binding_action(self):
+        def perform():
+            if chat_binding_can_renew(self.core.bridge_snapshot()):
+                self.core.rotate_chat_binding()
+            else:
+                self.copy_chat_binding()
+        self.action(perform)
 
     def show_chat_binding(self):
         dialog = self.connection_settings()
@@ -9268,7 +9290,10 @@ class ReviewUI:
             self.chat_code_status_label.pack(fill="x", pady=(0, 4), before=self.chat_code_copy)
         else:
             self.chat_code_status_label.pack_forget()
-        self.chat_code_copy.configure(state="normal" if can_copy else "disabled")
+        can_renew = chat_binding_can_renew(bridge)
+        self.chat_code_copy.configure(text="Wird erneuert …" if bridge.state == "CONNECTED" and bridge.chat_binding_busy
+                                      else "Chat-Code erneuern" if can_renew else "Chat-Code kopieren",
+                                      state="normal" if can_copy or can_renew else "disabled")
         can_select_output = connected or snapshot.output_mode == "CLIPBOARD"
         self.from_terminal_button.configure(state="normal" if can_select_output and not busy else "disabled")
         # #35: a deliberately requested takeover must open the directional dialog instead of
@@ -11512,7 +11537,7 @@ class BridgeTunnel:
         elif phase in {"error", "configured"}:
             self.step = ""
         if changed:
-            bridge_console("Tunnel-Status: %s%s" % (phase, (" (%s)" % detail.split(":", 1)[0]) if detail else ""))
+            bridge_console("Bridge -> Tunnel-Client: Status %s%s" % (phase, (" (%s)" % detail.split(":", 1)[0]) if detail else ""))
 
     def _step(self, step, cancel=None):
         if cancel is not None and cancel.is_set():
@@ -11760,7 +11785,7 @@ class BridgeTunnel:
         self.deadline = self.now() + self.START_DEADLINE
         self.checked_at = 0.0
         self._transition("starting")
-        bridge_console("Tunnel-Client gestartet (pid %s, MCP %s)" % (self.process.pid, self.mcp_url))
+        bridge_console("Bridge -> Tunnel-Client: gestartet (pid %s); lokales Weiterleitungsziel zur AI/MCP-Schnittstelle: %s" % (self.process.pid, self.mcp_url))
 
     def _drain(self, stream):
         """Keep only the last kilobytes of client stderr; never persist or log it."""
@@ -12151,7 +12176,7 @@ class BridgeService:
         exact(value, {"version"})
         check(type(value["version"]) is int and value["version"] == 1)
         confirmed = self.store.confirm(token)
-        bridge_console("Controller-Kontakt: Kopplung bestaetigt (controller %s)" % confirmed["controller_id"])
+        bridge_console("Controller/UI -> Bridge: Kopplung bestaetigt (controller %s)" % confirmed["controller_id"])
         self.tunnel.controller_connected()
         return self.json(confirmed)
 
@@ -12161,7 +12186,7 @@ class BridgeService:
         try:
             return self._mcp(request)
         except BridgeError as failure:
-            bridge_console("mcp: abgewiesen (%s)" % failure.code)
+            bridge_console("AI/MCP-Eingang -> Bridge: abgewiesen (%s)" % failure.code)
             raise
 
     def _mcp(self, request):
@@ -12257,11 +12282,11 @@ class BridgeService:
             elif method == "events/unsubscribe" and modern:
                 result = self.unsubscribe(principal, params)
             else:
-                bridge_console("mcp: abgewiesen (method_not_found)")
+                bridge_console("AI/MCP-Eingang -> Bridge: abgewiesen (method_not_found)")
                 return self.json({"jsonrpc": "2.0", "id": rid,
                                   "error": {"code": -32601, "message": "Method not found"}})
         except BridgeError as failure:
-            bridge_console("mcp: %s abgewiesen (%s)" % (method if method in self.MCP_LOG_METHODS else "rpc",
+            bridge_console("AI/MCP-Eingang -> Bridge: %s abgewiesen (%s)" % (method if method in self.MCP_LOG_METHODS else "rpc",
                                                         failure.code))
             if method == "tools/call":
                 result = {"content": [{"type": "text", "text": failure.code}],
@@ -12276,7 +12301,8 @@ class BridgeService:
                 return self.json({"jsonrpc": "2.0", "id": rid,
                                   "error": {"code": -32602, "message": "Invalid parameters"}})
         if method in self.MCP_LOG_METHODS:
-            bridge_console("mcp: %s beantwortet" % method)
+            outcome = " (Tool-Fehler)" if method == "tools/call" and result.get("isError") else ""
+            bridge_console("AI/MCP-Eingang -> Bridge: %s beantwortet%s" % (method, outcome))
         if modern:
             result["resultType"] = "complete"
             result["_meta"] = {"io.modelcontextprotocol/serverInfo": BRIDGE_SERVER_INFO}

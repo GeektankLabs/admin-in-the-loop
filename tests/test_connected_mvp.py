@@ -2555,8 +2555,9 @@ class BridgeTunnelTests(unittest.TestCase):
         log = buffer.getvalue()
         self.assertIn("Tunnel-Konfiguration empfangen", log)
         self.assertIn("Tunnel-Client gefunden", log)
-        self.assertIn("Tunnel-Client gestartet", log)
-        self.assertIn("Tunnel-Status: starting", log)
+        self.assertIn("Bridge -> Tunnel-Client: gestartet", log)
+        self.assertIn("lokales Weiterleitungsziel zur AI/MCP-Schnittstelle:", log)
+        self.assertIn("Bridge -> Tunnel-Client: Status starting", log)
         self.assertNotIn(self.key, log)
         self.assertNotIn(self.tunnel_id, log)
         buffer2 = io.StringIO()
@@ -2565,7 +2566,7 @@ class BridgeTunnelTests(unittest.TestCase):
             tunnel.checked_at = 0.0
             tunnel.status()
         log2 = buffer2.getvalue()
-        self.assertIn("Tunnel-Status: error (tunnel_process_exited)", log2)
+        self.assertIn("Bridge -> Tunnel-Client: Status error (tunnel_process_exited)", log2)
         self.assertNotIn(self.key, log2)
         self.assertNotIn(self.tunnel_id, log2)
         tunnel.close()
@@ -2646,12 +2647,20 @@ class ConsoleVisibilityTests(unittest.TestCase):
                 status, _raw = request(harness.profile.url, "POST", path="/v1/pair/confirm",
                                        body={"version": 1}, headers={"Authorization": "Bearer " + controller})
                 self.assertEqual(status, 200)
+                status, _raw = request(harness.mcp_url, "POST",
+                                       body={"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                             "params": {"name": "unknown-tool-secret", "arguments": {}}},
+                                       headers={"X-AITL-AI-Key": ai})
+                self.assertEqual(status, 200)
             log = buffer.getvalue()
-            self.assertIn("mcp: initialize beantwortet", log)
-            self.assertIn("mcp: abgewiesen (unauthorized)", log)
-            self.assertIn("mcp: abgewiesen (method_not_found)", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: initialize beantwortet", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: abgewiesen (unauthorized)", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: abgewiesen (method_not_found)", log)
             self.assertNotIn("unbekannt/80", log)  # client-controlled names never reach the console
-            self.assertIn("Controller-Kontakt: Kopplung bestaetigt", log)
+            self.assertIn("Controller/UI -> Bridge: Kopplung bestaetigt", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: tools/call beantwortet (Tool-Fehler)", log)
+            self.assertNotIn("unknown-tool-secret", log)
+            self.assertNotIn("Tunnel verbunden", log)
             self.assertNotIn(ai, log)
             self.assertNotIn(controller, log)
 
