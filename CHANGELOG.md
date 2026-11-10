@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.25 — Deutsche/englische UI und orange wartende Vorschläge
+
+- Ein wartender Command-Vorschlag bei bereits offener Command-Review erscheint
+  hellorange mit dunkler Schrift; die bestehende Reviewsperre bleibt erhalten.
+- Hauptfenster, Verbindungsassistent, Prüfdetails, Meldungen und Kontextmenüs
+  unterstützen Deutsch und Englisch. Deutsche Systemlocale wählt Deutsch,
+  andere Locales Englisch (`LC_ALL` vor `LC_MESSAGES` vor `LANG`).
+- Die Sprachwahl unten im Fenster speichert Systemstandard, Deutsch oder English
+  in den vorhandenen Einstellungen und gilt ab dem nächsten App-Start.
+  Commands, Ausgaben, IDs und Freigaben werden nicht übersetzt oder verändert.
+- Der Übersetzungskatalog bleibt für Einzeldatei-Updates eingebettet.
+  App und Bridge: 0.9.25. [Prüfnachweis](doc/RELEASE_V0.9.25.md).
+
 ## 0.9.24 — Wiederherstellung sichtbar erneut starten
 
 - Jeder Wiederherstellungsversuch zeigt eine neue Versuchsnummer und seinen

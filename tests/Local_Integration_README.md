@@ -1,4 +1,4 @@
-# Admin in the Loop – v0.9.23 (persönliche Testversion)
+# Admin in the Loop – v0.9.25 (persönliche Testversion)
 
 **AI assists, Admin decides.**
 
@@ -8,7 +8,7 @@ Stand des beschriebenen MVP: 30. September 2026. Die bisherige lokale Integratio
 
 ## Versionen und Versionsregel
 
-Kanonische Version: `APP_VERSION` in `admin_in_the_loop.py` (aktuell **0.9.23**); die headless Bridge zeigt dieselbe Version (`BRIDGE_SERVER_INFO`, Konsolen-Startzeile) und der GUI-Fenstertitel führt sie ebenfalls. Jeder neue ausgelieferte Programmstand erhöht mindestens den Patch-Stand (keine undokumentierten Stände); `--version` gibt die Version zeilenweise aus. Tests pinnen die Konsistenz beider Kopien.
+Kanonische Version: `APP_VERSION` in `admin_in_the_loop.py` (aktuell **0.9.25**); die headless Bridge zeigt dieselbe Version (`BRIDGE_SERVER_INFO`, Konsolen-Startzeile) und der GUI-Fenstertitel führt sie ebenfalls. Jeder neue ausgelieferte Programmstand erhöht mindestens den Patch-Stand (keine undokumentierten Stände); `--version` gibt die Version zeilenweise aus. Tests pinnen die Konsistenz beider Kopien.
 
 Einzeldatei-Download und `update [GITHUB_USER [BRANCH]]` stehen im
 [Root-README](../README.md#einfach-aktualisieren). Standard ist GeektankLabs/main;
@@ -326,6 +326,14 @@ Headless/CLI bilden dieselben Aktionen explizit ab: `resolve_stage_conflict(...)
 **Tunnel und erster Roundtrip.** Tunnel-ID und Restricted-Runtime-Key werden lokal in der Bridge-Umgebung erfasst und bei Neustart wiederverwendet; Produktions-SSH-Schlüssel bleiben im Admin-Qube und gehören nie in Chat, Befehlsargumente oder Logs. Bridge-Erreichbarkeit, Tunnel-Readiness und echte ChatGPT-/Provider-Verifikation bleiben getrennte Belege. Der geführte harmlose Test (Vorschlag → manuelle Befehlsfreigabe → manuelle Ausgabe-Freigabe → Roundtrip) behält alle bestehenden Review- und Unsicherheits-Sperren. Native Qubes-/Qrexec-/echte SSH-/E2E-Abnahme ist separate externe Evidenz; lokale Mock-/Prozess-Tests weisen sie nicht nach.
 
 ## Tests und historischer Abnahmestand
+
+Die bestehenden UI-Textassertionen verwenden Deutsch. Dafür die Testbefehle
+mit `LC_ALL=de_DE.UTF-8` ausführen; die App wertet die Locale-Kennung aus,
+auch wenn die Locale nicht im Testsystem installiert ist.
+`tests/test_connection_dialog_ux.py` prüft zusätzlich beide UI-Sprachen,
+Locale-Priorität, Sprachspeicherung und den orangefarbenen Wartestatus.
+Siehe [v0.9.25](../doc/RELEASE_V0.9.25.md) für die gezielte Prüfauswahl.
+
 
 ```bash
 python3 admin_in_the_loop.py --self-test

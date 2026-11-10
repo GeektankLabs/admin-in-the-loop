@@ -138,5 +138,100 @@ class ConnectionUXTests(unittest.TestCase):
                 self.assertIn("Versuch %d: fehlgeschlagen" % attempt, self.ui.ai_status.get())
 
 
+class LanguagePreferenceTests(unittest.TestCase):
+    def tearDown(self):
+        a.configure_ui_language()
+
+    def test_locale_precedence_and_english_fallback(self):
+        for env, expected in (({'LANG': 'de_DE.UTF-8'}, 'de'),
+                              ({'LANG': 'de-CH'}, 'de'),
+                              ({'LANG': 'fr_FR.UTF-8'}, 'en'),
+                              ({'LANG': 'de_DE', 'LC_MESSAGES': 'en_GB'}, 'en'),
+                              ({'LANG': 'en_US', 'LC_ALL': 'de_AT'}, 'de'),
+                              ({'LANG': 'de_DE', 'LC_ALL': 'C.UTF-8'}, 'en')):
+            with self.subTest(env=env):
+                self.assertEqual(a.system_ui_language(env), expected)
+
+    def test_language_round_trip_preserves_existing_preferences(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = a.PreferenceStore(Path(directory) / 'config')
+            self.assertEqual(store.load_language(), 'system')
+            store.save(False, 'LARGE')
+            store.save_text_review(True, 'output')
+            store.save_language('de')
+            reloaded = a.PreferenceStore(store.directory)
+            self.assertEqual(reloaded.load_language(), 'de')
+            self.assertEqual(reloaded.load(), (False, 'LARGE'))
+            self.assertTrue(reloaded.load_text_review('output'))
+            with self.assertRaises(a.ProbeError):
+                store.save_language('fr')
+
+    def test_catalog_preserves_format_fields_and_unrecognized_payload(self):
+        import re
+        pattern = r'%(?:[0-9.]*[dsfX])'
+        for source, translated in a.UI_ENGLISH.items():
+            self.assertEqual(re.findall(pattern, source), re.findall(pattern, translated), source)
+        for language in ('de', 'en'):
+            a.configure_ui_language(language)
+            payload = "printf 'untranslated payload ä\\n'"
+            self.assertEqual(a.tr(payload), payload)
+
+
+@unittest.skipUnless(os.environ.get('DISPLAY'), 'Tk display required')
+class LanguageUITests(unittest.TestCase):
+    def test_both_languages_orange_gate_and_saved_choice_preserve_review(self):
+        import tkinter as tk
+        for language, expected, clipboard in (('en', 'Command proposal available', 'Clipboard'),
+                                               ('de', 'Command-Vorschlag vorhanden', 'Zwischenablage')):
+            with self.subTest(language=language), tempfile.TemporaryDirectory() as directory:
+                store = a.PreferenceStore(Path(directory) / 'config')
+                store.save_language(language)
+                core = a.AppCore(preference_store=store)
+                root = tk.Tk()
+                errors = []
+                root.report_callback_exception = lambda *args: errors.append(args)
+                try:
+                    ui = a.ReviewUI(root, core)
+                    root.update()
+                    self.assertEqual(ui.output_mode.get(), clipboard)
+                    ui.output_mode.set('Last 20' if language == 'en' else 'Letzte 20')
+                    ui.change_output_mode()
+                    self.assertEqual(core.output_mode, 'LAST_20')
+                    ui.output_mode.set(clipboard)
+                    ui.change_output_mode()
+                    self.assertEqual(core.output_mode, 'CLIPBOARD')
+                    dialog = ui.connection_settings()
+                    root.update()
+                    if language == 'en':
+                        self.assertEqual(dialog.layer_labels['Secure Tunnel'].cget('text'), 'Secure Tunnel: pending')
+                    dialog.window.destroy()
+                    core.review_command("printf 'payload ä'")
+                    proposal = core.add_proposal("printf 'next'")
+                    ui.render()
+                    review = core.review
+                    self.assertIn(expected, ui.readiness.cget('text'))
+                    self.assertEqual(ui.readiness.cget('background'), '#ffcc99')
+                    self.assertTrue(ui.from_ai_button.instate(['disabled']))
+                    self.assertIn(proposal, core.inbox)
+                    self.assertEqual(a.ConnectionDialog.error_text('network_unavailable').startswith(
+                        'Gateway/bridge' if language == 'en' else 'Gateway/Bridge'), True)
+                    ui.language.set('Deutsch' if language == 'en' else 'English')
+                    with mock.patch.object(ui.messagebox, 'showinfo') as notice:
+                        ui.change_language()
+                        notice.assert_called_once()
+                    self.assertIs(core.review, review)
+                    self.assertEqual(a.UI_LANGUAGE, language)  # Apply only after restart.
+                    self.assertEqual(store.load_language(), 'de' if language == 'en' else 'en')
+                    self.assertEqual(core.review.payload, review.payload)
+                    self.assertFalse(errors)
+                finally:
+                    core.close()
+                    for callback in root.tk.call('after', 'info'):
+                        root.after_cancel(callback)
+                    root.destroy()
+                    gc.collect()
+        a.configure_ui_language()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
