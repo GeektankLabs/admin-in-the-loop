@@ -27,6 +27,9 @@ def until(core, predicate, timeout=7):
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
+        language = mock.patch.object(a, "UI_LANGUAGE", "de")
+        language.start()
+        self.addCleanup(language.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = a.ConnectionStore(Path(self.temp.name) / "config")
@@ -110,6 +113,137 @@ class RecoveryTests(unittest.TestCase):
                 self.core.retry_connection_recovery()
             disconnect.assert_not_called()
         self.assertEqual(self.core.recovery_attempt, 0)
+
+    def test_killed_forwarder_recovery_is_bounded_and_can_succeed(self):
+        self.recovery_dialog()
+        self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
+        created = []
+        def forwarder():
+            item = mock.Mock(running=True, target="ai-bridge", port=8443)
+            item.stop.return_value = True
+            if not created:
+                item.start.side_effect = a.ProbeError("qrexec_forwarder_killed")
+            created.append(item)
+            return item
+        def connect(profile):
+            self.core.bridge_profile = profile
+            self.core.bridge_state = "CONNECTED"
+        with mock.patch.object(a, "QrexecForwarder", side_effect=forwarder), \
+                mock.patch.object(self.core, "connect_profile", side_effect=connect), \
+                mock.patch.object(self.core, "begin_tunnel_probe"):
+            self.core.begin_connection_recovery()
+            until(self.core, lambda: self.core.recovery_state == "WAITING")
+            self.assertIn("Erneuter Versuch", a.recovery_attempt_status(self.core))
+            self.core.recovery_retry_at = 0
+            until(self.core, lambda: self.core.recovery_state == "RESTORED")
+            self.assertEqual(self.core.recovery_attempt, 2)
+            self.assertEqual(self.core.recovery_retries_left, 1)
+            self.assertEqual(self.core.bridge_profile.pin, "a" * 64)
+            self.assertEqual(len(created), 2)
+            self.core._recovery_failure("network_timeout")
+            self.core.recovery_retry_at = 0
+            until(self.core, lambda: self.core.recovery_state == "RESTORED")
+            self.assertEqual(self.core.recovery_retries_left, 0)
+            self.core._recovery_failure("network_timeout")
+            self.assertEqual(self.core.recovery_state, "NEEDS_ATTENTION")
+            self.assertEqual(len(created), 3)
+
+    def test_repeated_killed_forwarders_stop_after_three_attempts(self):
+        self.recovery_dialog()
+        self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
+        with mock.patch.object(a.QrexecForwarder, "start", side_effect=a.ProbeError("qrexec_forwarder_killed")) as start:
+            self.core.begin_connection_recovery()
+            for attempt in (1, 2, 3):
+                until(self.core, lambda: self.core.recovery_state in {"WAITING", "NEEDS_ATTENTION"})
+                self.assertEqual(self.core.recovery_attempt, attempt)
+                if attempt < 3:
+                    self.core.recovery_retry_at = 0
+                    self.core._pump_connection_recovery()
+            self.assertEqual(self.core.recovery_state, "NEEDS_ATTENTION")
+            self.assertIn("Automatische Wiederaufnahme beendet", a.recovery_attempt_status(self.core))
+            for _ in range(5):
+                self.core.pump()
+            self.assertEqual(start.call_count, 3)
+
+    def test_auto_recovery_stops_on_foreign_port_identity_auth_or_target_change(self):
+        self.recovery_dialog()
+        self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
+        self.core.recovery_target = self.core._saved_recovery_target()
+        for reason in ("qrexec_port_conflict", "qrexec_ownership_unverified", "pin_mismatch", "network_http_401"):
+            self.core._recovery_failure(reason)
+            self.assertEqual(self.core.recovery_state, "NEEDS_ATTENTION")
+            self.assertIsNone(self.core.recovery_retry_at)
+        self.core._recovery_failure("network_timeout")
+        self.core.saved_connection["qrexec"]["target"] = "different-qube"
+        self.core.recovery_retry_at = 0
+        with mock.patch.object(self.core, "begin_connection_recovery") as begin:
+            self.core._pump_connection_recovery()
+            begin.assert_not_called()
+        self.assertEqual(self.core.recovery_error, "saved_connection_mismatch")
+
+    def test_stalled_preparation_waits_for_cleanup_and_dead_preparation_is_detected(self):
+        preparation = a.SavedForwarderPreparation.__new__(a.SavedForwarderPreparation)
+        preparation.cancel, preparation.lock = threading.Event(), threading.Lock()
+        preparation.result = None
+        preparation.thread = mock.Mock(is_alive=mock.Mock(return_value=False))
+        self.assertEqual(preparation.take(), ("error", "qrexec_preparation_interrupted"))
+        preparation.thread.is_alive.return_value = True
+        self.core.recovery_preparation = preparation
+        self.core.recovery_state, self.core.recovery_deadline = "PREPARING", 0
+        self.core._pump_connection_recovery()
+        self.assertEqual(self.core.recovery_error, "qrexec_preparation_timeout")
+        self.assertTrue(preparation.cancel.is_set())
+        with self.assertRaisesRegex(a.ProbeError, "setup_busy"):
+            self.core.retry_connection_recovery()
+        preparation.thread.is_alive.return_value = False
+        self.core._pump_connection_recovery()
+        self.assertIsNone(self.core.recovery_preparation)
+
+    def test_lost_own_forwarder_is_recovered_and_user_disconnect_cancels_pending_retry(self):
+        self.recovery_dialog()
+        self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
+        self.core.recovery_target = self.core._saved_recovery_target()
+        self.core.recovery_state, self.core.bridge_state = "RESTORED", "CONNECTED"
+        self.core.qrexec_forwarder = mock.Mock(running=False)
+        self.core._pump_connection_recovery()
+        self.assertEqual(self.core.recovery_state, "WAITING")
+        self.core.disconnect_bridge()
+        self.assertEqual(self.core.recovery_state, "STOPPED")
+        self.assertIsNone(self.core.recovery_retry_at)
+        with mock.patch.object(self.core, "begin_connection_recovery") as begin:
+            self.core._pump_connection_recovery()
+            begin.assert_not_called()
+
+    def test_cancelled_preparation_blocks_new_starts_until_its_thread_finishes(self):
+        self.recovery_dialog()
+        preparation = mock.Mock(thread=mock.Mock(is_alive=mock.Mock(return_value=True)))
+        self.core.recovery_preparation = preparation
+        self.core.disconnect_bridge()
+        preparation.close.assert_called_once()
+        with self.assertRaisesRegex(a.ProbeError, "setup_busy"):
+            self.core.retry_connection_recovery()
+        with self.assertRaisesRegex(a.ProbeError, "setup_busy"):
+            self.core.connect_saved_bridge()
+        preparation.thread.is_alive.return_value = False
+        self.core._pump_connection_recovery()
+        self.assertIsNone(self.core.recovery_cleanup)
+
+    def test_stuck_bridge_connection_has_deadline_and_manual_stop_cancels_recovery(self):
+        self.recovery_dialog()
+        self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
+        self.core.qrexec_forwarder = mock.Mock(running=True, target="ai-bridge", port=8443)
+        self.core.qrexec_forwarder.stop.return_value = True
+        def connecting(profile):
+            self.core.bridge_profile, self.core.bridge_state = profile, "CONNECTING"
+        with mock.patch.object(self.core, "connect_profile", side_effect=connecting):
+            self.core.begin_connection_recovery()
+        self.assertIsNotNone(self.core.recovery_deadline)
+        self.core.bridge_state, self.core.recovery_deadline = "RETRYING", 0
+        self.core._pump_connection_recovery()
+        self.assertEqual(self.core.recovery_state, "WAITING")
+        self.core.stop_qrexec_forwarder()
+        self.assertEqual(self.core.recovery_state, "STOPPED")
+        self.assertIsNone(self.core.recovery_retry_at)
 
     def test_already_paired_retries_blocked_and_later_disconnected_attempts(self):
         dialog = self.recovery_dialog()

@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import select
+import signal
 import socket
 import ssl
 import sqlite3
@@ -4235,6 +4236,8 @@ class QrexecForwarderTests(unittest.TestCase):
         "            conn.close(); continue\n"
         "        if mode == 'plain':\n"
         "            conn.sendall(b'NOPE NOT TLS\\r\\n'); conn.close(); continue\n"
+        "        if int(spec.get('remote', remote)) == int(local):\n"
+        "            conn.close(); continue\n"
         "        up = socket.socket(); up.settimeout(3)\n"
         "        try:\n"
         "            up.connect(('127.0.0.1', int(spec.get('remote', remote))))\n"
@@ -4341,15 +4344,72 @@ class QrexecForwarderTests(unittest.TestCase):
 
     def test_identity_guard_never_signals_foreign_group(self):
         # Simulate PID/PGID reuse: recorded group belongs to an unrelated process.
-        dummy = subprocess.Popen(["sleep", "30"], start_new_session=True,
+        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "socat"], start_new_session=True,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: dummy.poll() is None and dummy.kill())
+        def cleanup():
+            if dummy.poll() is None:
+                dummy.kill()
+            dummy.wait(timeout=3)
+        self.addCleanup(cleanup)
         forwarder = a.QrexecForwarder()
         forwarder.pgid = os.getpgid(dummy.pid)
         forwarder.port = self.free_port()
         self.assertFalse(forwarder.owned())
         forwarder.stop()
         self.assertIsNone(dummy.poll())  # foreign process still alive, never signalled
+
+    def test_killed_owned_helper_can_restart_without_duplicate_listener(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        port = self.free_port()
+        forwarder.start("target-vm", port)
+        original = forwarder.pgid
+        for pid, cmd in forwarder._group_members():
+            if cmd:
+                fd = os.pidfd_open(pid)
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                finally:
+                    os.close(fd)
+        deadline = time.monotonic() + 2
+        while self.listener(port) and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertFalse(forwarder.running)
+        forwarder.start("target-vm", port)
+        self.assertTrue(forwarder.running)
+        self.assertNotEqual(forwarder.pgid, original)
+        self.assertTrue(forwarder.stop())
+
+    def test_missing_owned_listener_and_pid_identity_change_are_not_healthy(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        forwarder.start("target-vm", self.free_port())
+        with mock.patch.object(forwarder, "_owns_listener", return_value=False):
+            self.assertFalse(forwarder.running)
+        with mock.patch.object(forwarder, "_process_identity", return_value=(999999, forwarder.pgid, forwarder.pgid, os.getuid())), \
+                mock.patch.object(a.signal, "pidfd_send_signal") as send:
+            self.assertFalse(forwarder.stop())
+            send.assert_not_called()
+        self.assertTrue(forwarder.stop())
+
+    def test_killed_launcher_is_reported_without_claiming_a_cause(self):
+        self.launcher.write_text("#!/bin/bash\nkill -KILL $$\n")
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        with self.assertRaisesRegex(a.ProbeError, "qrexec_forwarder_killed"):
+            forwarder.start("target-vm", self.free_port())
+        self.assertEqual(forwarder.last_result["exit"], -signal.SIGKILL)
+
+    def test_missing_pidfd_support_has_no_unsafe_signal_fallback(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        forwarder.start("target-vm", self.free_port())
+        with mock.patch.object(a.os, "pidfd_open", side_effect=OSError(a.errno.ENOSYS, "test")), \
+                mock.patch.object(a.signal, "pidfd_send_signal") as send:
+            self.assertFalse(forwarder.stop())
+            send.assert_not_called()
+        self.assertTrue(forwarder.running)
+        self.assertTrue(forwarder.stop())
 
     def test_missing_tool_and_invalid_names(self):
         forwarder = a.QrexecForwarder()
@@ -4810,7 +4870,8 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         self.assertEqual(denied["phase"], "qrexec_target_unreachable")
         self.assertEqual(down["phase"], "qrexec_target_unreachable")
         self.assertEqual(plain["phase"], "tls_handshake_failed")
-        message = text("qrexec_target_unreachable")
+        with mock.patch.object(a, "UI_LANGUAGE", "de"):
+            message = text("qrexec_target_unreachable")
         self.assertIn("Bridge", message)
         self.assertIn("Qrexec-Freigabe", message)
         self.assertIn("welche Ursache vorliegt, ist noch offen", message)

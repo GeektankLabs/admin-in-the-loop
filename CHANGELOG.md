@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.26 — Begrenzte Wiederaufnahme unterbrochener Qubes-Verbindungen
+
+- Nach abgebrochenem Launcher, fehlendem eigenen Listener oder vorübergehendem
+  Verbindungsfehler höchstens zwei zusätzliche Wiederaufnahmen mit kurzer Wartezeit.
+  Jeder bewusste Retry erhält ein neues Budget; Erfolg setzt das Budget nicht zurück.
+- Recovery erkennt beendete Vorbereitung und begrenzt Vorbereitung/Verbindungsaufbau
+  auf 30 Sekunden pro Versuch. Während noch bereinigt wird, startet kein zweiter
+  Forwarder. Trennen oder bewusstes Stoppen beendet anstehende Wiederholungen.
+- Ein gesunder Forwarder benötigt einen eigenen Listener. Prozesse werden über
+  beobachtete Kernel-Startzeit, Session, Gruppe und UID zugeordnet; Signale gehen
+  gezielt über geprüfte pidfds. Namen, belegte Ports und alte PIDs reichen nicht.
+- Unsichere Eigentümerschaft, fremde Listener, Pin- und Authentifizierungsfehler
+  stoppen die Automatik. Gespeicherte Kopplung und TLS-Pins bleiben erhalten;
+  Einrichtung/Startanleitung bzw. eine bekannte HTTPS-Bridge bleiben manuelle Wege.
+- UI und Bridge melden 0.9.26. Deutsch/Englisch aus 0.9.25 bleiben erhalten.
+  Die Ursache einer externen Meldung „Killed“ ist damit nicht diagnostiziert;
+  ein beendeter Gesamtprozess benötigt einen erneuten manuellen App-Start.
+
 ## 0.9.25 — Deutsche/englische UI und orange wartende Vorschläge
 
 - Ein wartender Command-Vorschlag bei bereits offener Command-Review erscheint

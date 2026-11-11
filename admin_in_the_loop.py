@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.25"
+APP_VERSION = "0.9.26"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.25"
+APP_VERSION = "0.9.26"
 
 
 def _load_bridge_component(namespace=None):
@@ -1561,6 +1561,12 @@ UI_ENGLISH = {
     'noch offen': 'pending',
     'Verbindung unterbrochen; erneuter Verbindungsversuch läuft': 'Connection interrupted; reconnecting',
     'Wiederherstellung · Versuch %d: %s': 'Recovery · attempt %d: %s',
+    'Erneuter Versuch in %ds · eigene Weiterleitung wird neu aufgebaut': 'Retry in %ds · rebuilding app-owned forwarding',
+    'Automatische Wiederaufnahme beendet · Bridge im Ziel prüfen oder Einrichtung öffnen': 'Automatic recovery stopped · check bridge in target or open setup',
+    'Prozesseigentümerschaft nicht sicher bestätigt. Nichts wird beendet oder übernommen. Port selbst prüfen oder eine bekannte HTTPS-Bridge über die Einrichtung verwenden.': 'Process ownership could not be verified. Nothing is stopped or adopted. Check the port yourself or use a known HTTPS bridge through setup.',
+    'Der Forwarder wurde abgebrochen (Killed/SIGKILL möglich); die Ursache ist nicht belegt. Wiederaufnahme wird begrenzt versucht.': 'The forwarder was interrupted (Killed/SIGKILL possible); the cause is unconfirmed. Recovery attempts are bounded.',
+    'Die eigene Weiterleitung oder ihre Vorbereitung wurde unterbrochen. Wiederaufnahme wird begrenzt versucht.': 'App-owned forwarding or its preparation was interrupted. Recovery attempts are bounded.',
+    'Die Vorbereitung hat das Zeitlimit überschritten. Kein paralleler Start; Bereinigung abwarten und Bridge im Ziel prüfen.': 'Preparation timed out. No parallel start; wait for cleanup and check the bridge in the target.',
     'Client wird gesucht…': 'Looking for client…',
     'Offizieller Client wird installiert…': 'Installing official client…',
     'Lokale Verbindung wird aufgebaut…': 'Connecting locally…',
@@ -3935,13 +3941,11 @@ class QrexecForwarder:
     """M9 Folgefix (Launcher-Vertrag): das offizielle qvm-connect-tcp druckt die
     Binding-Zeile, startet socat im Hintergrund und exitet selbst sofort – das Skript
     ist NICHT der dauerhafte Forwarder, sondern unsere Gruppen-Kinder (socat/
-    qrexec-client-vm). Besitzführung läuft daher über die eigene Prozessgruppe
-    (start_new_session) mit Identitäts-Gate über /proc-Cmdlines; PID/PGID-Reuse oder
-    fremde Gruppen werden niemals gesignalisiert. running heißt: unsere verifizierte
-    Gruppe lebt. Ein lokaler Listener beweist weiterhin keine Bridge-Reichbarkeit,
+    qrexec-client-vm). Besitz folgt einer beobachteten Kernel-Identitätskette
+    (Startzeit, Session, Gruppe, UID); Signale gehen nur über geprüfte pidfds.
+    running verlangt außerdem einen Socket der eigenen Gruppe im LISTEN-Zustand.
+    Ein lokaler Listener beweist weiterhin keine Bridge-Reichbarkeit,
     keine Policy, kein Vertrauen und keine Kopplung."""
-
-    IDENTITY_MARKERS = ("qvm-connect-tcp", "socat", "qrexec-client-vm")
 
     def __init__(self):
         self.process = None
@@ -3952,10 +3956,21 @@ class QrexecForwarder:
         self.port = None
         self.launch_log = None
         self.last_result = None
+        self.identities = {}
 
     @property
     def running(self):
-        return self.owned()
+        return self.owned() and bool(self.port) and self._owns_listener()
+
+    @staticmethod
+    def _process_identity(pid):
+        try:
+            path = Path("/proc/%d" % pid)
+            data = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            # Kernel start time, group, session and uid; command names are not identity.
+            return (int(data[19]), int(data[2]), int(data[3]), path.stat().st_uid)
+        except (OSError, ValueError, IndexError):
+            return None
 
     def owned(self):
         if self.pgid is None:
@@ -3963,8 +3978,39 @@ class QrexecForwarder:
         members = self._group_members()
         if not members:
             return False
-        markers = self.IDENTITY_MARKERS + ((self.tool,) if self.tool else ())
-        return any(any(marker and marker in cmd for marker in markers) for _, cmd in members)
+        current = {pid: self._process_identity(pid) for pid, _ in members}
+        current = {pid: value for pid, value in current.items() if value is not None
+                   and value[1:] == (self.pgid, self.pgid, os.getuid())}
+        # Only extend an observed launch lineage while a known kernel identity
+        # still exists. A recycled PGID or a plausible command name proves nothing.
+        if not any(self.identities.get(pid) == value for pid, value in current.items()):
+            return False
+        self.identities = current
+        return any(pid in current and cmd for pid, cmd in members)
+
+    def _owns_listener(self):
+        try:
+            inodes = set()
+            for line in Path("/proc/net/tcp").read_text().splitlines()[1:]:
+                row = line.split()
+                address, port = row[1].split(":")
+                if address in {"0100007F", "00000000"} and int(port, 16) == self.port and row[3] == "0A":
+                    inodes.add("socket:[%s]" % row[9])
+            for pid, cmd in self._group_members():
+                if not cmd or self.identities.get(pid) is None or self.identities[pid] != self._process_identity(pid):
+                    continue
+                try:
+                    for fd in (Path("/proc/%d/fd" % pid)).iterdir():
+                        try:
+                            if os.readlink(fd) in inodes:
+                                return True
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+        except (OSError, ValueError, IndexError):
+            pass
+        return False
 
     def _group_members(self):
         if self.pgid is None:
@@ -4023,6 +4069,7 @@ class QrexecForwarder:
     def _clear(self):
         self.process, self.pgid, self.argv = None, None, None
         self.target, self.port = None, None
+        self.identities.clear()
 
     def start(self, target, port=8443):
         target = validate_qube_name(target)
@@ -4032,7 +4079,7 @@ class QrexecForwarder:
             self._result("already-running", None, tr("eigene Gruppe und Listener aktiv"),
                          tr("Verbindung prüfen"))
             return
-        self.stop()
+        require(self.stop() is not False, "qrexec_ownership_unverified")
         tool = shutil.which("qvm-connect-tcp")
         require(tool is not None, "qrexec_tool_missing")
         if self._listener_present(port):
@@ -4055,29 +4102,34 @@ class QrexecForwarder:
             os.close(handle)
         self.tool, self.argv, self.target, self.port = tool, argv, target, port
         self.pgid = os.getpgid(self.process.pid)
+        identity = self._process_identity(self.process.pid)
+        require(identity is not None, "qrexec_ownership_unverified")
+        self.identities[self.process.pid] = identity
         deadline = time.monotonic() + 4
         while time.monotonic() < deadline and not self._listener_present(port):
-            if self.process.poll() is not None and self.owned():
-                break  # Launcher-Semantik: Skript fertig, Gruppe evtl. noch leben
+            self.owned()  # keep the launcher identity until children are observed
             time.sleep(0.05)
+        self.owned()
         code = self.process.poll()
         grace = time.monotonic() + 2
         while time.monotonic() < grace and not self._listener_present(port):
             time.sleep(0.05)
         if self._listener_present(port):
-            if self.owned():
+            if self.running:
                 self._result("listener", code, tr("eigene Prozessgruppe live und lokaler Listener "
                              "gebunden – noch kein Beweis für Bridge/Policy"),
                              tr("Verbindung prüfen (echte Reichbarkeit durch die Weiterleitung)"))
                 return
-            self.stop()
-            self._clear()
+            require(self.stop() is not False, "qrexec_ownership_unverified")
             self._result("listener-foreign", code, tr("Listener erschien, gehört aber nicht unserer "
                          "verifizierten Gruppe"), tr("Portbelegung selbst klären"))
             raise ProbeError("qrexec_port_conflict")
         tail = self._tail()
-        self.stop()
-        self._clear()
+        require(self.stop() is not False, "qrexec_ownership_unverified")
+        if code in {-9, 137}:
+            self._result("launcher-killed", code, "Launcher abgebrochen; Ursache nicht belegt",
+                         "Begrenzt erneut versuchen; bei Wiederholung Bridge im Ziel-Qube prüfen")
+            raise ProbeError("qrexec_forwarder_killed")
         if code not in (None, 0):
             self._result("script-exit", code, tr("Launcher exitete mit Fehlercode %s; Log-Ende: %s")
                          % (code, tail or tr("leer")), tr("Ergebnis prüfen, ggf. Port/Ziel korrigieren "
@@ -4090,29 +4142,43 @@ class QrexecForwarder:
         raise ProbeError("qrexec_launch_no_listener")
 
     def stop(self):
-        if self.pgid is not None and self.owned():
+        for signum, grace in ((signal.SIGTERM, 2), (signal.SIGKILL, .2)):
+            live = [(pid, cmd) for pid, cmd in self._group_members() if cmd]
+            if not live:
+                break
+            if not self.owned() or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+                self._result("ownership-unverified", None, "Prozessidentität nicht sicher bestätigt; nichts beendet",
+                             "Port/Prozesse selbst prüfen oder gespeicherten sicheren HTTPS-Zugang verwenden")
+                return False
+            for pid, _cmd in live:
+                try:
+                    fd = os.pidfd_open(pid)
+                    try:
+                        if self.identities.get(pid) is not None and self.identities[pid] == self._process_identity(pid):
+                            signal.pidfd_send_signal(fd, signum)
+                    finally:
+                        os.close(fd)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    return False
+            deadline = time.monotonic() + grace
+            while any(cmd for _, cmd in self._group_members()) and time.monotonic() < deadline:
+                time.sleep(.02)
+        if any(cmd for _, cmd in self._group_members()):
+            return False
+        if self.process is not None and self.process.poll() is None:
             try:
-                os.killpg(self.pgid, signal.SIGTERM)
-                deadline = time.monotonic() + 2
-                while self._group_members() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if self._group_members():
-                    os.killpg(self.pgid, signal.SIGKILL)
-                    time.sleep(0.1)
-            except ProcessLookupError:
-                pass
-        elif self.pgid is not None:
-            # Gruppe nicht eindeutig als unsere identifiziert: NIEMALS signalisieren.
-            pass
-        process = self.process
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
+                self.process.wait(timeout=.25)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1)
+                return False
+        # Exiting processes can have an empty cmdline just before socket teardown.
+        # Wait briefly for release; never signal a new occupant of that port.
+        deadline = time.monotonic() + .25
+        while self.port and self._listener_present(self.port) and time.monotonic() < deadline:
+            time.sleep(.01)
         self._clear()
+        return True
 
     def status(self):
         return {"forwarder_running": self.running,
@@ -5030,6 +5096,8 @@ class SavedForwarderPreparation:
     def take(self):
         with self.lock:
             result, self.result = self.result, None
+            if result is None and not self.cancel.is_set() and not self.thread.is_alive():
+                return ("error", "qrexec_preparation_interrupted")
             return result
 
     def close(self):
@@ -5067,9 +5135,15 @@ class AppCore:
         self.connection_store = connection_store
         self.saved_connection = connection_store.load_connection() if connection_store else None
         self.recovery_preparation = None
+        self.recovery_cleanup = None
         self.recovery_profile = None
         self.recovery_started = False
         self.recovery_attempt = 0
+        self.recovery_retries_left = 2
+        self.recovery_retry_at = None
+        self.recovery_deadline = None
+        self.recovery_watch_at = 0
+        self.recovery_target = None
         self.recovery_state = "IDLE"
         self.recovery_error = None
         self.recovery_chat_recipient = None
@@ -5352,17 +5426,43 @@ class AppCore:
             raise
         self.bridge_process = process
 
-    def begin_connection_recovery(self):
+    def _saved_recovery_target(self):
+        saved = self.saved_connection or {}
+        return tuple(tuple(sorted((saved.get(key) or {}).items())) for key in ("profile", "qrexec"))
+
+    def _recovery_failure(self, reason):
+        self.recovery_error = reason
+        self.recovery_deadline = None
+        recoverable = {"qrexec_forwarder_killed", "qrexec_launch_no_listener", "qrexec_preparation_interrupted",
+                       "qrexec_forwarder_interrupted", "network_unavailable", "network_timeout",
+                       "network_worker_failed", "network_instance_changed", "network_failure"}
+        if (reason in recoverable and (self.saved_connection or {}).get("qrexec")
+                and self.recovery_target == self._saved_recovery_target() and self.recovery_retries_left > 0):
+            self.disconnect_bridge()
+            self.recovery_retry_at = time.monotonic() + (3 - self.recovery_retries_left)
+            self.recovery_retries_left -= 1
+            self.recovery_state = "WAITING"
+        else:
+            self.recovery_state = "NEEDS_ATTENTION"
+
+    def begin_connection_recovery(self, *, automatic=False):
         """Once per GUI start: reuse saved trust without new pairing."""
         if self.recovery_started or self.bridge_state != "DISCONNECTED" or self.local_setup is not None:
+            return
+        if self.recovery_cleanup is not None and self.recovery_cleanup.thread.is_alive():
+            self._recovery_failure("qrexec_preparation_timeout")
             return
         self.recovery_started = True
         self.recovery_error = None
         saved = self.saved_connection
         if not saved or not (saved.get("profile") or saved.get("tunnel")):
             return
+        if not automatic:
+            self.recovery_retries_left = 2
+            self.recovery_target = self._saved_recovery_target()
         self.recovery_attempt += 1
         self.recovery_state = "CONNECTING"
+        self.recovery_deadline = time.monotonic() + 30 if saved.get("qrexec") else None
         self.bridge_error = None
         self.local_setup_error = None
         try:
@@ -5370,12 +5470,12 @@ class AppCore:
                 if saved.get("qrexec"):
                     config = saved["qrexec"]
                     profile = ConnectionProfile(**saved["profile"])
-                    if (self.qrexec_forwarder.running and
+                    if (not automatic and self.qrexec_forwarder.running and
                             (self.qrexec_forwarder.target, self.qrexec_forwarder.port) == (config["target"], config["port"])):
                         self.connect_profile(profile)
                         self.recovery_state = "CONNECTING"
                     else:
-                        self.qrexec_forwarder.stop()  # only our previous owned forwarder
+                        require(self.qrexec_forwarder.stop() is not False, "qrexec_ownership_unverified")
                         self.recovery_state = "PREPARING"
                         self.recovery_profile = profile
                         self.recovery_preparation = SavedForwarderPreparation(config["target"], config["port"])
@@ -5386,41 +5486,76 @@ class AppCore:
                 config = saved["tunnel"]
                 self.begin_local_setup(config["tunnel_id"], config["api_key"])
                 self.recovery_state = "CONNECTING"
+            if saved.get("qrexec"):
+                self.recovery_deadline = time.monotonic() + 30
         except (ProbeError, OSError) as exc:
-            self.recovery_state = "NEEDS_ATTENTION"
-            self.recovery_error = str(exc) if isinstance(exc, ProbeError) else "network_unavailable"
+            self._recovery_failure(str(exc) if isinstance(exc, ProbeError) else "network_unavailable")
 
     def _pump_connection_recovery(self):
+        now = time.monotonic()
+        if self.recovery_cleanup is not None and not self.recovery_cleanup.thread.is_alive():
+            self.recovery_cleanup = None
+        if self.recovery_state == "WAITING":
+            if self.recovery_target != self._saved_recovery_target():
+                self.recovery_retry_at = None
+                self._recovery_failure("saved_connection_mismatch")
+            elif self.recovery_retry_at is not None and now >= self.recovery_retry_at:
+                self.recovery_retry_at = None
+                self.recovery_started = False
+                self.begin_connection_recovery(automatic=True)
+            return
         preparation = self.recovery_preparation
         if preparation:
+            if preparation.cancel.is_set() and not preparation.thread.is_alive():
+                self.recovery_preparation, self.recovery_profile = None, None
+                return
             result = preparation.take()
             if result:
                 self.recovery_preparation = None
                 profile, self.recovery_profile = self.recovery_profile, None
                 kind, value = result
                 if kind == "error":
-                    self.recovery_state, self.recovery_error = "NEEDS_ATTENTION", value
+                    self._recovery_failure(value)
                 else:
-                    self.qrexec_forwarder.stop()
+                    if self.qrexec_forwarder.stop() is False:
+                        value.stop()
+                        self._recovery_failure("qrexec_ownership_unverified")
+                        return
                     self.qrexec_forwarder = value
                     try:
+                        deadline = self.recovery_deadline
                         self.connect_profile(profile)
                         self.recovery_state = "CONNECTING"
+                        self.recovery_deadline = deadline or time.monotonic() + 30
                     except (ProbeError, OSError) as exc:
                         value.stop()
-                        self.recovery_state, self.recovery_error = "NEEDS_ATTENTION", str(exc)
+                        self._recovery_failure(str(exc))
+            elif self.recovery_deadline is not None and now >= self.recovery_deadline:
+                preparation.close()
+                self._recovery_failure("qrexec_preparation_timeout")
+                return
         if self.recovery_state == "CONNECTING":
             if self.bridge_state == "CONNECTED":
                 if self.bridge_profile.mode == "LOCAL" and self.local_setup_state != "CONNECTED":
                     return  # Local restoration includes the validated tunnel, not just HTTP.
                 self.recovery_state = "RESTORED"
+                self.recovery_deadline = None
+                self.recovery_watch_at = now + 1
                 if self.bridge_profile.mode == "REMOTE":
                     self.recovery_chat_recipient = self.bridge_profile.recipient
                 if self.bridge_profile.mode == "REMOTE" and self.remote_tunnel_probe is None:
                     self.begin_tunnel_probe()
             elif self.bridge_state == "BLOCKED" or self.local_setup_state == "FAILED":
-                self.recovery_state = "NEEDS_ATTENTION"
-                self.recovery_error = self.bridge_error or self.local_setup_error
+                self._recovery_failure(self.bridge_error or self.local_setup_error)
+            elif self.recovery_deadline is not None and now >= self.recovery_deadline:
+                self._recovery_failure("network_timeout")
+        elif (self.recovery_state == "RESTORED" and (self.saved_connection or {}).get("qrexec")
+              and self.recovery_target == self._saved_recovery_target() and now >= self.recovery_watch_at):
+            self.recovery_watch_at = now + 1
+            if self.bridge_state in {"RETRYING", "BLOCKED"}:
+                self._recovery_failure(self.bridge_error or "network_unavailable")
+            elif not self.qrexec_forwarder.running:
+                self._recovery_failure("qrexec_forwarder_interrupted")
 
     def _pump_recovered_chat_binding(self):
         """One startup decision, using fresh authenticated server state only."""
@@ -5446,6 +5581,7 @@ class AppCore:
 
     def retry_connection_recovery(self):
         require(self.recovery_preparation is None and self.bridge_state not in {"CONNECTING", "PAIRING"}, "setup_busy")
+        require(self.recovery_cleanup is None or not self.recovery_cleanup.thread.is_alive(), "setup_busy")
         require(self.saved_connection and (self.saved_connection.get("profile")
                 or self.saved_connection.get("tunnel")), "no_saved_remote_connection")
         self.disconnect_bridge()
@@ -5453,6 +5589,8 @@ class AppCore:
         self.begin_connection_recovery()
 
     def connect_saved_bridge(self):
+        require(self.recovery_preparation is None and (self.recovery_cleanup is None
+                or not self.recovery_cleanup.thread.is_alive()), "setup_busy")
         if self.connection_store is not None:
             # A claim may have been saved before its confirm reply was lost.
             self.saved_connection = self.connection_store.load_connection()
@@ -5469,12 +5607,15 @@ class AppCore:
         self.connect_profile(ConnectionProfile(**self.saved_connection["profile"]))
 
     def disconnect_bridge(self):
+        self.recovery_retry_at = None
+        self.recovery_deadline = None
         self.recovery_chat_recipient = None
         self.recovery_profile = None
         if self.recovery_preparation is not None:
             self.recovery_preparation.close()
+            self.recovery_cleanup = self.recovery_preparation
             self.recovery_preparation = None
-        if self.recovery_state in {"PREPARING", "CONNECTING"}:
+        if self.recovery_state in {"PREPARING", "CONNECTING", "WAITING", "RESTORED"}:
             self.recovery_state = "STOPPED"
         if self.local_setup is not None:
             self.local_setup.close()
@@ -5555,6 +5696,8 @@ class AppCore:
         """M9: start Main's own forwarder only. The dom0 policy line is produced for
         the one-time MANUAL entry; binding alone is never treated as success."""
         require(self.connection_store is not None, "connection_store_required")
+        require(self.recovery_preparation is None and (self.recovery_cleanup is None
+                or not self.recovery_cleanup.thread.is_alive()), "setup_busy")
         target = validate_qube_name(target)
         self.qrexec_forwarder.start(target, port)
         self.qrexec = {"target": target, "port": int(port)}
@@ -5564,7 +5707,13 @@ class AppCore:
         self.saved_connection = self.connection_store.load_connection()
 
     def stop_qrexec_forwarder(self):
-        self.qrexec_forwarder.stop()
+        if self.recovery_preparation is not None:
+            self.recovery_preparation.close()
+            self.recovery_cleanup = self.recovery_preparation
+            self.recovery_preparation, self.recovery_profile = None, None
+        require(self.qrexec_forwarder.stop() is not False, "qrexec_ownership_unverified")
+        self.recovery_retry_at, self.recovery_deadline = None, None
+        self.recovery_state = "STOPPED"
         self._qrexec_note("qvm-connect-tcp stop", "stopped", None,
                           tr("Nur die verifizierte eigene Gruppe wurde beendet; fremde Prozesse "
                           "bleiben unberührt"), tr("Bei Bedarf erneut prüfen"))
@@ -5595,7 +5744,7 @@ class AppCore:
         require(type(port) is int and 1 <= port <= 65535, "invalid_port")
         forwarder = self.qrexec_forwarder
         if forwarder.running and (forwarder.target, forwarder.port) != (target, port):
-            forwarder.stop()
+            require(forwarder.stop() is not False, "qrexec_ownership_unverified")
         if not forwarder.running:
             try:
                 self.start_qrexec_forwarder(target, port)  # idempotent; persists config
@@ -6852,6 +7001,11 @@ def recovery_attempt_status(core):
     phase = phases.get(core.recovery_state, tr("noch offen"))
     if core.recovery_state == "CONNECTING" and core.bridge_state == "RETRYING":
         phase = tr("Verbindung unterbrochen; erneuter Verbindungsversuch läuft")
+    if core.recovery_state == "WAITING":
+        seconds = max(0, int((core.recovery_retry_at or 0) - time.monotonic() + .999))
+        phase = tr("Erneuter Versuch in %ds · eigene Weiterleitung wird neu aufgebaut") % seconds
+    elif core.recovery_state == "NEEDS_ATTENTION" and core.recovery_retries_left == 0:
+        phase += " · " + tr("Automatische Wiederaufnahme beendet · Bridge im Ziel prüfen oder Einrichtung öffnen")
     return tr("Wiederherstellung · Versuch %d: %s") % (core.recovery_attempt, phase)
 
 
@@ -7484,6 +7638,11 @@ class ConnectionDialog:
             "qrexec_tool_missing": tr('qvm-connect-tcp fehlt. Die Qubes-Werkzeuge werden im Quell-Qube benötigt.'),
             "qrexec_port_conflict": tr('Der lokale Port ist durch einen fremden Prozess belegt. Belegung klären oder einen anderen Port wählen; AITL übernimmt oder beendet den Prozess nicht.'),
             "qrexec_forwarder_failed": tr('Die Weiterleitung wurde beendet. Ziel-Qube, Bridge-Start und Qrexec-Freigabe prüfen; die Ursache ist noch nicht belegt.'),
+            "qrexec_ownership_unverified": tr("Prozesseigentümerschaft nicht sicher bestätigt. Nichts wird beendet oder übernommen. Port selbst prüfen oder eine bekannte HTTPS-Bridge über die Einrichtung verwenden."),
+            "qrexec_forwarder_killed": tr("Der Forwarder wurde abgebrochen (Killed/SIGKILL möglich); die Ursache ist nicht belegt. Wiederaufnahme wird begrenzt versucht."),
+            "qrexec_forwarder_interrupted": tr("Die eigene Weiterleitung oder ihre Vorbereitung wurde unterbrochen. Wiederaufnahme wird begrenzt versucht."),
+            "qrexec_preparation_interrupted": tr("Die eigene Weiterleitung oder ihre Vorbereitung wurde unterbrochen. Wiederaufnahme wird begrenzt versucht."),
+            "qrexec_preparation_timeout": tr("Die Vorbereitung hat das Zeitlimit überschritten. Kein paralleler Start; Bereinigung abwarten und Bridge im Ziel prüfen."),
             "qrexec_listener_timeout": tr('Die Weiterleitung ist noch nicht erreichbar. Ziel und Port prüfen; Einzelheiten stehen in der Diagnose.'),
             "qrexec_launch_no_listener": tr('Die Weiterleitung hat keinen Listener. Prüfe die Portbelegung und die Diagnose.'),
             "qrexec_target_unreachable": tr('Die Bridge im Ziel-Qube antwortet nicht. Läuft sie dort? Prüfe anschließend die Qrexec-Freigabe; welche Ursache vorliegt, ist noch offen.'),
@@ -8095,7 +8254,7 @@ class ConnectionDialog:
         if self.core.bridge_state == "CONNECTED":
             return tr("Die gespeicherte Bridge ist bereits authentifiziert verbunden.")
         if (self.core.bridge_state in {"CONNECTING", "PAIRING", "RETRYING"}
-                or self.core.recovery_preparation is not None):
+                or self.core.recovery_preparation is not None or self.core.recovery_state == "WAITING"):
             return (tr("Die Bridge-Verbindung wird bereits aufgebaut; Ergebnis abwarten. "
                     "Der Assistent fährt bei Erfolg automatisch fort."))
         self.refresh_saved()
@@ -8198,7 +8357,10 @@ class ConnectionDialog:
                         self.show_binding()
                     except ProbeError:
                         pass
-        busy = self.busy or self.pairing() or bridge.state in {"PAIRING", "CONNECTING"} or self.core.local_setup is not None or self.core.local_pending is not None
+        busy = (self.busy or self.pairing() or bridge.state in {"PAIRING", "CONNECTING"}
+                or self.core.local_setup is not None or self.core.local_pending is not None
+                or self.core.recovery_preparation is not None
+                or self.core.recovery_cleanup is not None and self.core.recovery_cleanup.thread.is_alive())
         for key in ("tunnel_id", "api_key"):
             self.entries[key].configure(state="disabled" if busy and local else "normal")
         for key in ("remote_tunnel_id", "remote_runtime_key", "qrexec_tunnel_id", "qrexec_runtime_key"):
@@ -10001,7 +10163,7 @@ class ReviewUI:
         self.ai_status.set(local_setup_summary(self.core) if self.core.local_setup_state != "IDLE" else
                            tr("Gespeicherte Bridge\nWeiterleitung wird vorbereitet") if self.core.recovery_state == "PREPARING" else
                            tr("Gespeicherte Bridge\nWiederherstellung prüfen") if self.core.recovery_state == "NEEDS_ATTENTION" else connection_summary(bridge))
-        if self.core.recovery_attempt and self.core.recovery_state in {"PREPARING", "CONNECTING", "NEEDS_ATTENTION"}:
+        if self.core.recovery_attempt and self.core.recovery_state in {"PREPARING", "CONNECTING", "WAITING", "NEEDS_ATTENTION"}:
             self.ai_status.set(recovery_attempt_status(self.core))
         chat_code, chat_status, can_copy = chat_binding_presentation(bridge)
         self.chat_code.set(chat_code)
@@ -10712,7 +10874,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.25"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.26"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime
