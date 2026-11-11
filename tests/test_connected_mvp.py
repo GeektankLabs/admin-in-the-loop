@@ -4491,7 +4491,7 @@ class QrexecConfigPersistenceTests(unittest.TestCase):
                 profile = a.ConnectionProfile("https://127.0.0.1:%d" % port, "0" * 64,
                                               "0" * 32, "0" * 32, "0" * 64)
                 self.store.save_connection(profile, None, restored.qrexec)
-                forwarder = mock.Mock(running=False)
+                forwarder = mock.Mock(running=False, target="target-vm", port=port, remote_port=port)
                 restored.qrexec_forwarder = forwarder
                 restored.saved_connection = None
                 with mock.patch.object(restored, "connect_profile") as connect:
@@ -4885,6 +4885,50 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         self.assertTrue(result["reachable"])
         self.assertEqual(result["phase"], "bridge_reachable")
         self.assertEqual(result["observed_pin"], self.bridge_pin)
+
+    def test_occupied_port_recovers_through_owned_alternate_without_changing_trust(self):
+        core = self.make_core()
+        profile = core.pair_remote(self.bridge.url, self.bridge_pin, self.bridge.code)
+        core.close()
+        core.connection_store.save_connection(profile, qrexec={"target": "fwdqube", "port": self.bridge_port})
+        before = core.connection_store.load_connection()
+        recovered = a.AppCore(connection_store=core.connection_store)
+        self.addCleanup(recovered.close)
+        def restored():
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                recovered.pump()
+                if recovered.recovery_state == "RESTORED" and recovered.remote_tunnel is not None:
+                    return
+                time.sleep(.01)
+            self.fail("alternate recovery: " + str(recovered.recovery_error or recovered.bridge_error))
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
+            recovered.begin_connection_recovery()
+            restored()
+            forwarder = recovered.qrexec_forwarder
+            self.assertNotEqual(forwarder.port, self.bridge_port)
+            self.assertEqual(forwarder.remote_port, self.bridge_port)
+            self.assertEqual(recovered.bridge_profile.forward_port, forwarder.port)
+            self.assertEqual(recovered.bridge_profile.recipient, profile.recipient)
+            self.assertEqual(recovered.bridge_profile.token, profile.token)
+            self.assertEqual(recovered.connection_store.load_connection(), before)
+            pgid = forwarder.pgid
+            recovered.retry_connection_recovery()
+            restored()
+            self.assertEqual(recovered.qrexec_forwarder.pgid, pgid)
+            result = recovered.verify_qrexec_connection("fwdqube", self.bridge_port)
+            self.assertTrue(result["reachable"])
+            self.assertEqual(result["observed_pin"], self.bridge_pin)
+            self.assertEqual(recovered.hello_bridge(profile.url), "already_paired")
+            self.assertEqual(recovered.qrexec_forwarder.pgid, pgid)
+            wrong_pin = replace(recovered.bridge_profile, pin="0"*64)
+            with self.assertRaisesRegex(a.TransportError, "tls_pin_mismatch"):
+                a.BridgeHTTP(wrong_pin).request("GET", "/v1/status")
+        # The pre-existing canonical listener is still alive and accessible;
+        # only the new alternate listener belongs to the recovering controller.
+        self.assertIsNone(self.bridge.process.poll())
+        self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/status")["state"], "PAIRED")
+        self.assertEqual(recovered.connection_store.load_connection(), before)
 
     def test_deny_down_plain_are_evidenced_separately_not_blanket_policy(self):
         text = a.ConnectionDialog.error_text

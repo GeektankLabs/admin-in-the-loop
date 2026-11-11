@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.27"
+APP_VERSION = "0.9.28"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.27"
+APP_VERSION = "0.9.28"
 
 
 def _load_bridge_component(namespace=None):
@@ -1561,6 +1561,7 @@ UI_ENGLISH = {
     'noch offen': 'pending',
     'Verbindung unterbrochen; erneuter Verbindungsversuch läuft': 'Connection interrupted; reconnecting',
     'Wiederherstellung · Versuch %d: %s': 'Recovery · attempt %d: %s',
+    'Lokaler Ausweichport %d': 'Alternate local port %d',
     'Konkreter Fehlergrund nicht verfügbar. Keine Verbindung bestätigt; Einrichtung/Startanleitung öffnen.': 'Specific failure reason unavailable. No connection confirmed; open setup/startup instructions.',
     'Gespeicherte Einrichtung gefunden. Diese Angaben allein bestätigen keine laufende oder erreichbare Bridge. Der Fehlergrund steht oben; die Einrichtung/Startanleitung verwendet die gespeicherten Werte.': 'Saved setup found. These values alone do not confirm a running or reachable bridge. The failure reason is shown above; setup/startup instructions use the saved values.',
     'Der lokale Port ist bereits belegt. Der vorhandene Listener wird weder übernommen noch beendet. Portbelegung prüfen; eine neue Kopplung ist dafür nicht nötig.': 'The local port is already in use. The existing listener is neither adopted nor stopped. Check port occupancy; new pairing is not required.',
@@ -3482,6 +3483,7 @@ class ConnectionProfile:
     controller_id: str
     token: str = field(repr=False)
     mode: str = "REMOTE"
+    forward_port: int | None = field(default=None, repr=False, compare=False)
 
     @property
     def recipient(self):
@@ -3536,6 +3538,10 @@ def check_profile(profile):
         raise ProbeError("invalid_bridge_url") from None
     require(port is not None and 1 <= port <= 65535, "explicit_bridge_port_required")
     require(profile.mode in {"LOCAL", "REMOTE"}, "invalid_connection_mode")
+    if profile.forward_port is not None:
+        require(profile.mode == "REMOTE" and parsed.hostname == "127.0.0.1"
+                and type(profile.forward_port) is int and 1 <= profile.forward_port <= 65535,
+                "invalid_forward_port")
     if profile.mode == "LOCAL":
         require(parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and profile.pin is None,
                 "local_loopback_required")
@@ -3548,7 +3554,7 @@ def check_profile(profile):
     return parsed
 
 
-def bridge_hello(url, timeout=6):
+def bridge_hello(url, timeout=6, *, forward_port=None):
     """M9 Ergänzung (comment_e6630467): the explicit code-free setup contact. Same
     trust level as the reachability probe (observation only; hello authorises
     neither pairing, trust, nor commands). The machine-readable contract is strict:
@@ -3557,6 +3563,8 @@ def bridge_hello(url, timeout=6):
     carries a code) is an error, never success. Never returns a secret."""
     parsed = urlsplit(url)
     require(parsed.scheme == "https" and parsed.hostname and parsed.port, "invalid_bridge_url")
+    require(forward_port is None or parsed.hostname == "127.0.0.1" and type(forward_port) is int
+            and 1 <= forward_port <= 65535, "invalid_forward_port")
     body = b'{"version": 1}'
     head = ("POST /v1/pair/hello HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\n"
             "Content-Length: %d\r\nConnection: close\r\n\r\n"
@@ -3565,7 +3573,7 @@ def bridge_hello(url, timeout=6):
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     try:
-        with socket.create_connection((parsed.hostname, parsed.port), timeout=timeout) as raw:
+        with socket.create_connection((parsed.hostname, forward_port or parsed.port), timeout=timeout) as raw:
             raw.settimeout(timeout)
             with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
                 tls.sendall(head + body)
@@ -3644,16 +3652,24 @@ def check_certificate(der, host, pin):
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, port, pin, **kwargs):
+    def __init__(self, host, port, pin, *, forward_port=None, **kwargs):
+        require(forward_port is None or host == "127.0.0.1" and type(forward_port) is int
+                and 1 <= forward_port <= 65535, "invalid_forward_port")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         super().__init__(host, port, context=context, **kwargs)
         self.pin = pin
+        self.forward_port = forward_port
 
     def connect(self):
-        super().connect()
+        canonical_port = self.port
+        try:
+            self.port = self.forward_port or canonical_port
+            super().connect()
+        finally:
+            self.port = canonical_port  # HTTP Host and the profile identity stay canonical.
         try:
             self.valid_until = check_certificate(self.sock.getpeercert(binary_form=True), self.host, self.pin)
         except BaseException:
@@ -3686,6 +3702,8 @@ class BridgeHTTP:
         kwargs = {"timeout": 5}
         if conn_type is PinnedHTTPSConnection:
             kwargs["pin"] = self.profile.pin
+            if self.profile.forward_port is not None:
+                kwargs["forward_port"] = self.profile.forward_port
         conn = conn_type(self.address.hostname, self.address.port, **kwargs)
         with self.lock:
             self.active = conn
@@ -3899,7 +3917,7 @@ def qrexec_first_start_command(port=8443):
     return "python3 ./admin_in_the_loop.py --bridge" + (" --port %d" % port if port != 8443 else "")
 
 
-def bridge_reachability(url, timeout=6):
+def bridge_reachability(url, timeout=6, *, forward_port=None):
     """M9 Folgeanpassung: unauthenticated reachability proof through the forwarder –
     real TCP connect + TLS handshake + expected denial of the authenticated endpoint.
     Returns the observed SPKI fingerprint for the human's INDEPENDENT comparison
@@ -3907,11 +3925,13 @@ def bridge_reachability(url, timeout=6):
     pairing, and no credential is ever sent here."""
     parsed = urlsplit(url)
     require(parsed.scheme == "https" and parsed.hostname and parsed.port, "invalid_bridge_url")
+    require(forward_port is None or parsed.hostname == "127.0.0.1" and type(forward_port) is int
+            and 1 <= forward_port <= 65535, "invalid_forward_port")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE  # observation only; pinning stays a human decision
     try:
-        with socket.create_connection((parsed.hostname, parsed.port), timeout=timeout) as raw:
+        with socket.create_connection((parsed.hostname, forward_port or parsed.port), timeout=timeout) as raw:
             raw.settimeout(timeout)
             try:
                 with context.wrap_socket(raw, server_hostname=parsed.hostname) as tls:
@@ -3957,6 +3977,7 @@ class QrexecForwarder:
         self.argv = None
         self.target = None
         self.port = None
+        self.remote_port = None
         self.launch_log = None
         self.last_result = None
         self.identities = {}
@@ -4082,13 +4103,16 @@ class QrexecForwarder:
     def _clear(self):
         self.process, self.pgid, self.argv = None, None, None
         self.target, self.port = None, None
+        self.remote_port = None
         self.identities.clear()
 
-    def start(self, target, port=8443):
+    def start(self, target, port=8443, *, remote_port=None):
         target = validate_qube_name(target)
         port = int(port)
+        remote_port = port if remote_port is None else remote_port
         require(1 <= port <= 65535, "invalid_port")
-        if self.running and (self.target, self.port) == (target, port):
+        require(type(remote_port) is int and 1 <= remote_port <= 65535, "invalid_port")
+        if self.running and (self.target, self.port, self.remote_port) == (target, port, remote_port):
             self._result("already-running", None, tr("eigene Gruppe und Listener aktiv"),
                          tr("Verbindung prüfen"))
             return
@@ -4105,7 +4129,7 @@ class QrexecForwarder:
             directory = Path(tempfile.mkdtemp(prefix="aitl-qrexec-"))
             os.chmod(directory, 0o700)
             self.launch_log = directory / "launch.log"
-        argv = [tool, "%d:%s:%d" % (port, target, port)]
+        argv = [tool, "%d:%s:%d" % (port, target, remote_port)]
         handle = os.open(self.launch_log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
                          0o600)
         try:
@@ -4114,6 +4138,7 @@ class QrexecForwarder:
         finally:
             os.close(handle)
         self.tool, self.argv, self.target, self.port = tool, argv, target, port
+        self.remote_port = remote_port
         self.pgid = os.getpgid(self.process.pid)
         identity = self._process_identity(self.process.pid)
         require(identity is not None, "qrexec_ownership_unverified")
@@ -5089,7 +5114,18 @@ class SavedForwarderPreparation:
         forwarder = QrexecForwarder()
         transferred = False
         try:
-            forwarder.start(target, port)
+            try:
+                forwarder.start(target, port)
+            except ProbeError as exc:
+                if str(exc) != "qrexec_port_conflict" or forwarder.pgid is not None:
+                    raise
+                # Do not adopt or stop the occupied listener. Try one fresh local
+                # port, forwarding to the SAME target/remote port. A bind race
+                # fails normally; this is not a port-hunting loop.
+                with socket.socket() as candidate:
+                    candidate.bind(("127.0.0.1", 0))
+                    local_port = candidate.getsockname()[1]
+                forwarder.start(target, local_port, remote_port=port)
             with self.lock:
                 if not self.cancel.is_set():
                     self.result = ("ready", forwarder)
@@ -5484,7 +5520,9 @@ class AppCore:
                     config = saved["qrexec"]
                     profile = ConnectionProfile(**saved["profile"])
                     if (not automatic and self.qrexec_forwarder.running and
-                            (self.qrexec_forwarder.target, self.qrexec_forwarder.port) == (config["target"], config["port"])):
+                            (self.qrexec_forwarder.target, self.qrexec_forwarder.remote_port) == (config["target"], config["port"])):
+                        profile = replace(profile, forward_port=self.qrexec_forwarder.port
+                                          if self.qrexec_forwarder.port != config["port"] else None)
                         self.connect_profile(profile)
                         self.recovery_state = "CONNECTING"
                     else:
@@ -5537,6 +5575,8 @@ class AppCore:
                     self.qrexec_forwarder = value
                     try:
                         deadline = self.recovery_deadline
+                        profile = replace(profile, forward_port=value.port
+                                          if value.port != urlsplit(profile.url).port else None)
                         self.connect_profile(profile)
                         self.recovery_state = "CONNECTING"
                         self.recovery_deadline = deadline or time.monotonic() + 30
@@ -5609,6 +5649,7 @@ class AppCore:
             self.saved_connection = self.connection_store.load_connection()
         require(self.saved_connection is not None and self.saved_connection["profile"] is not None,
                 "no_saved_remote_connection")
+        profile = ConnectionProfile(**self.saved_connection["profile"])
         qrexec = self.saved_connection.get("qrexec")
         if qrexec:
             # M9 restart recovery: restore Main's OWN forwarder from the saved
@@ -5617,7 +5658,11 @@ class AppCore:
             self.qrexec = dict(qrexec)
             if not self.qrexec_forwarder.running:
                 self.qrexec_forwarder.start(qrexec["target"], qrexec["port"])
-        self.connect_profile(ConnectionProfile(**self.saved_connection["profile"]))
+            require((self.qrexec_forwarder.target, self.qrexec_forwarder.remote_port)
+                    == (qrexec["target"], qrexec["port"]), "saved_connection_mismatch")
+            profile = replace(profile, forward_port=self.qrexec_forwarder.port
+                              if self.qrexec_forwarder.port != qrexec["port"] else None)
+        self.connect_profile(profile)
 
     def disconnect_bridge(self):
         self.recovery_retry_at = None
@@ -5756,7 +5801,7 @@ class AppCore:
         target = validate_qube_name(target)
         require(type(port) is int and 1 <= port <= 65535, "invalid_port")
         forwarder = self.qrexec_forwarder
-        if forwarder.running and (forwarder.target, forwarder.port) != (target, port):
+        if forwarder.running and (forwarder.target, forwarder.remote_port) != (target, port):
             require(forwarder.stop() is not False, "qrexec_ownership_unverified")
         if not forwarder.running:
             try:
@@ -5775,7 +5820,8 @@ class AppCore:
                         "diagnostic": detail or None}
         url = "https://127.0.0.1:%d" % port
         try:
-            observed = bridge_reachability(url)
+            observed = (bridge_reachability(url, forward_port=forwarder.port)
+                        if forwarder.port != port else bridge_reachability(url))
         except ProbeError as exc:
             self._qrexec_note("reachability-probe", str(exc), None,
                               tr("TLS-Handshake/Erwartung an %s fehlgeschlagen (nur lokaler Besitz "
@@ -5803,7 +5849,13 @@ class AppCore:
         """M9 Ergänzung: explicit code-free setup hello; authorises nothing, returns
         only the strict contract state pairing_required/already_paired."""
         try:
-            state = bridge_hello(url)
+            parsed = urlsplit(url)
+            qrexec = (self.saved_connection or {}).get("qrexec")
+            forwarder = self.qrexec_forwarder
+            routed = (qrexec and parsed.hostname == "127.0.0.1" and parsed.port == qrexec["port"]
+                      and (forwarder.target, forwarder.remote_port) == (qrexec["target"], qrexec["port"])
+                      and forwarder.running and forwarder.port != parsed.port)
+            state = bridge_hello(url, forward_port=forwarder.port) if routed else bridge_hello(url)
         except ProbeError as exc:
             self._qrexec_note("pairing-hello", str(exc), None,
                               "Hallo-Schritt fehlgeschlagen (Contract/Cooldown, Details Phase)",
@@ -7029,6 +7081,8 @@ def recovery_attempt_status(core):
     if core.recovery_state in {"NEEDS_ATTENTION", "WAITING"}:
         reason = core.recovery_error or core.bridge_error or core.local_setup_error
         phase += " [%s]" % recovery_error_code(reason)
+    if core.bridge_state in {"CONNECTING", "CONNECTED"} and core.bridge_profile and core.bridge_profile.forward_port:
+        phase += " · " + tr("Lokaler Ausweichport %d") % core.bridge_profile.forward_port
     return tr("Wiederherstellung · Versuch %d: %s") % (core.recovery_attempt, phase)
 
 
@@ -10190,6 +10244,8 @@ class ReviewUI:
                            tr("Gespeicherte Bridge\nWiederherstellung prüfen") if self.core.recovery_state == "NEEDS_ATTENTION" else connection_summary(bridge))
         if self.core.recovery_attempt and self.core.recovery_state in {"PREPARING", "CONNECTING", "WAITING", "NEEDS_ATTENTION"}:
             self.ai_status.set(recovery_attempt_status(self.core))
+        if bridge.state == "CONNECTED" and self.core.bridge_profile and self.core.bridge_profile.forward_port:
+            self.ai_status.set(self.ai_status.get() + "\n" + tr("Lokaler Ausweichport %d") % self.core.bridge_profile.forward_port)
         chat_code, chat_status, can_copy = chat_binding_presentation(bridge)
         self.chat_code.set(chat_code)
         if self.core.chat_binding_notice:
@@ -10899,7 +10955,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.27"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.28"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime

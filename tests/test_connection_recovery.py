@@ -137,12 +137,34 @@ class RecoveryTests(unittest.TestCase):
             disconnect.assert_not_called()
         self.assertEqual(self.core.recovery_attempt, 0)
 
+    def test_port_fallback_is_single_and_ownership_failure_does_not_trigger_it(self):
+        for reason, calls in (("qrexec_port_conflict", 2), ("qrexec_ownership_unverified", 1)):
+            with mock.patch.object(a.QrexecForwarder, "start", side_effect=a.ProbeError(reason)) as start:
+                preparation = a.SavedForwarderPreparation("ai-bridge", 8443)
+                self.addCleanup(preparation.close)
+                preparation.thread.join(2)
+                self.assertFalse(preparation.thread.is_alive())
+                self.assertEqual(preparation.take(), ("error", reason))
+                self.assertEqual(start.call_count, calls)
+                if calls == 2:
+                    self.assertEqual(start.call_args.kwargs["remote_port"], 8443)
+
+    def test_alternate_route_is_only_allowed_for_pinned_remote_loopback(self):
+        profile = a.ConnectionProfile("https://127.0.0.1:8443", "a"*64, "b"*32, "c"*32, "d"*64)
+        for port in (0, 65536, True, "8444"):
+            with self.assertRaisesRegex(a.ProbeError, "invalid_forward_port"):
+                a.check_profile(replace(profile, forward_port=port))
+        with self.assertRaisesRegex(a.ProbeError, "invalid_forward_port"):
+            a.check_profile(replace(profile, url="https://example.com:8443", forward_port=8444))
+        with self.assertRaisesRegex(a.ProbeError, "invalid_forward_port"):
+            a.check_profile(replace(profile, mode="LOCAL", url="http://127.0.0.1:8443", pin=None, forward_port=8444))
+
     def test_killed_forwarder_recovery_is_bounded_and_can_succeed(self):
         self.recovery_dialog()
         self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
         created = []
         def forwarder():
-            item = mock.Mock(running=True, target="ai-bridge", port=8443)
+            item = mock.Mock(running=True, target="ai-bridge", port=8443, remote_port=8443)
             item.stop.return_value = True
             if not created:
                 item.start.side_effect = a.ProbeError("qrexec_forwarder_killed")
@@ -254,7 +276,7 @@ class RecoveryTests(unittest.TestCase):
     def test_stuck_bridge_connection_has_deadline_and_manual_stop_cancels_recovery(self):
         self.recovery_dialog()
         self.core.saved_connection["qrexec"] = {"target": "ai-bridge", "port": 8443}
-        self.core.qrexec_forwarder = mock.Mock(running=True, target="ai-bridge", port=8443)
+        self.core.qrexec_forwarder = mock.Mock(running=True, target="ai-bridge", port=8443, remote_port=8443)
         self.core.qrexec_forwarder.stop.return_value = True
         def connecting(profile):
             self.core.bridge_profile, self.core.bridge_state = profile, "CONNECTING"
@@ -548,7 +570,7 @@ class RecoveryTests(unittest.TestCase):
         profile = a.ConnectionProfile("https://127.0.0.1:8443", "a"*64, "b"*32, "c"*32, "d"*64)
         self.core.saved_connection = {"profile": vars(profile), "tunnel": None,
                                       "qrexec": {"target": "ai-bridge", "port": 8443}}
-        forwarder = self.core.qrexec_forwarder = mock.Mock(running=True, target="ai-bridge", port=8443)
+        forwarder = self.core.qrexec_forwarder = mock.Mock(running=True, target="ai-bridge", port=8443, remote_port=8443)
         with mock.patch.object(a, "SavedForwarderPreparation") as preparation, \
                 mock.patch.object(self.core, "connect_profile") as connect:
             self.core.begin_connection_recovery()
@@ -563,7 +585,7 @@ class RecoveryTests(unittest.TestCase):
         profile = a.ConnectionProfile("https://127.0.0.1:8443", "a"*64, "b"*32, "c"*32, "d"*64)
         self.core.saved_connection = {"profile": vars(profile), "tunnel": None,
                                       "qrexec": {"target": "ai-bridge", "port": 8443}}
-        forwarder = mock.Mock()
+        forwarder = mock.Mock(target="ai-bridge", port=8443, remote_port=8443)
         with mock.patch.object(a, "QrexecForwarder", return_value=forwarder), \
                 mock.patch.object(self.core, "connect_profile") as connect:
             self.core.begin_connection_recovery()

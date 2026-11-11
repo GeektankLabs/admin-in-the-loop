@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.28 — Sicherer lokaler Ausweichport bei Qubes-Portkonflikten
+
+- Bei `qrexec_port_conflict` versucht die gespeicherte Qubes-Wiederherstellung
+  einmal einen freien lokalen Port. Ziel-Qube und Remote-Port bleiben unverändert;
+  der vorhandene Listener wird weder übernommen noch beendet. Bei unsicherer
+  Prozesseigentümerschaft gibt es diesen Fallback nicht.
+- Der alternative Port gilt nur für die TCP-Verbindung dieser Sitzung. Gespeicherte
+  URL, HTTP-Host, TLS-Hostname und Pin sowie Controller-/Chatbindung bleiben gleich.
+  Die bestehenden TLS-Prüfungen erfolgen weiterhin vor dem Senden von Zugangsdaten.
+- Ein gesunder eigener Ausweich-Forwarder wird bei erneutem Retry/Prüfen wiederverwendet.
+  Ein zweiter Portkonflikt beendet den Fallback, statt beliebig weitere Ports zu suchen.
+- UI und Bridge melden 0.9.28. Die native Qubes-Prüfung bleibt ausstehend;
+  die konkrete Identität des belegenden Prozesses wird nicht behauptet.
+
 ## 0.9.27 — Dual-Stack-Listener und konkrete Recovery-Fehler
 
 - Eigene IPv6-/Dual-Stack-Listener werden anhand ihres Socket-Inodes und derselben
