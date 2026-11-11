@@ -103,6 +103,29 @@ class RecoveryTests(unittest.TestCase):
             self.assertNotEqual(*notices)
         dialog.recovery_panel.grid.assert_called()
 
+    def test_failure_reason_is_primary_and_precedes_saved_setup_guidance_in_both_languages(self):
+        dialog = self.recovery_dialog()
+        self.core.recovery_attempt, self.core.recovery_state = 1, "NEEDS_ATTENTION"
+        self.core.recovery_error = "qrexec_port_conflict"
+        for language, guidance in (("de", "Gespeicherte Einrichtung gefunden"), ("en", "Saved setup found")):
+            with mock.patch.object(a, "UI_LANGUAGE", language):
+                dialog.render()
+                notice = dialog.recovery_notice.set.call_args.args[0]
+                self.assertIn("[qrexec_port_conflict]", notice.splitlines()[0])
+                self.assertLess(notice.index(a.ConnectionDialog.error_text("qrexec_port_conflict")),
+                                notice.index(guidance))
+                self.assertNotIn("If it is running", notice)
+        self.core.recovery_error = None
+        dialog.render()
+        notice = dialog.recovery_notice.set.call_args.args[0]
+        self.assertIn("[recovery_reason_unavailable]", notice.splitlines()[0])
+        self.assertIn("Konkreter Fehlergrund nicht verfügbar", notice)
+        self.core.recovery_error = "unexpected secret text\nTOKEN=not-a-reason-code"
+        dialog.render()
+        notice = dialog.recovery_notice.set.call_args.args[0]
+        self.assertNotIn("TOKEN", notice)
+        self.assertIn("[recovery_reason_unavailable]", notice)
+
     def test_retry_requires_saved_configuration_and_does_not_interrupt_connecting(self):
         with self.assertRaisesRegex(a.ProbeError, "no_saved_remote_connection"):
             self.core.retry_connection_recovery()

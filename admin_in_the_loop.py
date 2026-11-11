@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.26"
+APP_VERSION = "0.9.27"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.26"
+APP_VERSION = "0.9.27"
 
 
 def _load_bridge_component(namespace=None):
@@ -1561,6 +1561,9 @@ UI_ENGLISH = {
     'noch offen': 'pending',
     'Verbindung unterbrochen; erneuter Verbindungsversuch läuft': 'Connection interrupted; reconnecting',
     'Wiederherstellung · Versuch %d: %s': 'Recovery · attempt %d: %s',
+    'Konkreter Fehlergrund nicht verfügbar. Keine Verbindung bestätigt; Einrichtung/Startanleitung öffnen.': 'Specific failure reason unavailable. No connection confirmed; open setup/startup instructions.',
+    'Gespeicherte Einrichtung gefunden. Diese Angaben allein bestätigen keine laufende oder erreichbare Bridge. Der Fehlergrund steht oben; die Einrichtung/Startanleitung verwendet die gespeicherten Werte.': 'Saved setup found. These values alone do not confirm a running or reachable bridge. The failure reason is shown above; setup/startup instructions use the saved values.',
+    'Der lokale Port ist bereits belegt. Der vorhandene Listener wird weder übernommen noch beendet. Portbelegung prüfen; eine neue Kopplung ist dafür nicht nötig.': 'The local port is already in use. The existing listener is neither adopted nor stopped. Check port occupancy; new pairing is not required.',
     'Erneuter Versuch in %ds · eigene Weiterleitung wird neu aufgebaut': 'Retry in %ds · rebuilding app-owned forwarding',
     'Automatische Wiederaufnahme beendet · Bridge im Ziel prüfen oder Einrichtung öffnen': 'Automatic recovery stopped · check bridge in target or open setup',
     'Prozesseigentümerschaft nicht sicher bestätigt. Nichts wird beendet oder übernommen. Port selbst prüfen oder eine bekannte HTTPS-Bridge über die Einrichtung verwenden.': 'Process ownership could not be verified. Nothing is stopped or adopted. Check the port yourself or use a known HTTPS bridge through setup.',
@@ -3990,24 +3993,34 @@ class QrexecForwarder:
 
     def _owns_listener(self):
         try:
-            inodes = set()
-            for line in Path("/proc/net/tcp").read_text().splitlines()[1:]:
-                row = line.split()
-                address, port = row[1].split(":")
-                if address in {"0100007F", "00000000"} and int(port, 16) == self.port and row[3] == "0A":
-                    inodes.add("socket:[%s]" % row[9])
+            ipv4, ipv6, owned = set(), set(), set()
+            for table, addresses, inodes in (
+                    ("tcp", {"0100007F", "00000000"}, ipv4),
+                    ("tcp6", {"0"*32, "0"*24 + "01000000", "0"*16 + "FFFF00000100007F"}, ipv6)):
+                try:
+                    lines = Path("/proc/net/" + table).read_text().splitlines()[1:]
+                except OSError:
+                    continue  # IPv6 can be disabled; keep valid IPv4 evidence.
+                for line in lines:
+                    row = line.split()
+                    address, port = row[1].split(":")
+                    if address in addresses and int(port, 16) == self.port and row[3] == "0A":
+                        inodes.add("socket:[%s]" % row[9])
             for pid, cmd in self._group_members():
                 if not cmd or self.identities.get(pid) is None or self.identities[pid] != self._process_identity(pid):
                     continue
                 try:
                     for fd in (Path("/proc/%d/fd" % pid)).iterdir():
                         try:
-                            if os.readlink(fd) in inodes:
-                                return True
+                            owned.add(os.readlink(fd))
                         except OSError:
                             pass
                 except OSError:
                     continue
+            # IPv4 traffic must not be attributed to an unrelated IPv4 listener
+            # just because our process also has an IPv6 socket on the same port.
+            candidates = ipv4 or ipv6
+            return bool(candidates) and candidates <= owned
         except (OSError, ValueError, IndexError):
             pass
         return False
@@ -6991,6 +7004,13 @@ def chat_binding_can_renew(bridge):
             or binding["server_time"] + elapsed >= binding["expires_at"])
 
 
+def recovery_error_code(reason):
+    """Only fixed reason codes enter the compact status; never arbitrary error text."""
+    if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{1,63}", reason):
+        return reason
+    return "recovery_reason_unavailable"
+
+
 def recovery_attempt_status(core):
     if not core.recovery_attempt:
         return ""
@@ -7006,6 +7026,9 @@ def recovery_attempt_status(core):
         phase = tr("Erneuter Versuch in %ds · eigene Weiterleitung wird neu aufgebaut") % seconds
     elif core.recovery_state == "NEEDS_ATTENTION" and core.recovery_retries_left == 0:
         phase += " · " + tr("Automatische Wiederaufnahme beendet · Bridge im Ziel prüfen oder Einrichtung öffnen")
+    if core.recovery_state in {"NEEDS_ATTENTION", "WAITING"}:
+        reason = core.recovery_error or core.bridge_error or core.local_setup_error
+        phase += " [%s]" % recovery_error_code(reason)
     return tr("Wiederherstellung · Versuch %d: %s") % (core.recovery_attempt, phase)
 
 
@@ -7545,17 +7568,19 @@ class ConnectionDialog:
         if recovery in {"PREPARING", "CONNECTING"}:
             notice = tr("Gespeicherte Verbindung wird automatisch wiederhergestellt. Neue Kopplungscodes sind dafür nicht nötig.")
         elif saved.get("profile"):
-            notice = tr("Diese Bridge ist bereits eingerichtet. Läuft sie noch, genügt ein erneuter Verbindungsversuch. Andernfalls zuerst im Bridge-System starten; die Startanleitung verwendet deine gespeicherten Werte.")
+            notice = tr("Gespeicherte Einrichtung gefunden. Diese Angaben allein bestätigen keine laufende oder erreichbare Bridge. Der Fehlergrund steht oben; die Einrichtung/Startanleitung verwendet die gespeicherten Werte.")
         elif saved.get("qrexec"):
             notice = tr("Der Bridge-Standort ist gespeichert, aber noch nicht gekoppelt. Über die Startanleitung fortfahren.")
         else:
             notice = tr("Eine lokale Einrichtung ist gespeichert. Die App kann Bridge und Tunnel mit diesen Werten erneut starten.")
+        error = self.core.recovery_error or bridge.last_error or self.core.local_setup_error
+        if error:
+            notice = self.error_text(recovery_error_code(error)) + "\n" + notice
+        elif recovery == "NEEDS_ATTENTION":
+            notice = tr("Konkreter Fehlergrund nicht verfügbar. Keine Verbindung bestätigt; Einrichtung/Startanleitung öffnen.") + "\n" + notice
         attempt_status = recovery_attempt_status(self.core)
         if attempt_status:
             notice = attempt_status + "\n" + notice
-        error = self.core.recovery_error or bridge.last_error or self.core.local_setup_error
-        if error:
-            notice += "\n" + self.error_text(error)
         self.recovery_notice.set(notice)
         # Secondary controls appear only where they have a useful effect.
         for key, visible in (("qrexec_stop", self.core.qrexec_forwarder.running),
@@ -7636,7 +7661,7 @@ class ConnectionDialog:
             "independent_fingerprint_comparison_required": tr("Fingerprint unabhängig am Gateway vergleichen und bestätigen."),
             "invalid_pair_code": tr("Den zwölfstelligen Gateway-Kopplungscode eingeben; Vierergruppen mit Bindestrichen sind erlaubt."),
             "qrexec_tool_missing": tr('qvm-connect-tcp fehlt. Die Qubes-Werkzeuge werden im Quell-Qube benötigt.'),
-            "qrexec_port_conflict": tr('Der lokale Port ist durch einen fremden Prozess belegt. Belegung klären oder einen anderen Port wählen; AITL übernimmt oder beendet den Prozess nicht.'),
+            "qrexec_port_conflict": tr("Der lokale Port ist bereits belegt. Der vorhandene Listener wird weder übernommen noch beendet. Portbelegung prüfen; eine neue Kopplung ist dafür nicht nötig."),
             "qrexec_forwarder_failed": tr('Die Weiterleitung wurde beendet. Ziel-Qube, Bridge-Start und Qrexec-Freigabe prüfen; die Ursache ist noch nicht belegt.'),
             "qrexec_ownership_unverified": tr("Prozesseigentümerschaft nicht sicher bestätigt. Nichts wird beendet oder übernommen. Port selbst prüfen oder eine bekannte HTTPS-Bridge über die Einrichtung verwenden."),
             "qrexec_forwarder_killed": tr("Der Forwarder wurde abgebrochen (Killed/SIGKILL möglich); die Ursache ist nicht belegt. Wiederaufnahme wird begrenzt versucht."),
@@ -10874,7 +10899,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.26"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.27"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime

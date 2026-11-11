@@ -16,7 +16,9 @@ weitergegeben. Das Terminal bleibt unabhängig manuell bedienbar.
 
 ## Aktuelle persönliche Testversion
 
-**Aktuelle persönliche Testversion auf `geco91/main`: v0.9.26.**
+**Aktuelle persönliche Testversion auf `geco91/main`: v0.9.27.**
+Eigene Dual-Stack-Listener werden korrekt erkannt. Bei fehlgeschlagener Recovery
+steht der konkrete Fehlercode direkt im Status und der Fehlergrund vor der Anleitung.
 Die Qubes-Wiederherstellung versucht unterbrochene eigene Weiterleitungen
 höchstens zweimal zusätzlich neu aufzubauen. Versuch, Wartezeit und endgültiger
 Fehler bleiben sichtbar; fremde oder nicht sicher zuordenbare Prozesse werden
@@ -26,7 +28,7 @@ startet sie auf Deutsch, sonst auf Englisch. Unten im Fenster lässt sich
 „Systemstandard“, „Deutsch“ oder „English“ speichern; die Auswahl gilt nach
 dem nächsten App-Start. Eine laufende Review bleibt dabei erhalten.
 Ein weiterer Command-Vorschlag bei offener Command-Review wird hellorange
-angezeigt. UI und Bridge melden beide 0.9.26. Bestehende Einzeldatei-Installationen mit
+angezeigt. UI und Bridge melden beide 0.9.27. Bestehende Einzeldatei-Installationen mit
 `python3 admin_in_the_loop.py update geco91` aktualisieren und die jeweilige App
 bzw. Bridge anschließend selbst neu starten. Die folgenden Downloadlinks
 verweisen weiterhin auf den getaggten Stand v0.9.23.

@@ -4411,6 +4411,20 @@ class QrexecForwarderTests(unittest.TestCase):
         self.assertTrue(forwarder.running)
         self.assertTrue(forwarder.stop())
 
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 unavailable")
+    def test_owned_dual_stack_listener_is_not_mistaken_for_foreign_port(self):
+        helper = self.directory / "qvm-connect-tcp-listener"
+        helper.write_text(self.LISTENER.replace("srv = socket.socket()\n",
+            "srv = socket.socket(socket.AF_INET6)\n"
+            "srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n")
+            .replace("srv.bind(('127.0.0.1', int(local)))", "srv.bind(('::', int(local)))"))
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        forwarder.start("target-vm", self.free_port())
+        self.assertTrue(forwarder.running)
+        self.assertTrue(forwarder.owned())
+        self.assertTrue(forwarder.stop())
+
     def test_missing_tool_and_invalid_names(self):
         forwarder = a.QrexecForwarder()
         self.addCleanup(forwarder.stop)
@@ -4859,6 +4873,18 @@ class QrexecBridgeFirstTests(unittest.TestCase):
             again = core.verify_qrexec_connection("fwdqube", port)  # "Erneut prüfen": idempotent
         self.assertTrue(again["reachable"])
         self.assertEqual(core.qrexec_forwarder.pgid, first_pgid)  # no double forwarder group
+
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 unavailable")
+    def test_dual_stack_forwarder_reaches_the_expected_tls_bridge(self):
+        proxy = self.base / "qvm-connect-tcp-forwarder"
+        proxy.write_text(self.PROXY.replace("srv = socket.socket()\n",
+            "srv = socket.socket(socket.AF_INET6)\n"
+            "srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n")
+            .replace("srv.bind(('127.0.0.1', int(local)))", "srv.bind(('::', int(local)))"))
+        result = self.verify_with_env("fwdqube", self.free_port(), self.bridge_port)
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["phase"], "bridge_reachable")
+        self.assertEqual(result["observed_pin"], self.bridge_pin)
 
     def test_deny_down_plain_are_evidenced_separately_not_blanket_policy(self):
         text = a.ConnectionDialog.error_text

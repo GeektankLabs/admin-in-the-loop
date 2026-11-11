@@ -87,7 +87,8 @@ class ConnectionUXTests(unittest.TestCase):
             dialog = self.dialog = self.ui.connection_settings()
             self.root.update()
             self.assertTrue(dialog.recovery_panel.winfo_ismapped())
-            self.assertIn("bereits eingerichtet", dialog.recovery_notice.get())
+            self.assertIn("Gespeicherte Einrichtung gefunden" if a.UI_LANGUAGE == "de" else "Saved setup found",
+                          dialog.recovery_notice.get())
             with mock.patch.object(dialog.core, "retry_connection_recovery",
                                    side_effect=a.ProbeError("setup_busy")):
                 dialog.run("bridge", dialog.core.retry_connection_recovery)

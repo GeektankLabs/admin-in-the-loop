@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.27 — Dual-Stack-Listener und konkrete Recovery-Fehler
+
+- Eigene IPv6-/Dual-Stack-Listener werden anhand ihres Socket-Inodes und derselben
+  verifizierten Prozessidentität erkannt. 0.9.26 konnte sie trotz erreichbarem
+  IPv4-Loopback fälschlich als Portkonflikt ablehnen und nach Versuch 1 stoppen.
+- Echte oder nicht zugeordnete Portbelegungen bleiben geschützt; konkurrierende
+  IPv4-Listener werden nicht aufgrund eines eigenen IPv6-Sockets übernommen.
+- Die kurze Recovery-Statuszeile zeigt den festen Fehlercode. Der ausführliche
+  Fehlergrund steht vor der allgemeinen Anleitung. Gespeicherte Angaben werden
+  ausdrücklich nicht als Nachweis einer laufenden oder erreichbaren Bridge dargestellt.
+- UI und Bridge melden 0.9.27. Kopplung, TLS-Pins und die Retry-Grenzen bleiben
+  erhalten. Ob dieser reproduzierte Codefehler den Gerätetest erklärt, ist offen.
+
 ## 0.9.26 — Begrenzte Wiederaufnahme unterbrochener Qubes-Verbindungen
 
 - Nach abgebrochenem Launcher, fehlendem eigenen Listener oder vorübergehendem
