@@ -16,7 +16,12 @@ weitergegeben. Das Terminal bleibt unabhängig manuell bedienbar.
 
 ## Aktuelle persönliche Testversion
 
-**Aktuelle persönliche Testversion auf `geco91/main`: v0.9.28.**
+**Aktuelle persönliche Testversion auf `geco91/main`: v0.9.29.**
+Freigegebene Ausgaben werden nach ausdrücklicher Lese-ACK nicht erneut im allgemeinen
+Abruf angeboten. Der AI-Client liest den Text und bestätigt `output_id` und `receipt`
+mit `acknowledge_output`; gezieltes Wiederlesen bleibt bis zum Ablauf möglich.
+Nach dem Bridge-Update die MCP-Werkzeuge/den Clientablauf neu laden. Ein Event-ACK
+bestätigt nur die Benachrichtigung. Alte Ausgaben ohne Lese-ACK werden nicht pauschal gelöscht.
 Ist der gespeicherte lokale Qubes-Port belegt, versucht die Wiederherstellung
 einmal einen freien lokalen Ausweichport zum selben Ziel und Bridge-Port.
 Der vorhandene Listener bleibt unangetastet; gespeicherte Adresse, HTTP-Host,
@@ -32,7 +37,7 @@ startet sie auf Deutsch, sonst auf Englisch. Unten im Fenster lässt sich
 „Systemstandard“, „Deutsch“ oder „English“ speichern; die Auswahl gilt nach
 dem nächsten App-Start. Eine laufende Review bleibt dabei erhalten.
 Ein weiterer Command-Vorschlag bei offener Command-Review wird hellorange
-angezeigt. UI und Bridge melden beide 0.9.28. Bestehende Einzeldatei-Installationen mit
+angezeigt. UI und Bridge melden beide 0.9.29. Bestehende Einzeldatei-Installationen mit
 `python3 admin_in_the_loop.py update geco91` aktualisieren und die jeweilige App
 bzw. Bridge anschließend selbst neu starten. Die folgenden Downloadlinks
 verweisen weiterhin auf den getaggten Stand v0.9.23.

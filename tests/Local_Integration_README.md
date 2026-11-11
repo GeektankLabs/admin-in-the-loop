@@ -282,11 +282,28 @@ AI-Rolle ausschließlich über `POST /mcp`:
 |---|---|---|
 | `submit_proposal` | `request_id`, `text` | Empfang/ID; keine Ausführung |
 | `get_submission_status` | `submission_id` | Lifecycle-Fakten: `ACCEPTED`/`TAKEN`/`WITHDRAWN`/`UNKNOWN`, Zeitstempel, `output_shared_ever`, Verfügbarkeit freigegebenen Outputs; keine Rohtexte, keine IDs anderer Vorschläge |
-| `get_approved_output` | optional `submission_id`, `cursor` | Ausschließlich bereits freigegebener Output |
+| `get_approved_output` | optional `output_id` oder `submission_id`, `cursor` | Ungelesene Freigaben; per ID auch bestätigte Historie, mit `receipt` und `acknowledged` |
+| `acknowledge_output` | `output_id`, `receipt` | Idempotente Lese-ACK; entfernt aus Ungelesen-Abruf, löscht keinen Text |
 | `get_preferences` | keine | SINGLE/SMALL/MEDIUM/LARGE |
 | `withdraw_proposal` | `submission_id` | Immer nur `RECORDED` – kein Erfolgsbeweis; maßgeblich ist der folgende `get_submission_status`-Readback |
 
-Fünf Tools, keine Resources, Shell-, Datei-, Tastatur- oder Terminal-Lesetools. Ein MCP-Tools-Teilumfang mit Legacy-Initialisierung und neuer Discovery ist implementiert; kein allgemeines Agentenframework. `ACCEPTED` bedeutet **angenommen, nicht ausgeführt**; `TAKEN` bedeutet **in menschliche Review übernommen, nicht gesendet oder ausgeführt**. `withdraw_proposal` zieht ausschließlich eigene, noch nicht übernommene (`WAITING`) Vorschläge zurück; bereits übernommene bleiben `TAKEN` und werden nur als „Rücknahme angefragt“ vermerkt. Leerer Output beweist keinen Fehler oder Erfolg.
+Sechs Tools, keine Resources, Shell-, Datei-, Tastatur- oder Terminal-Lesetools. Ein MCP-Tools-Teilumfang mit Legacy-Initialisierung und neuer Discovery ist implementiert; kein allgemeines Agentenframework. `ACCEPTED` bedeutet **angenommen, nicht ausgeführt**; `TAKEN` bedeutet **in menschliche Review übernommen, nicht gesendet oder ausgeführt**. `withdraw_proposal` zieht ausschließlich eigene, noch nicht übernommene (`WAITING`) Vorschläge zurück; bereits übernommene bleiben `TAKEN` und werden nur als „Rücknahme angefragt“ vermerkt. Leerer Output beweist keinen Fehler oder Erfolg.
+
+Der Client bestätigt erst nach Empfang/Verarbeitung des Texts dessen `output_id`
+und `receipt`. Verlorene Antworten werden erneut gelesen; eine verlorene ACK-Antwort
+wird mit derselben ACK wiederholt. Lese-ACKs überstehen Neustarts. Fehlt ein noch
+unbestätigter Beleg nach einem Neustart, liefert das gezielte Wiederlesen einen neuen.
+Der allgemeine Abruf filtert bestätigte Ausgaben, während ID-/Submission-Abrufe
+die freigegebene Historie bis zum unveränderten Ablauf wiedergeben. Event-ACK und
+Controller-Upload-ACK sind keine Lese-ACK. Alle berechtigten Clients derselben
+Chatbindung teilen ein Ungelesen-Postfach; Belege gehören trotzdem zum lesenden
+Principal und seiner Bindungs-Generation. Bei parallelem Lesen oder einem Absturz
+zwischen Verarbeitung und ACK sind Duplikate möglich; Clients deduplizieren per ID.
+Unbekannte/abgelaufene Cursor melden `cursor_reset: true`; der allgemeine Neustart
+scannt nur unbestätigte Ausgaben. Ein fremder oder anders gefilterter Cursor wird
+mit `invalid_cursor` und `retry_without_cursor: true` abgewiesen. Keine Cursor erfinden.
+Nach dem Bridge-Update MCP-Tools und den beiliegenden Client-Skill neu laden;
+Altclients ohne ACK können weiterhin unbestätigte Ausgaben mehrfach lesen.
 
 Output wird exakt einmal als eigener Text-Contentblock übertragen. Der erste Block und `structuredContent` enthalten Metadaten; `text_content_index` benennt den jeweiligen Textblock. Dadurch bleibt Output auch bei Hosts verfügbar, die `structuredContent` ignorieren, ohne den Nutztext doppelt zu übertragen.
 

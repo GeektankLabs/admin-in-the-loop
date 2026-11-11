@@ -44,13 +44,13 @@ from types import MappingProxyType
 # Kanonische Version (Journal 8.10.: jede ausgelieferte Codeaenderung erhoehrt
 # mindestens den Patch-Stand). BRIDGE_SERVER_INFO pflegt eine separate Kopie im
 # Bridge-Block; ein Konsistenztest pinnt beide auf denselben Wert.
-APP_VERSION = "0.9.28"
+APP_VERSION = "0.9.29"
 
 
 # Single canonical UI/CLI version. The embedded bridge block keeps its own copy in
 # BRIDGE_SERVER_INFO; a consistency test pins both to the same value (Journal #88ff:
 # every delivered program state bumps at least the patch digit).
-APP_VERSION = "0.9.28"
+APP_VERSION = "0.9.29"
 
 
 def _load_bridge_component(namespace=None):
@@ -10955,7 +10955,7 @@ BRIDGE_RETENTION = 24 * 3600
 BRIDGE_OUTPUT_LIMIT = 64 * 1024
 BRIDGE_BLOCK_SIZES = ("SINGLE", "SMALL", "MEDIUM", "LARGE")
 BRIDGE_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
-BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.28"}
+BRIDGE_SERVER_INFO = {"name": "admin-in-the-loop", "version": "0.9.29"}
 BRIDGE_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # M9 Folgeaenderung (Operator-Journal 100): pairing-code validity 10 minutes; the
 # attempt limit (5), claim-path cooldown and the separate PAIR_PENDING token lifetime
@@ -11151,11 +11151,10 @@ class BridgeStore:
             failure_times TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY(conversation,generation,principal));
         """)
-        for column, definition in (("delivered", "INTEGER NOT NULL DEFAULT 0"), ("delivered_at", "REAL")):
-            try:
+        for column, definition in (("delivered", "INTEGER NOT NULL DEFAULT 0"), ("delivered_at", "REAL"),
+                                   ("consumed_at", "REAL")):
+            if column not in {row["name"] for row in self.execute("PRAGMA table_info(outputs)").fetchall()}:
                 self.execute("ALTER TABLE outputs ADD COLUMN " + column + " " + definition)
-            except sqlite3.OperationalError:
-                pass  # Column already exists on an upgraded state directory.
         try:
             # Pre-binding subscriptions must be reauthorized by a human-bound
             # subscribe/refresh before they can send metadata or acknowledge it.
@@ -11714,10 +11713,9 @@ class BridgeStore:
             row = self.execute("SELECT * FROM proposals WHERE id=? AND expires>?",
                                (submission_id, now)).fetchone()
             check(row is not None, "submission_unavailable", 404)
-            shared = self.execute("SELECT id FROM outputs WHERE submission=? AND expires>? AND delivered=0 LIMIT 1",
+            shared = self.execute("SELECT id FROM outputs WHERE submission=? AND expires>? AND consumed_at IS NULL LIMIT 1",
                                   (submission_id, now)).fetchone()
-            # Permanent release fact, read-side from the existing outputs row (delivered
-            # ignored): stays provable after the completion ACK flipped delivery state.
+            # Permanent release fact: remains provable after an explicit read ACK.
             ever = self.execute("SELECT id FROM outputs WHERE submission=? AND expires>? LIMIT 1",
                                 (submission_id, now)).fetchone()
             return {"state": {"WAITING": "ACCEPTED"}.get(row["state"], row["state"]),
@@ -11838,32 +11836,78 @@ class BridgeStore:
                 "kind": value["kind"], "state": "TAKEN"}
 
     def ai_output(self, principal, value):
-        exact(value, set(), {"submission_id", "cursor"})
+        exact(value, set(), {"submission_id", "output_id", "cursor"})
         cursor = value.get("cursor", "")
         submission = value.get("submission_id")
+        output_id = value.get("output_id")
+        check(submission is None or output_id is None, "output_selector_conflict")
         if submission is not None:
             opaque(submission)
+        if output_id is not None:
+            opaque(output_id)
         with self.lock:
-            position = self.cursor_position(cursor, principal["id"], "OUTPUT")
-            if submission is None:
-                # Un-bound outputs stay readable on the canonical pull even after a
-                # confirmed push: there is no submission readback to recover them from.
-                row = self.execute("SELECT * FROM outputs WHERE seq>? AND expires>?"
-                                   " AND (delivered=0 OR submission IS NULL)"
+            generation = self.chat_binding["generation"]
+            kind = "OUTPUT:%d:%s" % (generation, "ID:" + output_id if output_id is not None else
+                                     "SUBMISSION:" + submission if submission is not None else "UNREAD")
+            position, reset = self.output_cursor_position(cursor, principal["id"], kind)
+            if submission is None and output_id is None:
+                row = self.execute("SELECT * FROM outputs WHERE seq>? AND expires>? AND consumed_at IS NULL"
                                    " ORDER BY seq LIMIT 1", (position, self.clock())).fetchone()
-                if row is None:
-                    gap = self.execute("SELECT max(seq) AS top FROM outputs WHERE seq>? AND expires>?"
-                                       " AND delivered=1 AND submission IS NOT NULL",
-                                       (position, self.clock())).fetchone()
-                    if gap and gap["top"] is not None and gap["top"] > position:
-                        position = gap["top"]
             else:
-                # An explicitly named output stays within the retention as an authorized readback.
-                row = self.execute("SELECT * FROM outputs WHERE seq>? AND expires>? AND submission=?"
-                                   " ORDER BY seq LIMIT 1", (position, self.clock(), submission)).fetchone()
+                # Explicit reads include acknowledged data, without reopening the unread queue.
+                column, selected = ("id", output_id) if output_id is not None else ("submission", submission)
+                row = self.execute("SELECT * FROM outputs WHERE seq>? AND expires>? AND " + column + "=?"
+                                   " ORDER BY seq LIMIT 1", (position, self.clock(), selected)).fetchone()
+            next_cursor = self.cursor(principal["id"], kind, row["seq"] if row else position)
             result = [] if row is None else [{"output_id": row["id"], "submission_id": row["submission"],
-                                              "text": row["text"], "expires_at": row["expires"]}]
-            return {"outputs": result, "cursor": self.cursor(principal["id"], "OUTPUT", row["seq"] if row else position)}
+                                              "text": row["text"], "expires_at": row["expires"],
+                                              "receipt": next_cursor, "acknowledged": row["consumed_at"] is not None}]
+            return {"outputs": result, "cursor": next_cursor, "cursor_reset": reset}
+
+    def output_cursor_position(self, value, owner, kind):
+        if not value:
+            return 0, False
+        try:
+            opaque(value)
+        except BridgeError:
+            raise BridgeError("invalid_cursor", data={"retry_without_cursor": True}) from None
+        row = self.execute("SELECT * FROM cursors WHERE id=?", (value,)).fetchone()
+        if row is None:
+            return 0, True  # Removed on restart/expiry: rescan UNREAD, never consumed history.
+        if row["owner"] != owner:
+            raise BridgeError("invalid_cursor", data={"retry_without_cursor": True})
+        if row["kind"] == "OUTPUT":
+            return 0, True  # Legacy cursors are not read receipts.
+        pieces, expected = row["kind"].split(":", 2), kind.split(":", 2)
+        if not (len(pieces) == 3 and pieces[0] == "OUTPUT" and pieces[2] == expected[2]):
+            raise BridgeError("invalid_cursor", data={"retry_without_cursor": True})
+        if row["expires"] <= self.clock() or pieces[1] != expected[1]:
+            return 0, True
+        return row["seq"], False
+
+    def acknowledge_output(self, principal, value, generation):
+        exact(value, {"output_id", "receipt"})
+        output_id, receipt = opaque(value["output_id"]), opaque(value["receipt"])
+        with self.lock:
+            self.require_chat_binding_generation(generation)
+            now = self._safe_chat_time()
+            row = self.execute("SELECT * FROM outputs WHERE id=? AND expires>?", (output_id, now)).fetchone()
+            check(row is not None, "output_unavailable", 404)
+            read = self.execute("SELECT * FROM cursors WHERE id=?", (receipt,)).fetchone()
+            if read is not None:
+                check(read["owner"] == principal["id"] and read["kind"].startswith("OUTPUT:%d:" % generation)
+                      and read["seq"] == row["seq"], "output_receipt_mismatch", 403)
+            if row["consumed_at"] is None:
+                check(read is not None and read["expires"] > now, "output_receipt_expired", 409)
+            # Recheck both principal and current human chat binding in the write,
+            # including revocation/rotation by another SQLite connection at ACK time.
+            changed = self.execute("UPDATE outputs SET consumed_at=coalesce(consumed_at,?) WHERE id=? AND expires>?"
+                " AND EXISTS(SELECT 1 FROM tokens WHERE id=? AND role='AI' AND conversation=? AND state='PAIRED')"
+                " AND EXISTS(SELECT 1 FROM meta WHERE key='chat_binding' AND json_extract(value,'$.generation')=?"
+                " AND json_extract(value,'$.expires_at')>?)",
+                (now, output_id, now, principal["id"], self.conversation, generation, now)).rowcount
+            check(changed == 1, "unauthorized", 401)
+            return {"output_id": output_id, "state": "ACKNOWLEDGED"}
 
     @staticmethod
     def subscription_identity(principal_id, url, name, args_json):
@@ -11939,6 +11983,7 @@ class BridgeStore:
             return dict(row) if row else None
 
     def mark_delivered(self, output_id, subscription_id, expected_generation):
+        """Record notification delivery only; the text still needs a read receipt ACK."""
         opaque(output_id)
         with self.lock:
             if not self._binding_is_live(expected_generation):
@@ -11975,12 +12020,15 @@ BRIDGE_TOOLS = [
     {"name": "submit_proposal", "description": "Queue a terminal command for local human review. ACCEPTED means received, never executed. No terminal access.",
      "inputSchema": object_schema({"request_id": BRIDGE_ID_SCHEMA, "text": {"type": "string", "maxLength": 4096}}, ("request_id", "text")),
      "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
-    {"name": "get_submission_status", "description": "Return transport acceptance and whether a not-yet-delivered human-approved output exists. No execution, prompt or review status.",
+    {"name": "get_submission_status", "description": "Return transport acceptance and whether a not-yet-acknowledged human-approved output exists. Event delivery alone does not acknowledge reading. No execution, prompt or review status.",
      "inputSchema": object_schema({"submission_id": BRIDGE_ID_SCHEMA}, ("submission_id",)),
      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
-    {"name": "get_approved_output", "description": "Read only output explicitly shared by the human with this conversation. Empty means none available; do not infer execution.",
-     "inputSchema": object_schema({"submission_id": BRIDGE_ID_SCHEMA, "cursor": BRIDGE_ID_SCHEMA}),
+    {"name": "get_approved_output", "description": "Read human-approved output. General reads return unacknowledged output; output_id or submission_id permits retained readback. After receiving/processing text call acknowledge_output with output_id and receipt. Reads alone do not consume. If cursor_reset is true the scan restarted over unacknowledged output only. Empty never proves execution.",
+     "inputSchema": object_schema({"submission_id": BRIDGE_ID_SCHEMA, "output_id": BRIDGE_ID_SCHEMA, "cursor": BRIDGE_ID_SCHEMA}),
      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+    {"name": "acknowledge_output", "description": "Confirm text successfully received/processed using its output_id and receipt from get_approved_output. Idempotently remove it from the shared conversation's unread queue, retaining named readback until expiry. Do not acknowledge a lost response or an availability notification.",
+     "inputSchema": object_schema({"output_id": BRIDGE_ID_SCHEMA, "receipt": BRIDGE_ID_SCHEMA}, ("output_id", "receipt")),
+     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
     {"name": "get_preferences", "description": "Read the human's preferred command block size: SINGLE, SMALL, MEDIUM or LARGE. A comfort preference, never permission.",
      "inputSchema": object_schema({}),
      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
@@ -13209,7 +13257,7 @@ class BridgeService:
                 with self.store.lock:
                     if type(args) is not dict:
                         self.store.authorize_chat_binding(principal["id"], None)
-                    self.store.authorize_chat_binding(principal["id"], args.get("conversation"))
+                    binding_generation = self.store.authorize_chat_binding(principal["id"], args.get("conversation"))
                     args = {key: val for key, val in args.items() if key != "conversation"}
                     if name == "submit_proposal":
                         data = self.store.submit(args)
@@ -13220,6 +13268,8 @@ class BridgeService:
                         data = self.store.submission_status(args["submission_id"])
                     elif name == "get_approved_output":
                         data = self.store.ai_output(principal, args)
+                    elif name == "acknowledge_output":
+                        data = self.store.acknowledge_output(principal, args, binding_generation)
                     elif name == "get_preferences":
                         exact(args, set())
                         data = {"block_size": self.store.preference}
@@ -13233,7 +13283,7 @@ class BridgeService:
                 # Put approved text into its own plaintext block once, not into a nested
                 # JSON string or twice into the response. Metadata names its block index.
                 if name == "get_approved_output":
-                    metadata = {"outputs": [], "cursor": data["cursor"]}
+                    metadata = {"outputs": [], "cursor": data["cursor"], "cursor_reset": data["cursor_reset"]}
                     blocks = [{"type": "text", "text": ""}]
                     for item in data["outputs"]:
                         metadata["outputs"].append({key: val for key, val in item.items() if key != "text"}
@@ -13480,6 +13530,10 @@ class BridgeService:
         if current is None or current["binding_generation"] != expected_generation:
             return
         subscription, event = current, job["event"]
+        with self.store.lock:
+            if self.store.execute("SELECT 1 FROM outputs WHERE id=? AND expires>? AND consumed_at IS NULL",
+                                  (event["eventId"], self.store.clock())).fetchone() is None:
+                return  # A late notification must not reopen acknowledged/expired output.
         status, failure = None, None
         try:
             status, _ = self.webhook_call(subscription, encoded(event),

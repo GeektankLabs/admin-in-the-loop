@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.29 — Freigegebenen Output ausdrücklich als gelesen bestätigen
+
+- `get_approved_output` liefert Text plus Empfangsbeleg; `acknowledge_output`
+  bestätigt ihn idempotent. Erst diese Lese-ACK entfernt gebundene und ungebundene
+  Ausgaben aus dem gemeinsamen Ungelesen-Abruf. Inhalte bleiben bis zur bisherigen
+  Aufbewahrungsgrenze erhalten und per `output_id` oder `submission_id` wieder lesbar.
+- Event-/Webhook-ACKs bestätigen nur die Verfügbarkeitsmeldung. Sie konsumieren den
+  Text nicht; nach Lese-ACK werden spätere Event-Jobs übersprungen.
+- Empfangsbelege sind an AI-Principal und Chatbindungs-Generation gebunden. Clients
+  mit gleicher gültiger Chatbindung teilen ein Postfach; andere Clients können
+  keine fremden Belege zum Konsumieren verwenden. ACK prüft die Autorisierung atomar.
+- Abgelaufene, entfernte und Legacy-Cursor führen mit `cursor_reset` zu einem neuen
+  Scan unbestätigter Ausgaben. Cursor anderer Principals/Abfragen bleiben ungültig
+  und geben einen ausdrücklichen Hinweis zum Wiederholen ohne diesen Cursor.
+- SQLite erhält einen Bestätigungszeitpunkt, keine pauschale Löschung oder geratenen
+  Lesebestätigungen für Altbestand. Clients müssen den aktualisierten ACK-Ablauf verwenden.
+- UI und Bridge: 0.9.29. Die funktionierende Qubes-Wiederherstellung bleibt erhalten.
+
 ## 0.9.28 — Sicherer lokaler Ausweichport bei Qubes-Portkonflikten
 
 - Bei `qrexec_port_conflict` versucht die gespeicherte Qubes-Wiederherstellung

@@ -446,14 +446,14 @@ class HTTPTests(unittest.TestCase):
     def tearDown(self):
         self.process.close()
 
-    def test_five_tools_legacy_and_modern_discovery(self):
+    def test_six_tools_legacy_and_modern_discovery(self):
         value = {"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}}
         headers = {"X-AITL-AI-Key": self.process.ai_token}
         status, raw = request(self.process.mcp_url, "POST", body=value, headers=headers)
         self.assertEqual(status, 200)
         names = {item["name"] for item in json.loads(raw)["result"]["tools"]}
         self.assertEqual(names, {"submit_proposal", "get_submission_status", "get_approved_output",
-                                 "get_preferences", "withdraw_proposal"})
+                                 "get_preferences", "withdraw_proposal", "acknowledge_output"})
         self.assertEqual(mcp(self.process, "get_preferences", modern=True)["block_size"], "SMALL")
         meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
         value = {"jsonrpc": "2.0", "id": 2, "method": "server/discover", "params": {"_meta": meta}}
@@ -904,6 +904,8 @@ class ConnectedRoundTripTests(unittest.TestCase):
             self.assertEqual(outputs[0]["output_id"], event_id)
             self.assertEqual(outputs[0]["submission_id"], submission_id)
             self.assertEqual(outputs[0]["text"], "HUMAN_APPROVED_EVENT_OUTPUT\n")
+            ack = mcp(process, "acknowledge_output", {"output_id": event_id, "receipt": outputs[0]["receipt"]})
+            self.assertEqual(ack["state"], "ACKNOWLEDGED")
             processed[event_id] = outputs[0]
             return True
 
@@ -922,8 +924,8 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
         subscription = store.active_subscription(subscription_id, store.clock())
         harness.service.deliver({"subscription": subscription, "event": event, "attempts": 0})
-        self.assertEqual(len(harness.deliveries[subscription_id]), 2)
-        replay_event = harness.deliveries[subscription_id][1][1]
+        self.assertEqual(len(harness.deliveries[subscription_id]), 1)  # late notification skipped after read ACK
+        replay_event = event  # a host may still replay its already received notification
         self.assertEqual(replay_event["eventId"], event["eventId"])
         self.assertFalse(continue_from_notification(replay_event))
         final_row = store.execute("SELECT delivered,delivered_at FROM outputs WHERE id=?",
@@ -1364,8 +1366,9 @@ class ProposalLifecycleStoreTests(unittest.TestCase):
         before = self.status(submission)
         self.assertTrue(before["approved_output_available"])
         self.assertTrue(before["output_shared_ever"])
-        self.store.execute("UPDATE outputs SET delivered=1, delivered_at=? WHERE submission=?",
-                           (self.now, submission))  # completion ACK flip
+        principal = self.store.authenticate(self.ai, "AI")
+        item = self.store.ai_output(principal, {"submission_id": submission})["outputs"][0]
+        self.store.acknowledge_output(principal, {"output_id": item["output_id"], "receipt": item["receipt"]}, 1)
         after = self.status(submission)
         self.assertFalse(after["approved_output_available"])
         self.assertTrue(after["output_shared_ever"])  # permanent fact, read-side only
@@ -3161,6 +3164,14 @@ class EventDeliveryTests(unittest.TestCase):
         return self.rpc("tools/call", {"name": "get_approved_output",
                                        "arguments": dict(arguments, conversation=self.harness.chat_code)})
 
+    def acknowledge_output_tool(self, item):
+        return self.rpc("tools/call", {"name": "acknowledge_output", "arguments": {
+            "output_id": item["output_id"], "receipt": item["receipt"], "conversation": self.harness.chat_code}})
+
+    def wait_for_notification(self, submission):
+        self.harness.wait(lambda: self.store.execute("SELECT 1 FROM outputs WHERE submission=? AND delivered=1",
+                                                     (submission,)).fetchone() is not None)
+
     def test_event_only_after_human_approved_output(self):
         created = self.store.submit({"request_id": uuid.uuid4().hex, "text": "true"})
         submission = created["submission_id"]
@@ -3175,9 +3186,12 @@ class EventDeliveryTests(unittest.TestCase):
         self.assertEqual(entry["data"]["output_id"], output_id)
         self.assertEqual(entry["data"]["submission_id"], submission)
         self.assertNotIn(self.store.conversation, json.dumps(entry))
-        self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
+        self.wait_for_notification(submission)
+        self.assertTrue(self.store.submission_status(submission)["approved_output_available"])
         named = self.approved_output_tool({"submission_id": submission})
         self.assertEqual(len(named["result"]["structuredContent"]["outputs"]), 1)
+        self.assertFalse(self.acknowledge_output_tool(named["result"]["structuredContent"]["outputs"][0])["result"]["isError"])
+        self.assertFalse(self.store.submission_status(submission)["approved_output_available"])
         general = self.approved_output_tool({})
         self.assertEqual(general["result"]["structuredContent"]["outputs"], [])
         replayed = a.BridgeHTTP(self.harness.profile).request("POST", "/v1/approved-output", replay)
@@ -3223,14 +3237,15 @@ class EventDeliveryTests(unittest.TestCase):
         self.harness.failures.clear()
         later = self.make_submission()
         self.post_output(later)
-        self.harness.wait(lambda: self.store.submission_status(later)["approved_output_available"] is False)
+        self.wait_for_notification(later)
+        self.assertTrue(self.store.submission_status(later)["approved_output_available"])
         self.assertGreaterEqual(len(self.harness.deliveries[self.subscription_id]), attempts + 1)
 
     def test_delivery_state_and_subscriptions_survive_restart(self):
         created = self.store.submit({"request_id": uuid.uuid4().hex, "text": "true"})
         submission = created["submission_id"]
         self.post_output(submission)
-        self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
+        self.wait_for_notification(submission)
         with self.store.lock:
             self.store.close()
         reopened = a.BridgeStore(self.temp.name, self.store.conversation, clock=lambda: time.time())
@@ -3239,7 +3254,7 @@ class EventDeliveryTests(unittest.TestCase):
             row = reopened.find_subscription(self.harness.ai_id, "https://delivery.example/hook",
                                              a.BRIDGE_EVENT_NAME, canonical)
             self.assertEqual(row["id"], self.subscription_id)
-            self.assertEqual(reopened.submission_status(submission)["approved_output_available"], False)
+            self.assertEqual(reopened.submission_status(submission)["approved_output_available"], True)
             named = reopened.ai_output(reopened.authenticate(self.harness.ai, "AI"),
                                        {"submission_id": submission})
             self.assertEqual(len(named["outputs"]), 1)
@@ -3441,11 +3456,18 @@ class WebhookTransportTests(EventSubscriptionTests):
         self.assertEqual(value["data"]["submission_id"], submission)
         self.assertNotIn(b"APPROVED_PAYLOAD", entry["body"])
         self.assertNotIn(self.store.conversation.encode(), entry["body"])
-        self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
+        self.harness.wait(lambda: self.store.execute("SELECT delivered FROM outputs WHERE id=?",
+                                                     (output_id,)).fetchone()[0] == 1)
+        self.assertTrue(self.store.submission_status(submission)["approved_output_available"])
         named = self.rpc("tools/call", {"name": "get_approved_output",
                                         "arguments": {"conversation": self.harness.chat_code,
                                                       "submission_id": submission}})
         self.assertEqual(len(named["result"]["structuredContent"]["outputs"]), 1)
+        item = named["result"]["structuredContent"]["outputs"][0]
+        ack = self.rpc("tools/call", {"name": "acknowledge_output", "arguments": {
+            "conversation": self.harness.chat_code, "output_id": item["output_id"], "receipt": item["receipt"]}})
+        self.assertFalse(ack["result"]["isError"])
+        self.assertFalse(self.store.submission_status(submission)["approved_output_available"])
         general = self.rpc("tools/call", {"name": "get_approved_output",
                                           "arguments": {"conversation": self.harness.chat_code}})
         self.assertEqual(general["result"]["structuredContent"]["outputs"], [])
