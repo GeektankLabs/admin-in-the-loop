@@ -16,25 +16,194 @@ weitergegeben. Das Terminal bleibt unabhängig manuell bedienbar.
 
 ## Aktuelle persönliche Testversion
 
-**v0.9.0 ist lokal als reguläre persönliche Testversion festgeschrieben; nicht
-veröffentlicht.** Der Operator hat am 4. Oktober 2026 den geprüften und integrierten
-Mainstand für seine eigenen Tests angenommen. Weitere externe Vorab-Abnahmen sind
-kein Gate für diesen Versionsstand. Änderungen stehen im [Changelog](CHANGELOG.md).
+**Aktuelle persönliche Testversion auf `geco91/main`: v0.9.29.**
+Freigegebene Ausgaben werden nach ausdrücklicher Lese-ACK nicht erneut im allgemeinen
+Abruf angeboten. Der AI-Client liest den Text und bestätigt `output_id` und `receipt`
+mit `acknowledge_output`; gezieltes Wiederlesen bleibt bis zum Ablauf möglich.
+Nach dem Bridge-Update die MCP-Werkzeuge/den Clientablauf neu laden. Ein Event-ACK
+bestätigt nur die Benachrichtigung. Alte Ausgaben ohne Lese-ACK werden nicht pauschal gelöscht.
+Ist der gespeicherte lokale Qubes-Port belegt, versucht die Wiederherstellung
+einmal einen freien lokalen Ausweichport zum selben Ziel und Bridge-Port.
+Der vorhandene Listener bleibt unangetastet; gespeicherte Adresse, HTTP-Host,
+Kopplung und TLS-Pin bleiben erhalten. Der Ausweichport gilt nur für die Sitzung.
+Eigene Dual-Stack-Listener werden korrekt erkannt. Bei fehlgeschlagener Recovery
+steht der konkrete Fehlercode direkt im Status und der Fehlergrund vor der Anleitung.
+Die Qubes-Wiederherstellung versucht unterbrochene eigene Weiterleitungen
+höchstens zweimal zusätzlich neu aufzubauen. Versuch, Wartezeit und endgültiger
+Fehler bleiben sichtbar; fremde oder nicht sicher zuordenbare Prozesse werden
+nicht beendet. Wurde die gesamte App beendet, muss sie erneut gestartet werden.
+Die Oberfläche unterstützt Deutsch und Englisch. Bei deutscher Systemlocale
+startet sie auf Deutsch, sonst auf Englisch. Unten im Fenster lässt sich
+„Systemstandard“, „Deutsch“ oder „English“ speichern; die Auswahl gilt nach
+dem nächsten App-Start. Eine laufende Review bleibt dabei erhalten.
+Ein weiterer Command-Vorschlag bei offener Command-Review wird hellorange
+angezeigt. UI und Bridge melden beide 0.9.29. Bestehende Einzeldatei-Installationen mit
+`python3 admin_in_the_loop.py update geco91` aktualisieren und die jeweilige App
+bzw. Bridge anschließend selbst neu starten. Die folgenden Downloadlinks
+verweisen weiterhin auf den getaggten Stand v0.9.23.
+Links im Terminalbereich wird die Rückgabeprüfung eingestellt, rechts im AI-Bereich
+die Befehlsprüfung. Die Mitte bleibt für Code/Ausgabe und die passenden Prüfreiter
+mit Ampel und Befundzahl frei. [Echte Beispielansichten](doc/REVIEW_LAYOUT.md).
+Der Stand bündelt außerdem sh-guard, überarbeitete Verbindungseinrichtung,
+erneutes Prüfen desselben Command-Outputs und Maus-Kontextmenüs. Änderungen
+stehen im [Changelog](CHANGELOG.md).
+
+Ohne geöffnetes Terminal startet die App im **Zwischenablage-Modus**: AI-Vorschläge
+lassen sich bereits übernehmen, prüfen, bearbeiten und ausdrücklich in die
+Zwischenablage kopieren. Kein Hinweis fordert dafür zum Öffnen des Terminals auf.
+Sobald das Terminal verbunden ist, werden **Terminal** und **Letzter Command**
+als Standard für neue Vorgänge gewählt. Bei Terminaltrennung gilt wieder
+Zwischenablage. Eine laufende Kopierprüfung wird beim Öffnen der Shell nicht
+automatisch zur Terminalfreigabe.
+
+**Ausgabebereich → Zwischenablage** und das Ziel für AI-Vorschläge sind gekoppelt.
+Diese Auswahl gilt deshalb auch bei geöffnetem Terminal: AI-Vorschläge werden
+nur mit **In Zwischenablage kopieren** übernommen und nicht ins Terminal gesendet.
+Ein Wechsel bei offenem Command erzeugt einen neuen Review; alte Freigaben gelten
+nicht mehr. Während Übernahme oder Zustellung ist die Moduswahl gesperrt.
+Zeilenbereiche bzw. **Letzter Command** schalten zurück zum Terminalmodus.
+
+Links liest **Prüfen →** den aktuellen Zwischenablagetext zur Rückgabe an die AI.
+Erst nach Prüfung und ausdrücklicher Freigabe wird er geteilt. Die Rückgabe ist
+standardmäßig unabhängig vom letzten Command; dessen offene Rückgabe bleibt
+erhalten. Kopieren an die Zwischenablage hängt kein automatisches finales Return
+an. Ohne zuvor aus der App freigegebenen Command zeigt **Letzter Command** einen
+Hinweis; für manuelle Terminalausgaben einen Zeilenbereich wählen.
+
+Nur Text bis 64 KiB innerhalb des bestehenden Nachrichtenlimits; unsichtbare
+Steuerzeichen einschließlich Tabs werden wie bei Terminalrückgaben abgewiesen.
+Unter Qubes muss der Text vorher in die lokale Zwischenablage des App-Qubes
+übertragen werden. Bilder und Dateien werden nicht übernommen.
+
+Für die Modusänderung genügt das Controller-Update. Die enthaltene
+Tunnelkorrektur benötigt eine Bridge ab v0.9.20; ältere Bridges mit demselben
+State-Verzeichnis neu starten. Gespeicherte Kopplung und Credentials bleiben erhalten. [Details und Prüfnachweis](doc/RELEASE_V0.9.22.md).
+
+## Herunterladen und ausprobieren
+
+[Python-Datei v0.9.23 herunterladen](https://raw.githubusercontent.com/geco91/admin-in-the-loop/refs/tags/v0.9.23/admin_in_the_loop.py) ·
+[Gesamtes Repository als ZIP](https://github.com/geco91/admin-in-the-loop/archive/refs/tags/v0.9.23.zip)
+
+Die einzelne Python-Datei genügt für die Anwendung; Tests und Dokumentation
+liegen zusätzlich im ZIP. In einem eigenen, leeren Verzeichnis herunterladen:
+
+```bash
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://raw.githubusercontent.com/geco91/admin-in-the-loop/refs/tags/v0.9.23/admin_in_the_loop.py \
+  --output admin_in_the_loop.py
+python3 admin_in_the_loop.py
+```
+
+Python ≥ 3.11, Tkinter und XFCE Terminal müssen vorhanden sein; für Remote-TLS
+zusätzlich `cryptography`. Debian-Paketbefehle stehen unter [Voraussetzungen](#voraussetzungen).
+Unter Qubes wird die Controller-App im vorgesehenen App-Qube gestartet.
+
+## Einfach aktualisieren
+
+App schließen, dann im Verzeichnis der heruntergeladenen Datei ausführen:
+
+```bash
+# Original-Repository GeektankLabs, main
+python3 admin_in_the_loop.py update
+
+# Fork, weiterhin main — für diesen Entwicklungsstand geco91 verwenden
+python3 admin_in_the_loop.py update geco91
+
+# Ausdrücklich einen Entwicklungsbranch dieses Forks ausprobieren
+python3 admin_in_the_loop.py update geco91 feature/mein-branch
+```
+
+`--update` funktioniert genauso wie `update`. Ohne Nutzernamen gilt immer
+`GeektankLabs/admin-in-the-loop`; der Repo-Name bleibt gleich. Ohne Branch gilt
+`main`. Die Quelle wird nicht dauerhaft umgestellt: Für weitere Updates aus
+einem Fork dessen Namen wieder angeben. Der Entwicklungsbranch muss existieren.
+
+Das Update prüft Python-Syntax sowie übereinstimmende App-/Bridge-Versionen,
+führt den Download dabei nicht aus und ersetzt nur die Anwendungsdatei atomar.
+`admin_in_the_loop.py.bak` enthält die unmittelbar vorherige Datei. Gleicher
+Dateiinhalt wird nicht erneut geschrieben. Einstellungen, Verbindungen und
+installierte Prüftools werden nicht überschrieben. App und gegebenenfalls eine
+separat laufende Bridge anschließend neu starten; diese werden nicht automatisch
+beendet oder aktualisiert. Bei getrennten Qubes die jeweilige Kopie aktualisieren.
+
+Ohne ausdrücklich angegebenen Branch wird eine ältere Versionsnummer abgelehnt.
+Das Original kann hinter dem Fork liegen. Mit beiden Parametern ist auch ein
+bewusster Wechsel auf einen älteren Branch möglich. Die Python-Datei aus diesem
+Branch kann weniger Funktionen besitzen; die Sicherung erlaubt die Rückkehr.
+Updates vertrauen dem ausgewählten GitHub-Konto und Branch über HTTPS. Syntax-
+und Versionsprüfung sind keine Signaturprüfung oder Sicherheitsbewertung des Codes.
+Lokale Änderungen an der Anwendungsdatei werden im Backup gesichert und ersetzt.
+Bei einem Git-Checkout stattdessen den üblichen Git-Workflow verwenden.
+
+[Veröffentlichungsumfang und Prüfnachweis](doc/RELEASE_V0.9.18.md)
+
+### Tunnel nach Ruhezustand oder erneutem App-Start prüfen
+
+Nach „Controller-Kontakt: Kopplung bestätigt“ prüft die Bridge ihren konfigurierten
+Tunnel frisch im Hintergrund. Ein gesunder eigener Client läuft weiter. Bei
+behebbarem Ausfall wird einmal mit den gespeicherten Werten neu gestartet,
+höchstens ein solcher Wiederanlauf innerhalb von 30 Sekunden. Key-/Rechtefehler
+und Provider-Drosselung lösen dabei keinen Neustart aus. Eine neue Kopplung
+oder das erneute Eingeben des Runtime Keys ist für die Wiederherstellung nicht nötig.
+
+Der Controller beobachtet den Remote-Tunnel weiter, auch nachdem „verbunden“
+erreicht wurde. Ein alter Erfolgsstatus bleibt dadurch nicht unbegrenzt grün.
+Ein erfolgreicher Providerkontakt darf höchstens 90 Sekunden zurückliegen;
+der Client muss einen aktuellen, fehlerfreien Status liefern. Dies belegt
+weiterhin nicht, dass die Werkzeuge in einem konkreten AI-Chat geladen sind.
+
+**Für diese Erweiterung Controller und Bridge aktualisieren und die Bridge
+einmal neu starten.** Bei einer alten Bridge ohne Updatefunktion die neue
+Python-Datei herunterladen und anschließend mit dem bisherigen Bridge-Startbefehl
+und demselben State-Verzeichnis starten. Fingerprint, Kopplung und gespeicherte
+Tunnelwerte werden dabei weiterverwendet. [Ablauf und Grenzen](doc/RELEASE_V0.9.18.md).
+
+### Frühere Terminalbefehle mit Pfeiltasten aufrufen
+
+Im geöffneten Terminal ruft **Pfeil hoch** frühere Shellbefehle auf; **Pfeil runter**
+geht wieder vorwärts bis zur aktuellen Eingabe. Erst Enter führt die bearbeitete
+Zeile aus. Manuelle und bereits freigegebene Befehle verwenden dieselbe Bash-History.
+
+Die History hält höchstens 1000 Einträge im Speicher der jeweiligen Shell.
+Sie wird nicht auf Festplatte gespeichert und nicht aus der persönlichen
+`.bash_history` importiert. Ein neues Terminal startet leer; bisherige Eingaben
+aus Versionen ohne History können nicht nachträglich übernommen werden.
+Direkt aufeinanderfolgende Duplikate und Zeilen mit führendem Leerzeichen werden
+nicht aufgenommen. Bash-History-Ersetzungen wie `!!` sind ausgeschaltet.
+Nach dem Update ein neues Terminal öffnen, damit diese Startkonfiguration gilt.
+
+### Vorschlag vorhanden, aber „Prüfen“ ausgegraut?
+
+Die lokale Terminalsitzung muss verbunden sein. Nach einem App-Neustart kann
+die gespeicherte Bridge bereits wieder verbunden sein, während links noch
+„Terminal öffnen“ angeboten wird. Zuerst dieses Terminal öffnen; anschließend
+wird „Prüfen“ freigeschaltet. Ein Vorschlag wird dabei nicht ausgeführt.
+
+Der Vorschlagsstatus nennt ab v0.9.16 den jeweiligen Sperrgrund: fehlendes oder
+startendes Terminal, laufende Übernahme/Übertragung oder ein bereits aktiver
+Commandreview. Einen aktiven Commandreview zuerst freigeben oder verwerfen.
+Eine offene Ausgabeprüfung lässt sich weiterhin über den bestehenden Dialog
+verlassen, um den neuen Vorschlag zu prüfen.
 
 Die Anwendung bleibt ein früher MVP, keine Abnahme für kritische Infrastruktur.
 „Konzept V0.7“, „MVP 0.8“ und der alte v0.0.1-Veröffentlichungsentwurf sind
-historische Stände. Die bestehende Runtime-Versionsquelle ist
-`BRIDGE_SERVER_INFO.version` in `admin_in_the_loop.py`.
+historische Stände. Die Runtime-Versionsquelle ist `APP_VERSION` in
+`admin_in_the_loop.py`; die eingebettete Bridge führt dieselbe Version separat.
 
 Hosted ChatGPT-Work, offizielles Tunnelbinary und native Desktop-Abnahmen bleiben
-offene separate Schritte (zuletzt vier externe Test-Skips). Die Mac-Vorschau ist
-nicht integriert. Der optionale sh-guard-Reviewer bleibt standardmäßig aus;
-alle realen Binary-Pins sind weiterhin `approved=False`.
+offene separate Schritte; der aktuelle Verbindungs-Prüfnachweis steht in
+[CONNECTION_UX.md](doc/CONNECTION_UX.md). Die Mac-Vorschau ist
+nicht integriert. Der optionale sh-guard-Reviewer bleibt beim Erststart aus;
+die bewusste Aktivierung wird gespeichert. Installation und lokale Analyse sind
+mit gepinnten v0.1.10-Binaries integriert; siehe [sh-guard-Anleitung und Prüfnachweise](doc/SH_GUARD.md).
 
 Der [Testbericht vom 30. September 2026](tests/MVP_0.8_TEST_REPORT.md) dokumentiert
 damalige Linux-/Ubuntu-Prüfungen. Er belegt keine aktuelle native macOS- oder
 Debian-Desktop-Abnahme und keinen echten ChatGPT-/OpenAI-Round-Trip. Eine lokale
 Bereitschaftsmeldung ist kein Nachweis, dass der gewünschte AI-Chat verbunden ist.
+
+Der [bebilderte Qubes-Verbindungsablauf](doc/CONNECTION_UX.md) zeigt die fünf Schritte,
+Wiederherstellung und Fehlerhilfe aus der aktuellen Oberfläche.
 
 ## Sicherheitsmodell in Kürze
 
@@ -51,8 +220,8 @@ Bereitschaftsmeldung ist kein Nachweis, dass der gewünschte AI-Chat verbunden i
 
 Menschliche Zustimmung ist keine Garantie für sichere Shellcommands. Commands
 können selbst Dateien lesen, löschen oder Daten versenden. Automatische
-Secret-Redaction und eine verlässliche Risikoklassifizierung sind nicht Teil
-dieses MVP. Ausgewählter Output kann Secrets enthalten; Ausgabeintervalle sind
+Secret-Redaction ist nicht integriert. Die optionale statische Commandanalyse
+unterstützt den Review, garantiert aber keine sichere Einstufung. Ausgewählter Output kann Secrets enthalten; Ausgabeintervalle sind
 keine verifizierten Commandgrenzen oder Exitcodes.
 
 Prozesse unter derselben Benutzerkennung sind keine starke Dateisystemisolation.
@@ -89,7 +258,7 @@ der Controller sie nicht sicher kennt. Beim Schließen des Controllerfensters
 | Bereich | Voraussetzungen |
 |---|---|
 | Lokaler Controller | Unix, Python ≥ 3.11, Bash, Tkinter und grafische Sitzung |
-| Linux-Terminalstart | `xterm`; Debian-Paketnamen siehe unten |
+| Linux-Terminalstart | `xfce4-terminal` mit nativem Copy/Paste-Kontextmenü; Debian-Paketnamen siehe unten |
 | macOS-Terminalstart | Terminal.app und `/usr/bin/osascript`; ggf. Automation-Erlaubnis. Native Abnahme ist nicht belegt. |
 | Lokale oder Remote-Bridge | Nur Python-Standardbibliothek im selben Python, das die Bridge startet |
 | Remote-Kopplung / TLS | Zusätzlich `cryptography` auf den beteiligten Python-Seiten |
@@ -111,7 +280,7 @@ Installer vorausgesetzt.
 Für eine Debian-Desktop-Umgebung beschreibt die bestehende Anleitung:
 
 ```bash
-sudo apt install python3 python3-tk xterm
+sudo apt install python3 python3-tk xfce4-terminal
 python3 admin_in_the_loop.py
 ```
 

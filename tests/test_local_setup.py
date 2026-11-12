@@ -11,7 +11,7 @@ import threading
 import time
 import unittest
 import zipfile
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -463,9 +463,225 @@ class AppVersionConsistencyTests(unittest.TestCase):
     muessen identisch sein; --version existiert im Haupt-Parser."""
 
     def test_version_sources_pinned(self):
-        self.assertEqual(a.APP_VERSION, "0.9.5")
+        self.assertEqual(a.APP_VERSION, "0.9.29")
         self.assertEqual(a.BRIDGE_SERVER_INFO["name"], "admin-in-the-loop")
         self.assertEqual(a.BRIDGE_SERVER_INFO["version"], a.APP_VERSION)
+
+class ApplicationUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.target = Path(self.temp.name) / "admin_in_the_loop.py"
+        self.source = Path(a.__file__).read_bytes()
+        self.original = self.source.replace(a.APP_VERSION.encode(), b"0.9.14")
+        self.target.write_bytes(self.original)
+        self.target.chmod(0o750)
+
+    def update(self, data=None, **kwargs):
+        with mock.patch.object(a, "download_app_update", return_value=self.source if data is None else data), \
+                redirect_stdout(io.StringIO()):
+            return a.update_application("geco91", target=self.target, **kwargs)
+
+    def test_owner_branch_encoding_and_invalid_sources(self):
+        self.assertEqual(a.app_update_url("GeektankLabs"),
+            "https://raw.githubusercontent.com/GeektankLabs/admin-in-the-loop/refs/heads/main/admin_in_the_loop.py")
+        self.assertIn("/refs/heads/feature/review%23test/", a.app_update_url("fork-user", "feature/review#test"))
+        for owner in ("", "../other", "a/b", "https://evil", "-bad", "bad-", "a"*40):
+            with self.subTest(owner=owner), mock.patch.object(a, "download_app_update") as download:
+                with self.assertRaisesRegex(a.ProbeError, "update_owner"):
+                    a.update_application(owner, target=self.target)
+                download.assert_not_called()
+        for branch in ("", "../main", "foo//bar", "main?x=1", "a b", "a\\b", ".hidden", "a.lock", "a@{b", "/main"):
+            with self.subTest(branch=branch), self.assertRaisesRegex(a.ProbeError, "update_branch"):
+                a.app_update_url("user", branch)
+
+    def test_atomic_update_retains_backup_permissions_and_settings(self):
+        settings = self.target.parent / "preferences.json"
+        settings.write_text('{"text_review_output": true}')
+        self.assertEqual(self.update(), 0)
+        self.assertEqual(self.target.read_bytes(), self.source)
+        self.assertEqual(self.target.with_suffix(".py.bak").read_bytes(), self.original)
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o750)
+        self.assertEqual(settings.read_text(), '{"text_review_output": true}')
+        self.assertEqual(list(self.target.parent.glob(".aitl-update-*")), [])
+
+    def test_identical_download_does_not_replace_file_or_previous_backup(self):
+        self.update()
+        inode = self.target.stat().st_ino
+        self.update()
+        self.assertEqual(self.target.stat().st_ino, inode)
+        self.assertEqual(self.target.with_suffix(".py.bak").read_bytes(), self.original)
+
+    def test_validation_never_executes_candidate(self):
+        marker = self.target.parent / "must-not-run"
+        candidate = self.source + ("\nPath(" + repr(str(marker)) + ").touch()\n").encode()
+        self.update(candidate)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.target.read_bytes(), candidate)
+
+    def test_invalid_candidate_leaves_installation_and_backup_untouched(self):
+        bad = [b"<html>not found</html>", b"APP_VERSION='1.0.0'", b"", b"x"*(a.APP_UPDATE_LIMIT+1),
+               self.source.replace(b'"name": "admin-in-the-loop"', b'"name": "other-app"'),
+               self.source.replace(b'"version": "'+a.APP_VERSION.encode()+b'"', b'"version": "0.0.1"')]
+        for data in bad:
+            with self.subTest(length=len(data)), self.assertRaises(a.ProbeError):
+                self.update(data)
+            self.assertEqual(self.target.read_bytes(), self.original)
+            self.assertFalse(self.target.with_suffix(".py.bak").exists())
+
+    def test_older_version_requires_explicit_branch_choice(self):
+        older = self.source.replace(a.APP_VERSION.encode(), b"0.9.13")
+        with self.assertRaisesRegex(a.ProbeError, "update_downgrade"):
+            self.update(older)
+        self.assertEqual(self.target.read_bytes(), self.original)
+        self.update(older, branch="development", allow_downgrade=True)
+        self.assertEqual(self.target.read_bytes(), older)
+
+    def test_failed_download_and_failed_replace_keep_original(self):
+        with mock.patch.object(a, "download_app_update", side_effect=a.ProbeError("update_download")), \
+                redirect_stdout(io.StringIO()), self.assertRaisesRegex(a.ProbeError, "update_download"):
+            a.update_application("geco91", target=self.target)
+        self.assertEqual(self.target.read_bytes(), self.original)
+        replace = os.replace
+        def fail_candidate(source, destination):
+            if Path(destination) == self.target:
+                raise OSError("simulated disk failure")
+            replace(source, destination)
+        with mock.patch.object(a.os, "replace", side_effect=fail_candidate), \
+                self.assertRaisesRegex(a.ProbeError, "update_filesystem"):
+            self.update()
+        self.assertEqual(self.target.read_bytes(), self.original)
+        self.assertEqual(self.target.with_suffix(".py.bak").read_bytes(), self.original)
+        self.assertEqual(list(self.target.parent.glob(".aitl-update-*")), [])
+
+    def test_symlinks_and_concurrent_local_changes_are_rejected(self):
+        link = self.target.parent / "linked.py"
+        link.symlink_to(self.target)
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(a.ProbeError, "update_filesystem"):
+            a.update_application("geco91", target=link)
+        backup = self.target.with_suffix(".py.bak")
+        backup.symlink_to(self.target)
+        with self.assertRaisesRegex(a.ProbeError, "update_backup"):
+            self.update()
+        self.assertEqual(self.target.read_bytes(), self.original)
+        backup.unlink()
+        def changed(*_):
+            self.target.write_bytes(self.original+b"\n# local edit\n")
+            return self.source
+        with mock.patch.object(a, "download_app_update", side_effect=changed), \
+                redirect_stdout(io.StringIO()), self.assertRaisesRegex(a.ProbeError, "update_target_changed"):
+            a.update_application("geco91", target=self.target)
+        self.assertTrue(self.target.read_bytes().endswith(b"# local edit\n"))
+        self.assertFalse(backup.exists())
+
+    def test_cli_defaults_fork_and_branch_without_starting_gui(self):
+        cases = [("update", [], "GeektankLabs", "main", False),
+                 ("--update", [], "GeektankLabs", "main", False),
+                 ("update", ["geco91"], "geco91", "main", False),
+                 ("--update", ["geco91", "feature/test"], "geco91", "feature/test", True)]
+        for command, values, owner, branch, explicit in cases:
+            with self.subTest(command=command, values=values), \
+                    mock.patch.object(sys, "argv", ["admin_in_the_loop.py", command, *values]), \
+                    mock.patch.object(a, "update_application", return_value=0) as update, \
+                    mock.patch.object(a, "run_gui") as gui:
+                self.assertEqual(a.main(), 0)
+                update.assert_called_once_with(owner, branch, allow_downgrade=explicit)
+                gui.assert_not_called()
+
+    def test_cli_rejects_extra_arguments_and_other_roles_before_download(self):
+        for values in (["update", "user", "branch", "extra"], ["--update", "user", "--gui"],
+                       ["--update", "--terminal-helper", "/tmp/unused"]):
+            with self.subTest(values=values), mock.patch.object(sys, "argv", ["app.py", *values]), \
+                    mock.patch.object(a, "update_application") as update, redirect_stderr(io.StringIO()):
+                with self.assertRaises((a.ProbeError, SystemExit)):
+                    a.main()
+                update.assert_not_called()
+
+    def test_download_uses_fixed_https_url_bounded_read_and_rejects_redirects(self):
+        import urllib.request
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = self.source
+        with mock.patch.object(urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = response
+            self.assertEqual(a.download_app_update("geco91", "feature/test"), self.source)
+            request = build.return_value.open.call_args.args[0]
+            self.assertEqual(request.full_url, a.app_update_url("geco91", "feature/test"))
+            self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 20)
+            response.read.assert_called_once_with(a.APP_UPDATE_LIMIT+1)
+            with self.assertRaisesRegex(a.ProbeError, "update_redirect"):
+                build.call_args.args[0].redirect_request(None, None, 302, "", {}, "http://other/")
+
+
+class TerminalHistoryTests(unittest.TestCase):
+    """Real helper/PTY/Readline, including actual arrow-key bytes and explicit Enter."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="aitl-history-")
+        self.addCleanup(self.temp.cleanup)
+        self.fixture = a.IntegrationFixture(self.temp.name)
+        self.addCleanup(self.fixture.close)
+        self.core = self.fixture.core
+
+    def ready_file(self, name, expected):
+        path = Path(self.temp.name, name)
+        self.fixture.wait(lambda: path.exists() and path.read_bytes() == expected
+                          and self.fixture.transcript.endswith(a.PROMPT))
+
+    def test_up_down_recall_manual_and_approved_commands_without_execution(self):
+        manual = "printf x >> manual-history"
+        approved = "printf y >> approved-history"
+        self.fixture.manual(manual+"\n")
+        self.ready_file("manual-history", b"x")
+        review = self.fixture.approve_command(approved)
+        self.ready_file("approved-history", b"y")
+        checkpoint = len(self.fixture.transcript)
+        self.fixture.manual(b"\x1b[A")
+        self.fixture.wait(lambda: approved.encode() in self.fixture.transcript[checkpoint:])
+        self.assertEqual(Path(self.temp.name, "approved-history").read_bytes(), b"y")
+        checkpoint = len(self.fixture.transcript)
+        self.fixture.manual(b"\x1b[B\n")  # Down returns to the empty draft; Enter executes nothing.
+        self.fixture.wait(lambda: len(self.fixture.transcript) > checkpoint
+                          and self.fixture.transcript.endswith(a.PROMPT))
+        self.assertEqual(Path(self.temp.name, "approved-history").read_bytes(), b"y")
+        checkpoint = len(self.fixture.transcript)
+        self.fixture.manual(b"\x1bOA\x1bOA")  # Application-cursor mode used by native terminals.
+        self.fixture.wait(lambda: b"manual-history" in self.fixture.transcript[checkpoint:])
+        self.assertEqual(Path(self.temp.name, "manual-history").read_bytes(), b"x")
+        self.fixture.manual(b"\n")  # Only this deliberate manual Enter repeats the recalled command.
+        self.ready_file("manual-history", b"xx")
+        self.assertEqual(Path(self.temp.name, "approved-history").read_bytes(), b"y")
+        self.assertEqual(self.core.review.id, review.id)
+        self.assertEqual(self.core.review_state, "TRANSFERRED")
+
+    def test_history_stays_in_memory_and_new_terminal_starts_empty(self):
+        self.fixture.manual(": SESSION_HISTORY_PREVIOUS\n")
+        self.fixture.wait(lambda: b"SESSION_HISTORY_PREVIOUS" in self.fixture.transcript
+                          and self.fixture.transcript.endswith(a.PROMPT))
+        checkpoint = self.core.output.end
+        self.fixture.manual("printf '\\nHISTORY_CONFIG=%s:%s:%s\\n' \"$HISTFILE\" \"$HISTSIZE\" \"$HISTFILESIZE\"\n")
+        self.fixture.wait(lambda: b"\r\nHISTORY_CONFIG=/dev/null:1000:0\r\n" in self.core.output.data)
+        self.fixture.manual("history -w; history\n")
+        self.fixture.wait(lambda: b"SESSION_HISTORY_PREVIOUS" in self.core.output.data[checkpoint:]
+                          and self.fixture.transcript.endswith(a.PROMPT))
+        self.assertFalse(Path(self.temp.name, ".bash_history").exists())
+        with tempfile.TemporaryDirectory(prefix="aitl-fresh-history-") as directory:
+            fresh = a.IntegrationFixture(directory)
+            try:
+                fresh.manual(b"\x1b[Aprintf '\\nFRESH_SESSION_OK\\n'\n")
+                fresh.wait(lambda: b"\r\nFRESH_SESSION_OK\r\n" in fresh.core.output.data)
+                self.assertNotIn(b"SESSION_HISTORY_PREVIOUS", fresh.core.output.data)
+            finally:
+                fresh.close()
+
+    def test_history_expansion_cannot_rewrite_approved_bang_literals(self):
+        self.fixture.approve_command("printf prior > history-seed")
+        self.ready_file("history-seed", b"prior")
+        review = self.fixture.approve_command('printf \'%s\' "!!" > history-literal')
+        self.ready_file("history-literal", b"!!")
+        self.assertEqual(review.payload, b'printf \'%s\' "!!" > history-literal\n')
+        self.assertEqual(self.core.review_state, "TRANSFERRED")
+
 
 class BridgeSetupDefaultsTests(unittest.TestCase):
     """M9: home-state defaults, path resolution, auto SAN, usable URLs, policy line."""

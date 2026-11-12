@@ -25,7 +25,7 @@ from test_local_setup import fake_brew
 
 
 class GUISmokeTests(unittest.TestCase):
-    def test_native_tk_xterm_review_and_connection_dialog(self):
+    def test_native_tk_terminal_review_and_connection_dialog(self):
         with tempfile.TemporaryDirectory(prefix="aitl-gui-") as directory:
             preferences = Path(directory, "config")
             core = a.AppCore(a.PreferenceStore(preferences), a.ConnectionStore(preferences))
@@ -42,8 +42,8 @@ class GUISmokeTests(unittest.TestCase):
                 self.assertLessEqual(abs(ui.from_terminal_button.winfo_rooty() - ui.from_ai_button.winfo_rooty()), 1)
                 self.assertLessEqual(abs(ui.from_ai_button.winfo_rooty() - ui.approve_button.winfo_rooty()), 1)
                 self.assertEqual(ui.preference.get(), "SMALL")
-                self.assertEqual(core.output_mode, "LAST_20")
-                self.assertEqual(ui.output_mode.get(), "Letzte 20")
+                self.assertEqual(core.output_mode, "CLIPBOARD")
+                self.assertEqual(ui.output_mode.get(), "Zwischenablage")
                 self.assertTrue(ui.terminal_button.winfo_ismapped())
                 ui.output_mode.set("Letzte 50")
                 ui.change_output_mode()
@@ -160,6 +160,124 @@ class ConnectionDialogTests(unittest.TestCase):
         self.addCleanup(self.cleanup)
         self.root.update()
 
+    def test_ai_proposal_to_clipboard_without_terminal_is_explicit_and_never_transferred(self):
+        self.core.start_local(self.tmp.name)
+        self.core.connect_local_bridge()
+        self.until(lambda: self.core.bridge_state == "CONNECTED")
+        self.assertEqual(self.ui.command_target.get(), "Zwischenablage")
+        self.assertEqual(self.ui.output_mode.get(), "Zwischenablage")
+        self.assertEqual(self.core.command_target, "CLIPBOARD")
+        self.assertEqual(self.core.output_mode, "CLIPBOARD")  # Source and target use the same mode.
+        self.root.clipboard_clear()
+        self.root.clipboard_append("KEEP UNTIL APPROVAL")
+        proposal = mcp(self.core.bridge_process, "submit_proposal", {
+            "request_id": "GUI_AI_CLIPBOARD_TARGET_001", "text": "printf 'MANUAL_ONLY'"})
+        self.until(lambda: bool(self.core.inbox))
+        self.assertFalse(self.ui.from_ai_button.instate(["disabled"]))
+        with mock.patch.object(self.core, "launch_terminal", side_effect=AssertionError("terminal launch")):
+            self.ui.from_ai_button.invoke()
+            self.assertEqual(self.core.pending_take["command_target"], "CLIPBOARD")
+            self.assertTrue(self.ui.command_target_picker.instate(["disabled"]))
+            self.until(lambda: self.core.review_state == "REVIEW")
+            review = self.core.review
+            self.assertEqual(review.command_target, "CLIPBOARD")
+            self.assertIsNone(review.session)
+            self.assertFalse(review.final_return)
+            self.assertEqual(self.root.clipboard_get(), "KEEP UNTIL APPROVAL")
+            self.assertEqual(self.ui.direction.get(), "AI → Zwischenablage")
+            self.assertEqual(self.ui.approve_button.cget("text"), "In Zwischenablage kopieren")
+            self.assertFalse(self.ui.return_checkbox.winfo_ismapped())
+            with self.assertRaisesRegex(a.ProbeError, "terminal_not_connected"):
+                self.core.set_command_target("TERMINAL")
+            with self.assertRaisesRegex(a.ProbeError, "clipboard_target_requires_copy"):
+                self.core.approve(review.id)
+            edited = self.core.edit_review(review.id, "printf 'REVIEWED_MANUAL_ONLY'")
+            self.assertEqual(edited.command_target, "CLIPBOARD")
+            self.core._disconnect()
+            self.assertEqual(self.core.review_state, "REVIEW")
+            self.core.set_paused(True)
+            with self.assertRaisesRegex(a.ProbeError, "paused"):
+                self.core.copy_command(edited.id, self.root.clipboard_append)
+            self.assertEqual(self.root.clipboard_get(), "KEEP UNTIL APPROVAL")
+            self.core.set_paused(False)
+            self.ui.render()
+            with mock.patch.object(self.root, "clipboard_append", side_effect=tk.TclError()), \
+                    mock.patch.object(self.ui.messagebox, "showerror") as error:
+                self.ui.approve_button.invoke()
+            self.assertIn("Bitte erneut versuchen", error.call_args.args[1])
+            self.assertEqual(self.core.review_state, "REVIEW")
+            self.ui.approve_button.invoke()
+            self.assertEqual(self.core.review_state, "COPIED")
+            self.assertEqual(self.root.clipboard_get(), edited.payload.decode())
+            self.assertFalse(self.root.clipboard_get().endswith("\n"))
+            with self.assertRaisesRegex(a.ProbeError, "approval_already_consumed"):
+                self.core.copy_command(edited.id, self.root.clipboard_append)
+            self.assertIsNone(self.core.channel)
+            self.assertIsNone(self.core.open_return)
+            self.assertIsNone(self.core.last_transfer_offset)
+            self.assertFalse(self.core.transferred)
+            status = mcp(self.core.bridge_process, "get_submission_status",
+                         {"submission_id": proposal["submission_id"]})
+            self.assertEqual(status["state"], "TAKEN")
+            self.assertIn("nicht ausgeführt", self.ui.review_status.get())
+
+    def test_clipboard_review_and_bridge_return_without_opening_terminal(self):
+        self.core.start_local(self.tmp.name)
+        self.core.connect_local_bridge()
+        self.until(lambda: self.core.bridge_state == "CONNECTED")
+        self.assertIsNone(self.core.channel)
+        self.assertIsNone(self.core.session)
+        self.assertFalse(self.ui.from_terminal_button.instate(["disabled"]))
+        self.root.clipboard_clear()
+        self.root.clipboard_append("External text without terminal\n")
+        self.ui.output_mode.set("Zwischenablage")
+        self.ui.change_output_mode()
+        self.assertFalse(self.ui.from_terminal_button.instate(["disabled"]))
+        with mock.patch.object(self.core, "launch_terminal", side_effect=AssertionError("terminal launch")):
+            self.ui.from_terminal_button.invoke()
+            review = self.core.review
+            self.assertEqual(review.text, "External text without terminal\n")
+            self.assertIsNone(review.session)
+            self.assertTrue(self.ui._payload_snapshot_current(self.core.snapshot(), review))
+            self.core._disconnect()  # A terminal lifecycle change does not invalidate external text.
+            self.assertEqual(self.core.review_state, "REVIEW")
+            edited = self.core.edit_review(review.id, "Reviewed external text\n")
+            self.ui.render()
+            self.assertTrue(self.ui._payload_snapshot_current(self.core.snapshot(), edited))
+            self.core.set_paused(True)
+            self.ui.render()
+            self.assertTrue(self.ui.approve_button.instate(["disabled"]))
+            self.core.set_paused(False)
+            self.ui.render()
+            self.assertEqual(mcp(self.core.bridge_process, "get_approved_output")["outputs"], [])
+            self.ui.approve_button.invoke()
+            self.assertTrue(self.ui.from_terminal_button.instate(["disabled"]))
+            self.until(lambda: self.core.review_state == "ACKNOWLEDGED")
+            output = mcp(self.core.bridge_process, "get_approved_output")["outputs"][0]
+            self.assertEqual(output["text"], edited.text)
+            self.assertIsNone(output["submission_id"])
+            self.assertIsNone(self.core.channel)
+        # Terminal reviews still require a connected terminal; bridge trust is unchanged.
+        self.core.output.append(b"terminal output\n")
+        with self.assertRaisesRegex(a.ProbeError, "terminal_not_connected"):
+            self.core.select_output()
+        with self.assertRaisesRegex(a.ProbeError, "terminal_not_connected"):
+            self.core.review_command("true", target="TERMINAL")
+        self.ui.output_mode.set("Letzte 20")
+        self.ui.change_output_mode()
+        self.assertTrue(self.ui.from_terminal_button.instate(["disabled"]))
+        self.ui.output_mode.set("Zwischenablage")
+        self.ui.change_output_mode()
+        self.ui.from_terminal_button.invoke()
+        review = self.core.review
+        self.core.disconnect_bridge()
+        self.ui.render()
+        self.assertEqual(self.core.review_state, "STALE")
+        self.assertFalse(self.ui._payload_snapshot_current(self.core.snapshot(), review))
+        with self.assertRaisesRegex(a.ProbeError, "stale_bridge_binding"):
+            self.core.approve(review.id)
+        self.assertTrue(self.ui.approve_button.instate(["disabled"]))
+
     def cleanup(self):
         self.core.close()
         for callback in self.root.tk.call("after", "info"):
@@ -182,6 +300,77 @@ class ConnectionDialogTests(unittest.TestCase):
             yield child
             yield from self.descendants(child)
 
+    def test_pending_proposal_explains_terminal_gate_even_with_connected_bridge(self):
+        self.core.start_local(self.tmp.name)
+        self.core.set_command_target("TERMINAL")
+        proposal = self.core.add_proposal("printf 'review only'")
+        bridge = a.replace(self.core.bridge_snapshot(), state="CONNECTED", mode="REMOTE",
+                           target="https://127.0.0.1:8443", tunnel_phase="connected")
+        with mock.patch.object(self.core, "bridge_snapshot", return_value=bridge), \
+                mock.patch.object(self.core, "review_pending_proposal", wraps=self.core.review_pending_proposal) as take:
+            for size in ("960x560", "1360x850"):
+                self.root.geometry(size)
+                for state, reason in (("WAITING_FOR_TERMINAL", "Zuerst links Terminal öffnen"),
+                                      ("STARTING_SHELL", "Terminal verbindet"),
+                                      ("DISCONNECTED", "Terminal getrennt")):
+                    with self.subTest(size=size, state=state):
+                        self.core.connection = state
+                        self.ui.render()
+                        self.root.update()
+                        self.assertIn("Command-Vorschlag vorhanden", self.ui.readiness.cget("text"))
+                        self.assertIn(reason, self.ui.readiness.cget("text"))
+                        self.assertTrue(self.ui.from_ai_button.instate(["disabled"]))
+                        self.ui.from_ai_button.invoke()
+                        self.assertIn(proposal, self.core.inbox)
+                        self.assertIsNone(self.core.review)
+                        self.assertTrue(self.ui.readiness.winfo_viewable())
+                        self.assertGreaterEqual(self.ui.readiness.winfo_height(), self.ui.readiness.winfo_reqheight())
+                        self.assertLessEqual(self.ui.from_ai_button.winfo_rooty()+self.ui.from_ai_button.winfo_height(),
+                                             self.root.winfo_rooty()+self.root.winfo_height())
+            take.assert_not_called()
+            self.core.connection = "STARTING_SHELL"
+            self.core._event({"type": "ready", "session": "12345678-1234-1234-1234-123456789012"})
+            self.ui.render()
+            self.root.update()
+            self.assertTrue(self.ui.from_ai_button.instate(["!disabled"]))
+            self.assertEqual(self.ui.readiness.cget("text"), "Command-Vorschlag vorhanden")
+            self.ui.from_ai_button.invoke()
+            take.assert_called_once()
+            self.assertEqual(self.core.review_state, "REVIEW")
+            self.assertEqual(self.core.review.text, "printf 'review only'\n")
+            self.assertNotIn(proposal, self.core.inbox)
+            self.assertIsNone(self.core.channel)  # No terminal send or approval took place.
+
+    def test_pending_proposal_explains_stage_and_transfer_gates(self):
+        self.core.connection, self.core.session = "CONNECTED", "UI_TEST_SESSION"
+        self.core.set_command_target("TERMINAL")
+        self.core.review_command("printf 'current review'")
+        proposal = self.core.add_proposal("printf 'next review'")
+        for state, reason in (("REVIEW", "Aktuellen Review freigeben oder verwerfen"),
+                              ("OVERRIDE_REQUIRED", "Aktuellen Review freigeben oder verwerfen"),
+                              ("CHECKING", "Terminalübertragung läuft"),
+                              ("TRANSFERRING", "Terminalübertragung läuft"),
+                              ("TAKE_PENDING", "Übernahme wird bestätigt"),
+                              ("SENDING", "Ausgabe wird zurückgegeben"),
+                              ("DELIVERY_UNCERTAIN", "Zustellung der Ausgabe klären")):
+            with self.subTest(state=state):
+                self.core.review_state = state
+                self.ui.render()
+                self.assertTrue(self.ui.from_ai_button.instate(["disabled"]))
+                self.assertIn(reason, self.ui.readiness.cget("text"))
+                self.assertIn(proposal, self.core.inbox)
+        self.core.review_state = "REVIEW"
+        self.core.review = a.replace(self.core.review, direction="TO_OUTPUT_SINK", final_return=False)
+        self.ui.render()
+        self.assertTrue(self.ui.from_ai_button.instate(["!disabled"]))  # Existing directional dialog stays reachable.
+        self.core.review = a.replace(self.core.review, direction="TO_TERMINAL")
+        self.core._park_staged_proposal()
+        self.core.remove_proposal(proposal)
+        self.ui.render()
+        self.assertTrue(self.ui.from_ai_button.instate(["!disabled"]))
+        self.assertIn("Geparkter Vorschlag vorhanden", self.ui.readiness.cget("text"))
+        self.assertIsNone(self.core.channel)
+
     def test_panel_proportions_and_shared_footer_at_supported_sizes(self):
         for width in (960, 1360):
             self.root.geometry("%dx600" % width)
@@ -202,16 +391,16 @@ class ConnectionDialogTests(unittest.TestCase):
                 graphic = self.ui.section_logo_labels[section]
                 self.assertTrue(graphic.winfo_ismapped())
                 self.assertIs(graphic.master.master.master, panel)
-            self.assertGreater(self.ui.header_bar.winfo_width() - self.ui.logo_label.winfo_width(), 600)
-            self.assertGreater(self.ui.layout.winfo_rooty(),
-                               self.ui.header_bar.winfo_rooty() + self.ui.header_bar.winfo_height() - 1)
+            self.assertEqual(self.ui.layout.winfo_rooty(), self.root.winfo_rooty())
+            self.assertEqual(self.root.title(), "Admin in the Loop · v" + a.APP_VERSION)
         base = ttk.Style(self.root).lookup("TFrame", "background") or self.root.cget("background")
         self.assertEqual(self.ui.logo_variant, a._logo_variant(self.root, base))
         left, center, right = self.ui.panels
         self.assertEqual(left.cget("highlightbackground"), right.cget("highlightbackground"))
         self.assertNotEqual(left.cget("highlightbackground"), center.cget("highlightbackground"))
-        self.assertTrue(any(getattr(widget, "cget", lambda _: "")("text") == "Review"
-                            for widget in self.descendants(center) if widget.winfo_class() == "TLabel"))
+        self.assertTrue(self.ui.review_picker.winfo_ismapped())
+        self.assertIn("Befehlsprüfung", self.ui.review_selection.get())
+        self.assertFalse(self.ui.review_options.winfo_viewable())
         self.assertEqual(self.ui.editor.text.cget("state"), "disabled")
         self.assertEqual(self.callbacks, [])
 
@@ -231,6 +420,7 @@ class ConnectionDialogTests(unittest.TestCase):
         self.assertTrue(self.ui.reject_button.instate(["disabled"]))
         self.core.session = "HAND_BUTTON_TEST_SESSION"
         self.core.connection = "CONNECTED"
+        self.core.set_command_target("TERMINAL")
         review = self.core._output_review("selected output\n")
         self.ui.render()
         self.assertEqual(self.ui.approve_button.cget("text"), "Freigeben an AI →")
@@ -302,6 +492,9 @@ class ConnectionDialogTests(unittest.TestCase):
         dialog.wizard_goto(1)
         self.root.update()
         self.assertTrue(dialog.chat_section.winfo_ismapped())
+        self.assertFalse(dialog.controls.winfo_ismapped())
+        dialog.details_button.invoke()
+        self.root.update()
         self.assertTrue(dialog.controls.winfo_ismapped())
         dialog.buttons["offline"].focus_force()
         self.root.update()
@@ -412,7 +605,8 @@ class ConnectionDialogTests(unittest.TestCase):
         self.assertNotEqual(self.core.chat_binding["code"], old_code)
         self.assertEqual(self.ui.chat_code.get(), self.core.chat_binding["code"][:4] + "-" +
                          self.core.chat_binding["code"][4:])
-        self.assertEqual(sum(isinstance(widget, tk.Toplevel) for widget in self.root.winfo_children()), 1)
+        self.assertEqual(sum(isinstance(widget, tk.Toplevel) and widget.winfo_viewable()
+                             for widget in self.root.winfo_children()), 1)
         self.core.disconnect_bridge()
         self.ui.render()
         self.assertEqual(dialog.binding.get(), "")
@@ -723,7 +917,7 @@ for variant, background in (("light", "#ffffff"), ("dark", "#101010")):
         assert graphic.master.master.master is panel
         assert graphic.winfo_rooty() < ui.status_labels[0 if section == "terminal" else 1][0].winfo_rooty()
         assert image.transparency_get(0, 0) == (variant == "dark")
-    assert ui.logo_label.cget("text") == "Admin in the Loop"
+    assert root.title() == "Admin in the Loop · v" + app.APP_VERSION
     for name, button in (("ok", ui.approve_button), ("stop", ui.reject_button)):
         image = ui.button_hand_images[name]
         assert image is not None and (image.width(), image.height()) == (24, 24)
@@ -731,7 +925,7 @@ for variant, background in (("light", "#ffffff"), ("dark", "#101010")):
         assert tuple(map(str, root.tk.splitlist(button.cget("image")))) == (str(image),)
         assert str(button.cget("compound")) == "left" and button.winfo_ismapped()
         assert button.instate(["disabled"])
-    assert ui.header_bar.winfo_width() - ui.logo_label.winfo_width() > 600
+    assert ui.layout.winfo_rooty() == root.winfo_rooty()
     for width in (960, 1100, 1360):
         root.geometry("%dx600" % width)
         root.update()
@@ -749,9 +943,10 @@ for variant, background in (("light", "#ffffff"), ("dark", "#101010")):
                     assert widget.winfo_width() >= panel.winfo_width() - 30
         for label, _ in ui.status_labels:
             assert str(label.cget("justify")) == "center"
-        review_title = next(w for w in descendants(ui.panels[1])
-                            if isinstance(w, ttk.Label) and w.cget("text") == "Review")
-        assert review_title.pack_info()["anchor"] == "w"
+        assert ui.review_picker.winfo_ismapped()
+        assert ui.review_picker.grid_info()["sticky"] == "ew"
+        assert ui.review_selection.get().startswith("Befehlsprüfung")
+        assert not ui.review_options.winfo_viewable()
         assert ui.editor.text.cget("state") == "disabled"
     assert core.bridge_process is None and core.tunnel is None
     results.append({"variant": variant, "dimensions": [80, 64], "sections": ["terminal", "ai"], "mapped": True})
@@ -784,8 +979,8 @@ print(json.dumps(results))
                 root.update()
                 self.assertEqual(ui.section_images, {"terminal": None, "ai": None})
                 self.assertEqual(ui.section_logo_labels, {})
-                self.assertEqual(ui.logo_label.cget("text"), "Admin in the Loop")
-                self.assertTrue(ui.logo_label.winfo_ismapped())
+                self.assertEqual(root.title(), "Admin in the Loop · v" + a.APP_VERSION)
+                self.assertEqual(ui.layout.winfo_rooty(), root.winfo_rooty())
                 for label, _ in ui.status_labels:
                     titles = [child.cget("text") for child in label.master.winfo_children()
                               if child.winfo_class() == "TLabel" and not str(child.cget("textvariable"))]
@@ -812,6 +1007,7 @@ print(json.dumps(results))
                 self.assertEqual(ui.reject_button.cget("text"), "Verwerfen")
                 core.session = "TEXT_FALLBACK_SESSION"
                 core.connection = "CONNECTED"
+                core.set_command_target("TERMINAL")
                 core._output_review("reject this\n")
                 ui.render()
                 ui.reject_button.invoke()
@@ -832,6 +1028,7 @@ class WorkPackageReviewUITests(unittest.TestCase):
         self.ui = a.ReviewUI(self.root, self.core)
         self.core.session = "SYNTHETIC_REVIEW_SESSION"
         self.core.connection = "CONNECTED"
+        self.core.set_command_target("TERMINAL")
         self.addCleanup(self.cleanup)
 
     def cleanup(self):
@@ -934,6 +1131,78 @@ class WorkPackageReviewUITests(unittest.TestCase):
         self.assertEqual(self.core.review, review)
         self.assertEqual(self.core.review_state, "REVIEW")
         window.destroy()
+
+    def test_mouse_context_copy_paste_for_entries_text_and_readonly_fields(self):
+        window = tk.Toplevel(self.root)
+        try:
+            widgets = (tk.Entry(window), ttk.Entry(window, show="*"), ttk.Combobox(window),
+                       tk.Spinbox(window), ttk.Spinbox(window), tk.Text(window, height=2))
+            for widget in widgets:
+                widget.pack()
+            self.root.update()
+            menu = self.ui.clipboard_menu.menu
+            for widget in widgets:
+                with self.subTest(widget=widget.winfo_class()):
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append("MOUSE-é")
+                    widget.event_generate("<Button-3>", x=5, y=5, rootx=100, rooty=100)
+                    self.root.update()
+                    self.assertIs(self.ui.clipboard_menu.target, widget)
+                    self.assertEqual(str(menu.entrycget("Einfügen", "state")), "normal")
+                    menu.invoke("Einfügen")
+                    menu.unpost()
+                    if isinstance(widget, tk.Text):
+                        self.assertEqual(widget.get("1.0", "end-1c"), "MOUSE-é")
+                        widget.tag_add("sel", "1.0", "end-1c")
+                    else:
+                        self.assertIn("MOUSE-é", widget.get())
+                        widget.selection_range(0, "end")
+                    widget.event_generate("<Button-3>", x=5, y=5, rootx=100, rooty=100)
+                    self.root.update()
+                    menu.invoke("Kopieren")
+                    menu.unpost()
+                    copied = widget.get("1.0", "end-1c") if isinstance(widget, tk.Text) else widget.get()
+                    self.assertEqual(self.root.clipboard_get(), copied)
+            entry = widgets[1]
+            entry.configure(state="readonly")
+            entry.selection_range(0, "end")
+            entry.event_generate("<Button-3>", x=5, y=5, rootx=100, rooty=100)
+            self.root.update()
+            self.assertEqual(str(menu.entrycget("Einfügen", "state")), "disabled")
+            self.assertEqual(str(menu.entrycget("Kopieren", "state")), "normal")
+            menu.unpost()
+            self.assertIsNone(self.core.review)
+        finally:
+            window.destroy()
+
+    def test_code_context_paste_edits_source_selection_only_after_apply(self):
+        review = self.core.review_command("echo é😀 old", False)
+        self.ui.render()
+        box = self.ui.editor
+        box.show_review(review.text, ((0, len(review.text), 50),))
+        first, last = review.text.index("old"), len(review.text)
+        box.text.tag_add("sel", box.copy_positions[first], box.copy_positions[last])
+        self.root.clipboard_clear()
+        self.root.clipboard_append("new")
+        with mock.patch.object(self.core, "approve") as approve:
+            box.text.event_generate("<Button-3>", x=5, y=5, rootx=100, rooty=100)
+            self.root.update()
+            self.ui.context.invoke("Einfügen")
+            self.ui.context.unpost()
+            self.root.update()
+            self.assertEqual(self.ui.edit_box.text.get("1.0", "end-1c"), "echo é😀 new")
+            self.assertEqual(self.core.review, review)
+            self.ui.edit_apply_button.invoke()
+            self.root.update()
+            self.assertEqual(self.core.review.text, "echo é😀 new")
+            self.assertGreater(self.core.review.revision, review.revision)
+            self.assertEqual(self.core.review_state, "REVIEW")
+            approve.assert_not_called()
+        self.core.review_state = "ACKNOWLEDGED_LOCAL"
+        box.text.event_generate("<Button-3>", x=5, y=5, rootx=100, rooty=100)
+        self.root.update()
+        self.assertEqual(str(self.ui.context.entrycget("Einfügen", "state")), "disabled")
+        self.ui.context.unpost()
 
     def test_keyboard_and_context_copy_keep_review_colors_font_and_risk_tags(self):
         review = self.core.review_command("echo é😀", False)
@@ -1083,6 +1352,7 @@ class StageConflictDialogTests(unittest.TestCase):
             if self.core.open_return is not None:
                 self.core.close_open_return()
             if self.core.connection == "CONNECTED" and self.core.channel:
+                self.core.set_command_target("TERMINAL")
                 review = self.core.review_command("exit", True)
                 self.core.approve(review.id)
                 self.until(lambda: self.core.connection == "DISCONNECTED", 3)
@@ -1128,6 +1398,82 @@ class StageConflictDialogTests(unittest.TestCase):
         self.assertEqual([button.cget("text") for button in self.ui.conflict_buttons.values()],
                          ordered_labels)
 
+    def test_clipboard_selection_reads_on_check_and_requires_explicit_approval(self):
+        self.submit("printf 'LOCAL_SOURCE\\n'", "GUI_CLIPBOARD_SOURCE_001")
+        self.take()
+        self.transfer()
+        self.ui.output_mode.set("Zwischenablage")
+        with mock.patch.object(self.root, "clipboard_get", side_effect=AssertionError("early read")):
+            self.ui.change_output_mode()
+            self.ui.render()
+        self.root.clipboard_clear()
+        self.root.clipboard_append("External clipboard snapshot\n")
+        pending = dict(self.core.open_return)
+        self.ui.from_terminal_button.invoke()
+        self.root.update()
+        review = self.core.review
+        self.assertEqual(review.text, "External clipboard snapshot\n")
+        self.assertEqual(review.output_source, "CLIPBOARD")
+        self.assertEqual(self.ui.direction.get(), "Zwischenablage → AI")
+        self.assertEqual(self.ui.review_notebook.tab(self.ui.code_tab, "text"), "Zwischenablage")
+        self.assertIsNone(self.ui.binding_submission[self.ui.binding_value.get()])
+        self.root.clipboard_clear()
+        self.root.clipboard_append("Changed after review")
+        self.assertEqual(self.core.review.text, "External clipboard snapshot\n")
+        self.assertEqual(mcp(self.core.bridge_process, "get_approved_output")["outputs"], [])
+        self.ui.approve_button.invoke()
+        self.until(lambda: self.core.review_state == "ACKNOWLEDGED")
+        output = mcp(self.core.bridge_process, "get_approved_output")["outputs"][0]
+        self.assertEqual(output["text"], review.text)
+        self.assertIsNone(output["submission_id"])
+        self.assertEqual(self.core.open_return, pending)
+        self.ui.from_terminal_button.invoke()
+        self.assertEqual(self.core.review.text, "Changed after review")
+
+    def test_clipboard_unavailable_and_active_review_leave_content_unchanged(self):
+        self.core.set_output_mode("CLIPBOARD")
+        with mock.patch.object(self.ui.messagebox, "showerror") as error:
+            with mock.patch.object(self.root, "clipboard_get", side_effect=tk.TclError()):
+                self.ui.from_terminal()
+            self.assertIn("keinen verfügbaren Text", error.call_args.args[1])
+            self.assertIsNone(self.core.review)
+            command = self.core.review_command("true")
+            with mock.patch.object(self.root, "clipboard_get", side_effect=AssertionError("early read")):
+                self.ui.from_terminal()
+            self.assertIn("offene Prüfung", error.call_args.args[1])
+            self.assertEqual(self.core.review, command)
+
+    def test_clipboard_source_reroutes_active_proposal_without_any_terminal_send(self):
+        with mock.patch.object(self.ui.messagebox, "showinfo") as info:
+            self.ui.from_terminal_button.invoke()
+        self.assertIn("Noch kein Command", info.call_args.args[1])
+        marker = Path(self.tmp.name, "must-not-execute-clipboard-mode")
+        self.submit(": > must-not-execute-clipboard-mode", "GUI_CLIPBOARD_ROUTE_0001")
+        self.take()
+        old = self.core.review
+        self.assertEqual(self.core.output_mode, "SINCE_LAST")
+        self.assertEqual(old.command_target, "TERMINAL")
+        self.root.clipboard_clear()
+        self.root.clipboard_append("UNCHANGED BEFORE APPROVAL")
+        with mock.patch.object(self.core.channel, "send", side_effect=AssertionError("terminal write")) as send:
+            self.ui.output_mode.set("Zwischenablage")
+            self.ui.change_output_mode()
+            self.assertEqual(self.core.review.command_target, "CLIPBOARD")
+            self.assertEqual(self.ui.command_target.get(), "Zwischenablage")
+            self.assertEqual(self.ui.approve_button.cget("text"), "In Zwischenablage kopieren")
+            self.assertNotEqual(self.core.review.id, old.id)
+            self.assertEqual(self.core.review.proposal_id, old.proposal_id)
+            self.assertEqual(self.root.clipboard_get(), "UNCHANGED BEFORE APPROVAL")
+            with self.assertRaisesRegex(a.ProbeError, "stale_review"):
+                self.core.approve(old.id)
+            self.ui.approve_button.invoke()
+            self.assertEqual(self.root.clipboard_get(), ": > must-not-execute-clipboard-mode")
+            self.assertEqual(self.core.review_state, "COPIED")
+            send.assert_not_called()
+        self.assertFalse(marker.exists())
+        self.assertIsNone(self.core.open_return)
+        self.assertIsNone(self.core.last_transfer_offset)
+
     def test_send_conflict_dialog_cancel_escape_and_waiver_send(self):
         self.submit("printf 'GUI_STAGE_A\\n'", "GUI_STAGE_A_REQ_0001")
         self.take()
@@ -1161,6 +1507,72 @@ class StageConflictDialogTests(unittest.TestCase):
         self.until(lambda: self.core.review_state == "TRANSFERRED")
         self.assertTrue(Path(self.tmp.name, "gui-b-marker").exists())
         self.assertEqual(self.core.open_return["return_state"], "offen_sammelnd")  # B's own return now
+
+    def test_recheck_running_command_output_before_and_after_first_return_without_reexecution(self):
+        gate = Path(self.tmp.name, "continue-output")
+        counter = Path(self.tmp.name, "execution-count")
+        # Octal markers prevent the shell's echoed command from satisfying output checks.
+        command = ("printf 'run\\n' >> execution-count; printf '\\101\\114\\120\\110\\101\\n'; "
+                   "while [ ! -e continue-output ]; do sleep 0.02; done; "
+                   "printf '\\102\\105\\124\\101\\n'")
+        try:
+            self.submit(command, "RECHECK_OUTPUT_0001")
+            self.take()
+            submission = self.core.review.proposal_id
+            self.transfer()
+            self.until(lambda: b"ALPHA\r\n" in self.core.output.data)
+            with mock.patch.object(self.core.channel, "send", wraps=self.core.channel.send) as terminal_send:
+                self.ui.from_terminal_button.invoke()
+                first = self.core.review
+                self.assertEqual(first.direction, "TO_OUTPUT_SINK")
+                self.assertIn("ALPHA\n", first.text)
+                self.assertNotIn("BETA\n", first.text)
+                draft = self.core.edit_review(first.id, "unshared draft", False)
+                self.ui.render()
+                # Every click reloads a fresh capture, even while already reviewing output.
+                self.ui.from_terminal_button.invoke()
+                self.assertNotEqual(self.core.review.id, draft.id)
+                self.assertIn("ALPHA\n", self.core.review.text)
+                self.assertNotIn("unshared draft", self.core.review.text)
+                self.core.edit_review(self.core.review.id, "checked ALPHA\n", False)
+                self.ui.render()
+                self.ui.approve_button.invoke()
+                with self.assertRaisesRegex(a.ProbeError, "return_not_ready"):
+                    self.core.take_return_review()
+                with self.assertRaisesRegex(a.ProbeError, "transfer_in_progress"):
+                    self.core.select_current_output()
+                self.until(lambda: self.core.review_state == "ACKNOWLEDGED")
+                first_id = self.core.review.id
+                self.assertIsNone(self.core.open_return)
+                self.assertFalse(gate.exists())  # The command is still waiting for its late output.
+                first_return = mcp(self.core.bridge_process, "get_approved_output", {"submission_id": submission})
+                self.assertEqual(first_return["outputs"][0]["text"], "checked ALPHA\n")
+                self.assertEqual(first_return["outputs"][0]["submission_id"], submission)
+                gate.touch()
+                self.until(lambda: b"BETA\r\n" in self.core.output.data)
+                self.ui.from_terminal_button.invoke()
+                second = self.core.review
+                self.assertNotEqual(second.id, first_id)
+                self.assertEqual(second.direction, "TO_OUTPUT_SINK")
+                self.assertIn("ALPHA\n", second.text)
+                self.assertIn("BETA\n", second.text)
+                self.assertEqual(self.ui.binding_submission[self.ui.binding_value.get()], submission)
+                args = {"submission_id": submission, "cursor": first_return["cursor"]}
+                self.assertEqual(mcp(self.core.bridge_process, "get_approved_output", args)["outputs"], [])
+                second = self.core.edit_review(second.id, "checked ALPHA\nchecked BETA\n", False)
+                self.ui.render()
+                self.ui.approve_button.invoke()
+                self.until(lambda: self.core.review_state == "ACKNOWLEDGED")
+                late_return = mcp(self.core.bridge_process, "get_approved_output", args)["outputs"]
+                self.assertEqual(len(late_return), 1)
+                self.assertEqual(late_return[0]["submission_id"], submission)
+                self.assertEqual(late_return[0]["text"].encode(), second.payload)
+                self.assertNotEqual(late_return[0]["output_id"], first_return["outputs"][0]["output_id"])
+                self.assertFalse(self.core.inbox)
+                terminal_send.assert_not_called()  # Reviewing/editing/returning never sends terminal input.
+            self.assertEqual(counter.read_text(), "run\n")
+        finally:
+            gate.touch()  # Always let the existing fixture finish its command and clean up.
 
     def test_bidirectional_dialogs_park_and_resume_via_ui(self):
         self.submit("printf 'GUI_STAGE_A\\n'", "GUI_BIDI_A_00001")
@@ -1269,6 +1681,7 @@ class SentStylingUITests(unittest.TestCase):
     def cleanup(self):
         try:
             if self.core.connection == "CONNECTED" and self.core.channel:
+                self.core.set_command_target("TERMINAL")
                 review = self.core.review_command("exit", True)
                 self.core.approve(review.id)
                 self.until(lambda: self.core.connection == "DISCONNECTED", 3)
@@ -1409,7 +1822,7 @@ class QrexecDialogTests(unittest.TestCase):
         dialog.location.set("QREXEC")
         self.root.update()
         self.assertTrue(dialog.q1.winfo_ismapped())
-        self.assertNotIn("qrexec_copy_command", dialog.buttons)  # J82: kein Kopierbutton
+        self.assertIn("qrexec_copy_command", dialog.buttons)  # One-click copy in the simplified setup.
         self.assertNotIn("qrexec_pin", dialog.fields)  # #90: keine Hex-Pflichteingabe
         # Feldbezogene Validierung am Schritt 1, inkl. IP/localhost-Ausschluss.
         for bad in ("bad name", "127.0.0.1", "localhost"):

@@ -26,6 +26,9 @@ import test_risk_install_ui as fixtures
 
 class TransportBoundaryTests(unittest.TestCase):
     def setUp(self):
+        proxy = mock.patch("urllib.request.getproxies", return_value={})
+        proxy.start()
+        self.addCleanup(proxy.stop)
         self.binary = fixtures.fake_binary()
         self.archive = fixtures.archive_for(self.binary)
         self.release = fixtures.release_for(self.binary, self.archive)
@@ -270,6 +273,7 @@ class LifecycleBoundaryTests(unittest.TestCase):
         self.tool, self.work = self.installation.install(threading.Event(), lambda _: None, lambda *_: raw)
         self.core = a.AppCore(preference_store=a.PreferenceStore(self.base))
         self.core.session, self.core.connection = "FIXTURE_SESSION", "CONNECTED"
+        self.core.set_command_target("TERMINAL")
         self.core.channel = mock.Mock()
         self.core.channel.receive.return_value = []
         self.addCleanup(self.core.close)
@@ -426,6 +430,7 @@ class RenderBoundaryTests(unittest.TestCase):
         root = tk.Tk()
         core = a.AppCore()
         core.session, core.connection = "FIXTURE_SESSION", "CONNECTED"
+        core.set_command_target("TERMINAL")
         core.channel = mock.Mock(receive=mock.Mock(return_value=[]))
         ui = a.ReviewUI(root, core)
         try:

@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import select
+import signal
 import socket
 import ssl
 import sqlite3
@@ -75,11 +76,59 @@ def mcp(process, name, args=None, modern=False):
     return data
 
 
+class ClipboardRoutingTests(unittest.TestCase):
+    def test_defaults_follow_terminal_lifecycle_without_retargeting_active_copy(self):
+        core = a.AppCore()
+        self.addCleanup(core.close)
+        self.assertEqual((core.output_mode, core.command_target), ("CLIPBOARD", "CLIPBOARD"))
+        core.add_proposal("printf 'COPY_WITHOUT_TERMINAL'")
+        review = core.review_pending_proposal()
+        self.assertEqual(review.command_target, "CLIPBOARD")
+        self.assertIsNone(review.session)
+        core.connection = "STARTING_SHELL"
+        core._event({"type": "ready", "session": "12345678-1234-1234-1234-123456789012"})
+        self.assertEqual((core.output_mode, core.command_target), ("SINCE_LAST", "TERMINAL"))
+        self.assertEqual(core.review, review)  # Opening a shell never grants a new destination.
+        copied = []
+        core.copy_command(review.id, copied.append)
+        self.assertEqual(copied, [review.text])
+        core._disconnect()
+        self.assertEqual((core.output_mode, core.command_target), ("CLIPBOARD", "CLIPBOARD"))
+
+    def test_explicit_switch_rebuilds_review_and_old_terminal_approval_is_stale(self):
+        core = a.AppCore()
+        self.addCleanup(core.close)
+        core.connection = "STARTING_SHELL"
+        core._event({"type": "ready", "session": "12345678-1234-1234-1234-123456789012"})
+        terminal = core.review_command("printf 'ROUTING'")
+        core.set_output_mode("CLIPBOARD")
+        copy = core.review
+        self.assertNotEqual(terminal.id, copy.id)
+        self.assertEqual((core.output_mode, core.command_target, copy.command_target),
+                         ("CLIPBOARD", "CLIPBOARD", "CLIPBOARD"))
+        self.assertFalse(copy.final_return)
+        with self.assertRaisesRegex(a.ProbeError, "stale_review"):
+            core.approve(terminal.id)
+        with self.assertRaisesRegex(a.ProbeError, "clipboard_target_requires_copy"):
+            core.approve(copy.id)
+        core.set_output_mode("LAST_50")
+        self.assertEqual(core.review.command_target, "TERMINAL")
+        self.assertTrue(core.review.final_return)
+        self.assertEqual(core.command_target, "TERMINAL")
+        with self.assertRaisesRegex(a.ProbeError, "stale_review"):
+            core.copy_command(copy.id, lambda _: self.fail("stale clipboard write"))
+        core.review_state = "CHECKING"
+        with self.assertRaisesRegex(a.ProbeError, "transfer_in_progress"):
+            core.set_output_mode("CLIPBOARD")
+        self.assertEqual(core.output_mode, "LAST_50")
+
+
 class ReviewByteDetailTests(unittest.TestCase):
     def test_normalization_counts_and_final_bytes_follow_existing_rules(self):
         core = a.AppCore()
         self.addCleanup(core.close)
         core.session, core.connection = "synthetic", "CONNECTED"
+        core.set_command_target("TERMINAL")
         for text, counts in [("a\r\nb\r\r\n", (2, 1, 2)), ("a\n\n", (0, 0, 2)),
                              ("a\nb", (0, 0, 0)), ("é😀", (0, 0, 0))]:
             for final_return in (False, True):
@@ -397,14 +446,14 @@ class HTTPTests(unittest.TestCase):
     def tearDown(self):
         self.process.close()
 
-    def test_five_tools_legacy_and_modern_discovery(self):
+    def test_six_tools_legacy_and_modern_discovery(self):
         value = {"jsonrpc": "2.0", "id": "list", "method": "tools/list", "params": {}}
         headers = {"X-AITL-AI-Key": self.process.ai_token}
         status, raw = request(self.process.mcp_url, "POST", body=value, headers=headers)
         self.assertEqual(status, 200)
         names = {item["name"] for item in json.loads(raw)["result"]["tools"]}
         self.assertEqual(names, {"submit_proposal", "get_submission_status", "get_approved_output",
-                                 "get_preferences", "withdraw_proposal"})
+                                 "get_preferences", "withdraw_proposal", "acknowledge_output"})
         self.assertEqual(mcp(self.process, "get_preferences", modern=True)["block_size"], "SMALL")
         meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}
         value = {"jsonrpc": "2.0", "id": 2, "method": "server/discover", "params": {"_meta": meta}}
@@ -855,6 +904,8 @@ class ConnectedRoundTripTests(unittest.TestCase):
             self.assertEqual(outputs[0]["output_id"], event_id)
             self.assertEqual(outputs[0]["submission_id"], submission_id)
             self.assertEqual(outputs[0]["text"], "HUMAN_APPROVED_EVENT_OUTPUT\n")
+            ack = mcp(process, "acknowledge_output", {"output_id": event_id, "receipt": outputs[0]["receipt"]})
+            self.assertEqual(ack["state"], "ACKNOWLEDGED")
             processed[event_id] = outputs[0]
             return True
 
@@ -873,8 +924,8 @@ class ConnectedRoundTripTests(unittest.TestCase):
 
         subscription = store.active_subscription(subscription_id, store.clock())
         harness.service.deliver({"subscription": subscription, "event": event, "attempts": 0})
-        self.assertEqual(len(harness.deliveries[subscription_id]), 2)
-        replay_event = harness.deliveries[subscription_id][1][1]
+        self.assertEqual(len(harness.deliveries[subscription_id]), 1)  # late notification skipped after read ACK
+        replay_event = event  # a host may still replay its already received notification
         self.assertEqual(replay_event["eventId"], event["eventId"])
         self.assertFalse(continue_from_notification(replay_event))
         final_row = store.execute("SELECT delivered,delivered_at FROM outputs WHERE id=?",
@@ -903,6 +954,8 @@ class ConnectedRoundTripTests(unittest.TestCase):
                 self.core.close_open_return()
         candidates = self.core.output_candidates()
         self.assertEqual({item["submission_id"] for item in candidates}, {first, second})
+        # TRANSFERRED acknowledges the terminal write, not arrival of shell output.
+        self.fixture.wait(lambda: b"MULTI_FLIGHT_TWO\r\n" in self.core.output.data)
         output = self.core.select_current_output()
         with self.assertRaises(a.ProbeError):
             self.core.approve(output.id, submission_id="f" * 32)
@@ -1313,8 +1366,9 @@ class ProposalLifecycleStoreTests(unittest.TestCase):
         before = self.status(submission)
         self.assertTrue(before["approved_output_available"])
         self.assertTrue(before["output_shared_ever"])
-        self.store.execute("UPDATE outputs SET delivered=1, delivered_at=? WHERE submission=?",
-                           (self.now, submission))  # completion ACK flip
+        principal = self.store.authenticate(self.ai, "AI")
+        item = self.store.ai_output(principal, {"submission_id": submission})["outputs"][0]
+        self.store.acknowledge_output(principal, {"output_id": item["output_id"], "receipt": item["receipt"]}, 1)
         after = self.status(submission)
         self.assertFalse(after["approved_output_available"])
         self.assertTrue(after["output_shared_ever"])  # permanent fact, read-side only
@@ -1426,6 +1480,89 @@ class ControllerTakeFlowTests(unittest.TestCase):
     def inject(self, kind, value):
         self.core.bridge_worker.events.put((self.core.worker_id, kind, value))
         self.core.pump()
+
+    def test_clipboard_roundtrip_stays_unbound_and_keeps_terminal_return_open(self):
+        submission = self.submit("printf 'CLIPBOARD_COMMAND_ONCE\\n'")
+        self.core.review_pending_proposal()
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        self.core.approve(self.core.review.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+        pending = dict(self.core.open_return)
+        with mock.patch.object(self.core.channel, "send", side_effect=AssertionError("terminal write")):
+            review = self.core.select_clipboard("External report\n")
+            self.assertEqual(self.core.open_return, pending)
+            self.core.reject(review.id)
+            self.assertEqual(self.core.open_return, pending)
+            review = self.core.select_clipboard("External report\n")
+            review = self.core.edit_review(review.id, "Reviewed external report\n")
+            self.assertEqual(review.output_source, "CLIPBOARD")
+            self.assertEqual(mcp(self.process, "get_approved_output")["outputs"], [])
+            self.core.set_paused(True)
+            with self.assertRaisesRegex(a.ProbeError, "paused"):
+                self.core.approve(review.id)
+            self.core.set_paused(False)
+            self.core.approve(review.id)
+            self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
+            outputs = mcp(self.process, "get_approved_output")["outputs"]
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(outputs[0]["text"], "Reviewed external report\n")
+            self.assertIsNone(outputs[0]["submission_id"])
+            self.assertEqual(self.core.open_return, pending)
+            self.assertEqual(mcp(self.process, "get_approved_output",
+                                 {"submission_id": submission})["outputs"], [])
+            # Even an explicit association of external context is no terminal-return waiver.
+            linked = self.core.select_clipboard("Additional context")
+            self.core.approve(linked.id, submission_id=submission, explicit_binding=True)
+            self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
+            self.assertEqual(self.core.open_return, pending)
+            named = mcp(self.process, "get_approved_output", {"submission_id": submission})["outputs"]
+            self.assertEqual([item["text"] for item in named], ["Additional context"])
+            terminal = self.core.take_return_review()
+            self.assertEqual(terminal.output_source, "TERMINAL")
+            self.assertEqual(self.core.open_return["return_state"], "in_stage")
+
+    def test_clipboard_command_target_keeps_prior_terminal_return_open(self):
+        first = self.submit("printf 'ONE_TERMINAL_COMMAND\\n'")
+        self.core.review_pending_proposal()
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        self.core.approve(self.core.review.id)
+        self.fixture.wait(lambda: self.core.review_state in {"TRANSFERRED", "OVERRIDE_REQUIRED"})
+        if self.core.review_state == "OVERRIDE_REQUIRED":
+            self.core.approve(self.core.review.id, override=True)
+        self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED")
+        pending = dict(self.core.open_return)
+        self.core.set_command_target("CLIPBOARD")
+        second = self.submit("printf 'EXTERNAL_MANUAL_COPY'")
+        self.core.review_pending_proposal()
+        self.fixture.wait(lambda: self.core.review_state == "REVIEW", timeout=6)
+        copied = []
+        with mock.patch.object(self.core.channel, "send", side_effect=AssertionError("terminal write")):
+            self.core.copy_command(self.core.review.id, copied.append)
+        self.assertEqual(copied, ["printf 'EXTERNAL_MANUAL_COPY'"])
+        self.assertEqual(self.core.open_return, pending)
+        self.assertEqual(self.core.last_proposal_id, first)
+        self.assertEqual([item["submission_id"] for item in self.core.transferred], [first])
+        self.assertEqual(mcp(self.process, "get_submission_status", {"submission_id": second})["state"], "TAKEN")
+        self.assertEqual(self.core.take_return_review().output_source, "TERMINAL")
+        self.assertEqual(self.core.open_return["submission_id"], first)
+
+    def test_clipboard_preserves_active_stage_and_rejects_invalid_text(self):
+        command = self.core.review_command("true")
+        with self.assertRaisesRegex(a.ProbeError, "stage_conflict"):
+            self.core.select_clipboard("external")
+        self.assertEqual(self.core.review, command)
+        self.core.reject(command.id)
+        for text in ("", "x" * (a.OUTPUT_LIMIT + 1), "hidden\x00text", "tab\ttext"):
+            with self.subTest(text_length=len(text)):
+                with self.assertRaises(a.ProbeError):
+                    self.core.select_clipboard(text)
+                self.assertEqual(self.core.review, command)
+        self.core.set_output_mode("CLIPBOARD")
+        with self.assertRaisesRegex(a.ProbeError, "clipboard_requires_explicit_read"):
+            self.core.select_current_output()
 
     def test_take_pending_then_ack_builds_review_and_resumes_poll(self):
         submission = self.submit("printf 'ASYNC_TAKE\\n'")
@@ -1659,14 +1796,19 @@ class ControllerTakeFlowTests(unittest.TestCase):
         if self.core.review_state == "OVERRIDE_REQUIRED":
             self.core.approve(self.core.review.id, override=True)
         self.fixture.wait(lambda: self.core.review_state == "TRANSFERRED"
-                          and b"OBSERVE_BIND" in self.core.output.data)
+                          and b"OBSERVE_BIND\r\n" in self.core.output.data)
         output = self.core.select_current_output()
         with self.assertRaisesRegex(a.ProbeError, "unknown_output_binding"):
             self.core.note_output_binding(output.id, "e" * 32)
         self.core.note_output_binding(output.id, first)
-        self.fixture.wait(lambda: mcp(self.process, "get_submission_status",
-                                      {"submission_id": first})["output_reviewed_at"] is not None,
-                          timeout=6)
+        next_status_check = [0.0]
+        def reviewed_observed():
+            if time.monotonic() < next_status_check[0]:
+                return False
+            next_status_check[0] = time.monotonic() + 0.2
+            return mcp(self.process, "get_submission_status",
+                       {"submission_id": first})["output_reviewed_at"] is not None
+        self.fixture.wait(reviewed_observed, timeout=6)
         self.core.approve(output.id, submission_id=first, explicit_binding=True)
         self.fixture.wait(lambda: self.core.review_state == "ACKNOWLEDGED", timeout=6)
         status = mcp(self.process, "get_submission_status", {"submission_id": first})
@@ -1674,9 +1816,10 @@ class ControllerTakeFlowTests(unittest.TestCase):
 
 
 class RemoteFixture:
-    def __init__(self, directory):
+    def __init__(self, directory, port=None):
+        port_args = [] if port is None else ["--port", str(port)]
         self.process = subprocess.Popen([sys.executable, "-I", str(Path(a.__file__).resolve()), "--bridge",
-                                         "--state-dir", str(directory), "--tls-name", "127.0.0.1", "--pair"],
+                                         "--state-dir", str(directory), "--tls-name", "127.0.0.1", "--pair", *port_args],
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                         env=a.isolated_service_environment(), close_fds=True)
         try:
@@ -1960,6 +2103,10 @@ class TunnelTests(unittest.TestCase):
                 response = call("get_approved_output", {"submission_id": submission})
                 entry = response["structuredContent"]["outputs"][0]
                 self.assertEqual(response["content"][entry["text_content_index"]]["text"].encode(), output.payload)
+                # Observe the official client's real health JSON with the Bridge-side parser.
+                probe = a.BridgeTunnel(Path(directory, "health-probe"))
+                probe.work = tunnel.directory
+                self.assertEqual(probe._health(), (True, None))
             finally:
                 if tunnel:
                     tunnel.close()
@@ -2218,8 +2365,39 @@ class BridgeTunnelTests(unittest.TestCase):
         status = tunnel.status()
         self.assertEqual((status["phase"], status["detail"]), ("starting", "runtime_rate_limited"))
         # A healthy control-plane poll is the only accepted readiness evidence.
-        payload["details"] = {"http_status": 200, "last_success": "2026-10-08T10:00:00Z",
+        payload["details"] = {"http_status": 200, "last_success": a.datetime.now(a.timezone.utc).isoformat(),
                               "consecutive_failures": 0}
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "connected")
+        # Official v0.0.15 clears httpStatus on success; omitempty removes the field.
+        del payload["details"]["http_status"]
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "connected")
+        for invalid_status in (None, 0, True, "200", 500):
+            payload["details"]["http_status"] = invalid_status
+            tunnel.checked_at = 0.0
+            self.assertEqual(tunnel.status()["phase"], "starting")
+        del payload["details"]["http_status"]
+        payload["details"]["failure_category"] = "network"
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "starting")
+        del payload["details"]["failure_category"]
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "connected")
+        payload["details"]["http_status"] = 429  # A retained recent success must not mask current throttling.
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "starting")
+        self.assertEqual(tunnel.detail, "runtime_rate_limited")
+        payload["details"]["http_status"] = 200
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "connected")
+        payload["details"]["last_success"] = a.datetime.fromtimestamp(
+            time.time()-tunnel.HEALTH_MAX_AGE-10, a.timezone.utc).isoformat()
+        tunnel.checked_at = 0.0
+        self.assertEqual(tunnel.status()["phase"], "starting")
+        self.assertEqual(tunnel.detail, "runtime_poll_stale")
+        self.assertEqual(len(calls), 2)  # GET observation itself never restarts anything.
+        payload["details"]["last_success"] = a.datetime.now(a.timezone.utc).isoformat()
         tunnel.checked_at = 0.0
         self.assertEqual(tunnel.status()["phase"], "connected")
         tunnel.close()
@@ -2241,6 +2419,94 @@ class BridgeTunnelTests(unittest.TestCase):
         self.assertIn("[REDACTED]", detail)
         tunnel2.close()
 
+    def test_controller_contact_reuses_healthy_tunnel_and_bounds_recovery(self):
+        spawn, calls, processes = self.recorder()
+        tunnel = self.live_tunnel(spawn)
+        self.addCleanup(tunnel.close)
+        tunnel.configure(self.tunnel_id, self.key)
+        self.settle(tunnel)
+        tunnel.worker.join(timeout=2)
+        clock = [100.0]
+        tunnel.now = lambda: clock[0]
+        with mock.patch.object(tunnel, "_health", return_value=(True, None)) as health:
+            tunnel.controller_connected()
+            tunnel.worker.join(timeout=2)
+            self.assertFalse(tunnel.worker.is_alive())
+            self.assertEqual(tunnel.phase, "connected")
+            self.assertEqual(len(calls), 1)
+            health.assert_called_once()
+            health.return_value = (False, "runtime_poll_stale")
+            tunnel.controller_connected()
+            tunnel.worker.join(timeout=2)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(tunnel.phase, "starting")
+            self.assertEqual(processes[0].exit_code, -15)
+            for _ in range(3):
+                tunnel.controller_connected()
+                tunnel.worker.join(timeout=2)
+            self.assertEqual(len(calls), 2)  # No second restart during startup/cooldown.
+            processes[-1].exit_code = 1
+            tunnel.controller_connected()
+            tunnel.worker.join(timeout=2)
+            self.assertEqual(len(calls), 2)
+            clock[0] += tunnel.RECONNECT_COOLDOWN+1
+            tunnel.controller_connected()
+            tunnel.worker.join(timeout=2)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(tunnel.config, {"tunnel_id": self.tunnel_id, "runtime_key": self.key})
+
+    def test_controller_contact_preserves_missing_config_and_rejects_fatal_or_throttled_retry(self):
+        spawn, calls, _ = self.recorder()
+        empty = self.live_tunnel(spawn)
+        empty.controller_connected()
+        self.assertEqual(empty.status()["phase"], "missing")
+        self.assertEqual(calls, [])
+        empty.close()
+        for failure in ("runtime_key_rejected", "runtime_permission_denied", "runtime_tunnel_not_found",
+                        "client_health_unsupported", "runtime_rate_limited"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(dir=self.temp.name) as directory:
+                spawn, calls, _ = self.recorder()
+                tunnel = self.live_tunnel(spawn, directory)
+                try:
+                    tunnel.configure(self.tunnel_id, self.key)
+                    self.settle(tunnel)
+                    tunnel.worker.join(timeout=2)
+                    tunnel.phase = "connected"
+                    with mock.patch.object(tunnel, "_health", return_value=(False, failure)):
+                        for _ in range(2):
+                            tunnel.controller_connected()
+                            tunnel.worker.join(timeout=2)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(tunnel.detail, failure)
+                finally:
+                    tunnel.close()
+
+    def test_close_during_contact_check_prevents_late_restart(self):
+        spawn, calls, _ = self.recorder()
+        tunnel = self.live_tunnel(spawn)
+        self.addCleanup(tunnel.close)
+        tunnel.configure(self.tunnel_id, self.key)
+        self.settle(tunnel)
+        tunnel.worker.join(timeout=2)
+        entered, release = threading.Event(), threading.Event()
+        def health():
+            entered.set()
+            release.wait(2)
+            return False, "runtime_network_unavailable"
+        tunnel.phase = "connected"
+        with mock.patch.object(tunnel, "_health", side_effect=health):
+            tunnel.controller_connected()
+            self.assertTrue(entered.wait(2))
+            cancel = tunnel.worker_cancel
+            closer = threading.Thread(target=tunnel.close)
+            closer.start()
+            self.assertTrue(cancel.wait(2))
+            release.set()
+            closer.join(timeout=3)
+            self.assertFalse(closer.is_alive())
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(tunnel.process)
+
     def test_controller_only_endpoints_and_validation(self):
         with tempfile.TemporaryDirectory(prefix="aitl-tunnel-http-") as directory:
             store = a.BridgeStore(directory, uuid.uuid4().hex, clock=lambda: time.time())
@@ -2250,6 +2516,13 @@ class BridgeTunnelTests(unittest.TestCase):
             harness = ServiceHarness(store, controller, controller_id, ai, ai_id)
             self.addCleanup(harness.close)
             profile = harness.profile
+            with mock.patch.object(harness.service.tunnel, "controller_connected") as recover:
+                self.assertEqual(request(profile.url, "POST", path="/v1/pair/confirm", body={"version": 1})[0], 401)
+                self.assertEqual(request(profile.url, "POST", path="/v1/pair/confirm", body={"version": 1},
+                                         headers={"Authorization": "Bearer " + ai})[0], 401)
+                recover.assert_not_called()
+                a.BridgeHTTP(profile).request("POST", "/v1/pair/confirm", {"version": 1})
+                recover.assert_called_once()
             self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/tunnel/status"),
                              {"version": 1, "phase": "missing", "detail": "", "step": ""})
             self.assertEqual(request(profile.url, path="/v1/tunnel/status")[0], 401)
@@ -2286,8 +2559,9 @@ class BridgeTunnelTests(unittest.TestCase):
         log = buffer.getvalue()
         self.assertIn("Tunnel-Konfiguration empfangen", log)
         self.assertIn("Tunnel-Client gefunden", log)
-        self.assertIn("Tunnel-Client gestartet", log)
-        self.assertIn("Tunnel-Status: starting", log)
+        self.assertIn("Bridge -> Tunnel-Client: gestartet", log)
+        self.assertIn("lokales Weiterleitungsziel zur AI/MCP-Schnittstelle:", log)
+        self.assertIn("Bridge -> Tunnel-Client: Status starting", log)
         self.assertNotIn(self.key, log)
         self.assertNotIn(self.tunnel_id, log)
         buffer2 = io.StringIO()
@@ -2296,7 +2570,7 @@ class BridgeTunnelTests(unittest.TestCase):
             tunnel.checked_at = 0.0
             tunnel.status()
         log2 = buffer2.getvalue()
-        self.assertIn("Tunnel-Status: error (tunnel_process_exited)", log2)
+        self.assertIn("Bridge -> Tunnel-Client: Status error (tunnel_process_exited)", log2)
         self.assertNotIn(self.key, log2)
         self.assertNotIn(self.tunnel_id, log2)
         tunnel.close()
@@ -2377,12 +2651,20 @@ class ConsoleVisibilityTests(unittest.TestCase):
                 status, _raw = request(harness.profile.url, "POST", path="/v1/pair/confirm",
                                        body={"version": 1}, headers={"Authorization": "Bearer " + controller})
                 self.assertEqual(status, 200)
+                status, _raw = request(harness.mcp_url, "POST",
+                                       body={"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                             "params": {"name": "unknown-tool-secret", "arguments": {}}},
+                                       headers={"X-AITL-AI-Key": ai})
+                self.assertEqual(status, 200)
             log = buffer.getvalue()
-            self.assertIn("mcp: initialize beantwortet", log)
-            self.assertIn("mcp: abgewiesen (unauthorized)", log)
-            self.assertIn("mcp: abgewiesen (method_not_found)", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: initialize beantwortet", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: abgewiesen (unauthorized)", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: abgewiesen (method_not_found)", log)
             self.assertNotIn("unbekannt/80", log)  # client-controlled names never reach the console
-            self.assertIn("Controller-Kontakt: Kopplung bestaetigt", log)
+            self.assertIn("Controller/UI -> Bridge: Kopplung bestaetigt", log)
+            self.assertIn("AI/MCP-Eingang -> Bridge: tools/call beantwortet (Tool-Fehler)", log)
+            self.assertNotIn("unknown-tool-secret", log)
+            self.assertNotIn("Tunnel verbunden", log)
             self.assertNotIn(ai, log)
             self.assertNotIn(controller, log)
 
@@ -2594,6 +2876,23 @@ class RemoteTunnelCoordinationTests(unittest.TestCase):
             self.core.save_remote_tunnel("tunnel_" + "a" * 32, "k" * 32)
         self.assertEqual(str(caught.exception), "tunnel_config_busy")
         self.core.remote_tunnel_busy = False
+
+    def test_connected_probe_keeps_observing_and_bounds_lost_health(self):
+        phase, calls = ["connected"], []
+        def status():
+            calls.append(phase[0])
+            return {"version": 1, "phase": phase[0], "detail": "", "step": ""}
+        with mock.patch.object(self.harness.service.tunnel, "status", side_effect=status), \
+                mock.patch.object(a.RemoteTunnelProbe, "POLL_INTERVAL", .03), \
+                mock.patch.object(a.RemoteTunnelProbe, "OVERALL_TIMEOUT", .15):
+            self.core.begin_tunnel_probe()
+            self.wait(lambda: len(calls) >= 10)
+            self.assertEqual(self.core.remote_tunnel["phase"], "connected")
+            self.assertTrue(self.core.remote_tunnel_probe.alive())
+            phase[0] = "starting"
+            self.wait(lambda: self.core.remote_tunnel_error == "tunnel_status_timeout")
+            self.assertEqual(self.core.remote_tunnel["phase"], "error")
+            self.assertGreater(calls.count("connected"), 5)
 
     def test_probe_save_and_disconnect_clear_state(self):
         key = "k" * 32
@@ -2865,6 +3164,14 @@ class EventDeliveryTests(unittest.TestCase):
         return self.rpc("tools/call", {"name": "get_approved_output",
                                        "arguments": dict(arguments, conversation=self.harness.chat_code)})
 
+    def acknowledge_output_tool(self, item):
+        return self.rpc("tools/call", {"name": "acknowledge_output", "arguments": {
+            "output_id": item["output_id"], "receipt": item["receipt"], "conversation": self.harness.chat_code}})
+
+    def wait_for_notification(self, submission):
+        self.harness.wait(lambda: self.store.execute("SELECT 1 FROM outputs WHERE submission=? AND delivered=1",
+                                                     (submission,)).fetchone() is not None)
+
     def test_event_only_after_human_approved_output(self):
         created = self.store.submit({"request_id": uuid.uuid4().hex, "text": "true"})
         submission = created["submission_id"]
@@ -2879,9 +3186,12 @@ class EventDeliveryTests(unittest.TestCase):
         self.assertEqual(entry["data"]["output_id"], output_id)
         self.assertEqual(entry["data"]["submission_id"], submission)
         self.assertNotIn(self.store.conversation, json.dumps(entry))
-        self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
+        self.wait_for_notification(submission)
+        self.assertTrue(self.store.submission_status(submission)["approved_output_available"])
         named = self.approved_output_tool({"submission_id": submission})
         self.assertEqual(len(named["result"]["structuredContent"]["outputs"]), 1)
+        self.assertFalse(self.acknowledge_output_tool(named["result"]["structuredContent"]["outputs"][0])["result"]["isError"])
+        self.assertFalse(self.store.submission_status(submission)["approved_output_available"])
         general = self.approved_output_tool({})
         self.assertEqual(general["result"]["structuredContent"]["outputs"], [])
         replayed = a.BridgeHTTP(self.harness.profile).request("POST", "/v1/approved-output", replay)
@@ -2927,14 +3237,15 @@ class EventDeliveryTests(unittest.TestCase):
         self.harness.failures.clear()
         later = self.make_submission()
         self.post_output(later)
-        self.harness.wait(lambda: self.store.submission_status(later)["approved_output_available"] is False)
+        self.wait_for_notification(later)
+        self.assertTrue(self.store.submission_status(later)["approved_output_available"])
         self.assertGreaterEqual(len(self.harness.deliveries[self.subscription_id]), attempts + 1)
 
     def test_delivery_state_and_subscriptions_survive_restart(self):
         created = self.store.submit({"request_id": uuid.uuid4().hex, "text": "true"})
         submission = created["submission_id"]
         self.post_output(submission)
-        self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
+        self.wait_for_notification(submission)
         with self.store.lock:
             self.store.close()
         reopened = a.BridgeStore(self.temp.name, self.store.conversation, clock=lambda: time.time())
@@ -2943,7 +3254,7 @@ class EventDeliveryTests(unittest.TestCase):
             row = reopened.find_subscription(self.harness.ai_id, "https://delivery.example/hook",
                                              a.BRIDGE_EVENT_NAME, canonical)
             self.assertEqual(row["id"], self.subscription_id)
-            self.assertEqual(reopened.submission_status(submission)["approved_output_available"], False)
+            self.assertEqual(reopened.submission_status(submission)["approved_output_available"], True)
             named = reopened.ai_output(reopened.authenticate(self.harness.ai, "AI"),
                                        {"submission_id": submission})
             self.assertEqual(len(named["outputs"]), 1)
@@ -3145,11 +3456,18 @@ class WebhookTransportTests(EventSubscriptionTests):
         self.assertEqual(value["data"]["submission_id"], submission)
         self.assertNotIn(b"APPROVED_PAYLOAD", entry["body"])
         self.assertNotIn(self.store.conversation.encode(), entry["body"])
-        self.harness.wait(lambda: self.store.submission_status(submission)["approved_output_available"] is False)
+        self.harness.wait(lambda: self.store.execute("SELECT delivered FROM outputs WHERE id=?",
+                                                     (output_id,)).fetchone()[0] == 1)
+        self.assertTrue(self.store.submission_status(submission)["approved_output_available"])
         named = self.rpc("tools/call", {"name": "get_approved_output",
                                         "arguments": {"conversation": self.harness.chat_code,
                                                       "submission_id": submission}})
         self.assertEqual(len(named["result"]["structuredContent"]["outputs"]), 1)
+        item = named["result"]["structuredContent"]["outputs"][0]
+        ack = self.rpc("tools/call", {"name": "acknowledge_output", "arguments": {
+            "conversation": self.harness.chat_code, "output_id": item["output_id"], "receipt": item["receipt"]}})
+        self.assertFalse(ack["result"]["isError"])
+        self.assertFalse(self.store.submission_status(submission)["approved_output_available"])
         general = self.rpc("tools/call", {"name": "get_approved_output",
                                           "arguments": {"conversation": self.harness.chat_code}})
         self.assertEqual(general["result"]["structuredContent"]["outputs"], [])
@@ -3679,7 +3997,7 @@ class BindingDisplayRegressionTests(unittest.TestCase):
                            {"submission_id": self.second, "text_view": "second"}]
         value = [""]
         self.snapshot = SimpleNamespace(bridge=SimpleNamespace(state="CONNECTED"), review_state="REVIEW",
-                                        review=SimpleNamespace(id="review-id", direction="TO_OUTPUT_SINK"))
+                                        review=SimpleNamespace(id="review-id", direction="TO_OUTPUT_SINK", output_source="TERMINAL"))
         self.ui = SimpleNamespace(core=SimpleNamespace(output_candidates=lambda: self.candidates,
             last_proposal_id=self.second, snapshot=lambda: self.snapshot, approve=mock.Mock()),
             binding_row=mock.Mock(), binding_picker=mock.Mock(),
@@ -3726,7 +4044,7 @@ class BindingDisplayRegressionTests(unittest.TestCase):
         self.assertEqual(self.ui.binding_value.get(), label)
         self.ui.binding_row.grid_remove.assert_not_called()
         # A different review gets a fresh mapping/default, never the consumed selection.
-        self.snapshot.review = SimpleNamespace(id="next-review", direction="TO_OUTPUT_SINK")
+        self.snapshot.review = SimpleNamespace(id="next-review", direction="TO_OUTPUT_SINK", output_source="TERMINAL")
         self.snapshot.review_state = "REVIEW"
         self.snapshot.bridge.state = "CONNECTED"
         self.candidates.append({"submission_id": self.second, "text_view": "second"})
@@ -3790,6 +4108,7 @@ class RiskSentPreservationTests(unittest.TestCase):
         self.core = a.AppCore()
         self.core.session = "RISK_SENT_SESSION"
         self.core.connection = "CONNECTED"
+        self.core.set_command_target("TERMINAL")
         self.core.channel = mock.Mock()
         self.core.channel.receive.return_value = []
         self.addCleanup(self.core.close)
@@ -3939,6 +4258,8 @@ class QrexecForwarderTests(unittest.TestCase):
         "            conn.close(); continue\n"
         "        if mode == 'plain':\n"
         "            conn.sendall(b'NOPE NOT TLS\\r\\n'); conn.close(); continue\n"
+        "        if int(spec.get('remote', remote)) == int(local):\n"
+        "            conn.close(); continue\n"
         "        up = socket.socket(); up.settimeout(3)\n"
         "        try:\n"
         "            up.connect(('127.0.0.1', int(spec.get('remote', remote))))\n"
@@ -4045,15 +4366,86 @@ class QrexecForwarderTests(unittest.TestCase):
 
     def test_identity_guard_never_signals_foreign_group(self):
         # Simulate PID/PGID reuse: recorded group belongs to an unrelated process.
-        dummy = subprocess.Popen(["sleep", "30"], start_new_session=True,
+        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "socat"], start_new_session=True,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: dummy.poll() is None and dummy.kill())
+        def cleanup():
+            if dummy.poll() is None:
+                dummy.kill()
+            dummy.wait(timeout=3)
+        self.addCleanup(cleanup)
         forwarder = a.QrexecForwarder()
         forwarder.pgid = os.getpgid(dummy.pid)
         forwarder.port = self.free_port()
         self.assertFalse(forwarder.owned())
         forwarder.stop()
         self.assertIsNone(dummy.poll())  # foreign process still alive, never signalled
+
+    def test_killed_owned_helper_can_restart_without_duplicate_listener(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        port = self.free_port()
+        forwarder.start("target-vm", port)
+        original = forwarder.pgid
+        for pid, cmd in forwarder._group_members():
+            if cmd:
+                fd = os.pidfd_open(pid)
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                finally:
+                    os.close(fd)
+        deadline = time.monotonic() + 2
+        while self.listener(port) and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertFalse(forwarder.running)
+        forwarder.start("target-vm", port)
+        self.assertTrue(forwarder.running)
+        self.assertNotEqual(forwarder.pgid, original)
+        self.assertTrue(forwarder.stop())
+
+    def test_missing_owned_listener_and_pid_identity_change_are_not_healthy(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        forwarder.start("target-vm", self.free_port())
+        with mock.patch.object(forwarder, "_owns_listener", return_value=False):
+            self.assertFalse(forwarder.running)
+        with mock.patch.object(forwarder, "_process_identity", return_value=(999999, forwarder.pgid, forwarder.pgid, os.getuid())), \
+                mock.patch.object(a.signal, "pidfd_send_signal") as send:
+            self.assertFalse(forwarder.stop())
+            send.assert_not_called()
+        self.assertTrue(forwarder.stop())
+
+    def test_killed_launcher_is_reported_without_claiming_a_cause(self):
+        self.launcher.write_text("#!/bin/bash\nkill -KILL $$\n")
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        with self.assertRaisesRegex(a.ProbeError, "qrexec_forwarder_killed"):
+            forwarder.start("target-vm", self.free_port())
+        self.assertEqual(forwarder.last_result["exit"], -signal.SIGKILL)
+
+    def test_missing_pidfd_support_has_no_unsafe_signal_fallback(self):
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        forwarder.start("target-vm", self.free_port())
+        with mock.patch.object(a.os, "pidfd_open", side_effect=OSError(a.errno.ENOSYS, "test")), \
+                mock.patch.object(a.signal, "pidfd_send_signal") as send:
+            self.assertFalse(forwarder.stop())
+            send.assert_not_called()
+        self.assertTrue(forwarder.running)
+        self.assertTrue(forwarder.stop())
+
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 unavailable")
+    def test_owned_dual_stack_listener_is_not_mistaken_for_foreign_port(self):
+        helper = self.directory / "qvm-connect-tcp-listener"
+        helper.write_text(self.LISTENER.replace("srv = socket.socket()\n",
+            "srv = socket.socket(socket.AF_INET6)\n"
+            "srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n")
+            .replace("srv.bind(('127.0.0.1', int(local)))", "srv.bind(('::', int(local)))"))
+        forwarder = a.QrexecForwarder()
+        self.addCleanup(forwarder.stop)
+        forwarder.start("target-vm", self.free_port())
+        self.assertTrue(forwarder.running)
+        self.assertTrue(forwarder.owned())
+        self.assertTrue(forwarder.stop())
 
     def test_missing_tool_and_invalid_names(self):
         forwarder = a.QrexecForwarder()
@@ -4121,7 +4513,7 @@ class QrexecConfigPersistenceTests(unittest.TestCase):
                 profile = a.ConnectionProfile("https://127.0.0.1:%d" % port, "0" * 64,
                                               "0" * 32, "0" * 32, "0" * 64)
                 self.store.save_connection(profile, None, restored.qrexec)
-                forwarder = mock.Mock(running=False)
+                forwarder = mock.Mock(running=False, target="target-vm", port=port, remote_port=port)
                 restored.qrexec_forwarder = forwarder
                 restored.saved_connection = None
                 with mock.patch.object(restored, "connect_profile") as connect:
@@ -4504,6 +4896,62 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         self.assertTrue(again["reachable"])
         self.assertEqual(core.qrexec_forwarder.pgid, first_pgid)  # no double forwarder group
 
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 unavailable")
+    def test_dual_stack_forwarder_reaches_the_expected_tls_bridge(self):
+        proxy = self.base / "qvm-connect-tcp-forwarder"
+        proxy.write_text(self.PROXY.replace("srv = socket.socket()\n",
+            "srv = socket.socket(socket.AF_INET6)\n"
+            "srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n")
+            .replace("srv.bind(('127.0.0.1', int(local)))", "srv.bind(('::', int(local)))"))
+        result = self.verify_with_env("fwdqube", self.free_port(), self.bridge_port)
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["phase"], "bridge_reachable")
+        self.assertEqual(result["observed_pin"], self.bridge_pin)
+
+    def test_occupied_port_recovers_through_owned_alternate_without_changing_trust(self):
+        core = self.make_core()
+        profile = core.pair_remote(self.bridge.url, self.bridge_pin, self.bridge.code)
+        core.close()
+        core.connection_store.save_connection(profile, qrexec={"target": "fwdqube", "port": self.bridge_port})
+        before = core.connection_store.load_connection()
+        recovered = a.AppCore(connection_store=core.connection_store)
+        self.addCleanup(recovered.close)
+        def restored():
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                recovered.pump()
+                if recovered.recovery_state == "RESTORED" and recovered.remote_tunnel is not None:
+                    return
+                time.sleep(.01)
+            self.fail("alternate recovery: " + str(recovered.recovery_error or recovered.bridge_error))
+        with mock.patch.dict(os.environ, {"AITL_TEST_REMOTE_PORT": str(self.bridge_port)}):
+            recovered.begin_connection_recovery()
+            restored()
+            forwarder = recovered.qrexec_forwarder
+            self.assertNotEqual(forwarder.port, self.bridge_port)
+            self.assertEqual(forwarder.remote_port, self.bridge_port)
+            self.assertEqual(recovered.bridge_profile.forward_port, forwarder.port)
+            self.assertEqual(recovered.bridge_profile.recipient, profile.recipient)
+            self.assertEqual(recovered.bridge_profile.token, profile.token)
+            self.assertEqual(recovered.connection_store.load_connection(), before)
+            pgid = forwarder.pgid
+            recovered.retry_connection_recovery()
+            restored()
+            self.assertEqual(recovered.qrexec_forwarder.pgid, pgid)
+            result = recovered.verify_qrexec_connection("fwdqube", self.bridge_port)
+            self.assertTrue(result["reachable"])
+            self.assertEqual(result["observed_pin"], self.bridge_pin)
+            self.assertEqual(recovered.hello_bridge(profile.url), "already_paired")
+            self.assertEqual(recovered.qrexec_forwarder.pgid, pgid)
+            wrong_pin = replace(recovered.bridge_profile, pin="0"*64)
+            with self.assertRaisesRegex(a.TransportError, "tls_pin_mismatch"):
+                a.BridgeHTTP(wrong_pin).request("GET", "/v1/status")
+        # The pre-existing canonical listener is still alive and accessible;
+        # only the new alternate listener belongs to the recovering controller.
+        self.assertIsNone(self.bridge.process.poll())
+        self.assertEqual(a.BridgeHTTP(profile).request("GET", "/v1/status")["state"], "PAIRED")
+        self.assertEqual(recovered.connection_store.load_connection(), before)
+
     def test_deny_down_plain_are_evidenced_separately_not_blanket_policy(self):
         text = a.ConnectionDialog.error_text
         dead = str(self.free_port())  # nothing listening: "target down"
@@ -4514,8 +4962,11 @@ class QrexecBridgeFirstTests(unittest.TestCase):
         self.assertEqual(denied["phase"], "qrexec_target_unreachable")
         self.assertEqual(down["phase"], "qrexec_target_unreachable")
         self.assertEqual(plain["phase"], "tls_handshake_failed")
-        message = text("qrexec_target_unreachable")
-        self.assertIn("Mögliche", message)  # possible causes, never a definite policy claim
+        with mock.patch.object(a, "UI_LANGUAGE", "de"):
+            message = text("qrexec_target_unreachable")
+        self.assertIn("Bridge", message)
+        self.assertIn("Qrexec-Freigabe", message)
+        self.assertIn("welche Ursache vorliegt, ist noch offen", message)
         self.assertNotEqual(message.strip(), "Policy fehlt.")
         self.assertNotIn("Policy", text("tls_handshake_failed"))  # TLS is a separate evidenced phase
 
